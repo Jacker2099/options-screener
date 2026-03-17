@@ -166,51 +166,84 @@ def get_universe() -> list:
 
 def check_market_environment(cfg: dict) -> dict:
     """
-    检查大盘环境是否适合做多期权。
-    返回: {
-        ok: bool,           # True=可以操作, False=大盘环境差暂停
-        vix: float,         # 当前VIX
-        spy_above_ma: bool, # SPY是否在均线上方
-        qqq_above_ma: bool, # QQQ是否在均线上方
-        reason: str         # 过滤原因说明
-    }
+    检查大盘环境，返回风险评级和评分惩罚值。
+
+    设计原则:
+      本策略核心是"支撑位抄底 + 期权异常"，本身就是逆势布局逻辑，
+      大盘下跌反而是最佳应用场景，不应硬性跳过。
+      改为软过滤：大盘差时降低评分并标注风险，让用户自行判断。
+
+    风险等级:
+      GREEN  : 大盘健康，正常操作
+      YELLOW : 大盘偏弱(均线下方)，信号扣分，标注警告，可能是抄底机会
+      RED    : VIX极度恐慌(>40)，信号大幅降权，仍然输出供参考
     """
-    result = {"ok": True, "vix": 0.0, "spy_above_ma": True,
-              "qqq_above_ma": True, "reason": ""}
+    result = {
+        "ok": True,
+        "vix": 0.0,
+        "spy_above_ma": True,
+        "qqq_above_ma": True,
+        "spy_pct_from_ma": 0.0,
+        "risk_level": "GREEN",
+        "score_penalty": 0,
+        "warning_msg": "",
+        "reason": "",
+    }
     try:
-        # VIX
         vix_hist = yf.Ticker("^VIX").history(period="5d")
         if not vix_hist.empty:
             vix = float(vix_hist["Close"].iloc[-1])
             result["vix"] = round(vix, 1)
-            if vix > cfg["max_vix"]:
-                result["ok"] = False
-                result["reason"] = f"VIX={vix:.1f} 超过{cfg['max_vix']}，市场恐慌，暂停看涨信号"
-                log.warning(f"  ⚠️ {result['reason']}")
-                return result
 
-        # SPY 均线
         spy_hist = yf.Ticker("SPY").history(period="60d")
         if not spy_hist.empty and len(spy_hist) >= cfg["market_spy_ma"]:
             spy_price = float(spy_hist["Close"].iloc[-1])
             spy_ma    = float(spy_hist["Close"].iloc[-cfg["market_spy_ma"]:].mean())
-            result["spy_above_ma"] = spy_price >= spy_ma * 0.99
-            if not result["spy_above_ma"]:
-                result["ok"] = False
-                result["reason"] = f"SPY 跌破{cfg['market_spy_ma']}日均线，大盘趋势偏空"
-                log.warning(f"  ⚠️ {result['reason']}")
-                return result
+            spy_pct   = round((spy_price / spy_ma - 1) * 100, 1)
+            result["spy_above_ma"]    = spy_price >= spy_ma
+            result["spy_pct_from_ma"] = spy_pct
 
-        # QQQ 均线
         qqq_hist = yf.Ticker("QQQ").history(period="60d")
         if not qqq_hist.empty and len(qqq_hist) >= cfg["market_spy_ma"]:
             qqq_price = float(qqq_hist["Close"].iloc[-1])
             qqq_ma    = float(qqq_hist["Close"].iloc[-cfg["market_spy_ma"]:].mean())
-            result["qqq_above_ma"] = qqq_price >= qqq_ma * 0.99
+            result["qqq_above_ma"] = qqq_price >= qqq_ma
 
-        log.info(f"  大盘环境: VIX={result['vix']} "
-                 f"SPY均线{'上方✅' if result['spy_above_ma'] else '下方⚠️'} "
-                 f"QQQ均线{'上方✅' if result['qqq_above_ma'] else '下方⚠️'}")
+        vix       = result["vix"]
+        spy_above = result["spy_above_ma"]
+        qqq_above = result["qqq_above_ma"]
+        spy_pct   = result["spy_pct_from_ma"]
+
+        if vix > 40:
+            result["risk_level"]    = "RED"
+            result["score_penalty"] = -15
+            result["warning_msg"]   = (
+                f"🔴 市场极度恐慌 VIX={vix:.1f}，信号仅供参考，"
+                f"建议轻仓或等VIX回落30以下再操作"
+            )
+        elif vix > cfg["max_vix"] or (not spy_above and not qqq_above):
+            result["risk_level"]    = "YELLOW"
+            result["score_penalty"] = -5
+            result["warning_msg"]   = (
+                f"🟡 大盘偏弱 VIX={vix:.1f} SPY距均线{spy_pct:+.1f}%，"
+                f"信号已降权，此时也可能是底部抄底机会，请结合个股判断"
+            )
+        elif not spy_above or not qqq_above:
+            result["risk_level"]    = "YELLOW"
+            result["score_penalty"] = -3
+            result["warning_msg"]   = (
+                f"🟡 SPY距均线{spy_pct:+.1f}%，大盘略偏弱，"
+                f"支撑位信号可关注潜在底部机会"
+            )
+        else:
+            result["risk_level"]  = "GREEN"
+            result["warning_msg"] = f"🟢 大盘健康 VIX={vix:.1f}"
+
+        log.info(f"  大盘环境: [{result['risk_level']}] VIX={vix:.1f} "
+                 f"SPY均线{spy_pct:+.1f}% "
+                 f"SPY{'✅' if spy_above else '⚠️'} "
+                 f"QQQ{'✅' if qqq_above else '⚠️'} "
+                 f"评分惩罚={result['score_penalty']}")
 
     except Exception as e:
         log.warning(f"  大盘环境检查失败: {e}，继续运行")
@@ -663,7 +696,8 @@ def scan_options_by_strike(tk, price: float, cfg: dict,
 
 def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
             oi_snapshot: dict, iv_history: dict,
-            persistent_signals: set) -> dict | None:
+            persistent_signals: set,
+            market_penalty: int = 0) -> dict | None:
     try:
         time.sleep(cfg["delay_per_ticker"])
         tk   = yf.Ticker(ticker)
@@ -730,10 +764,11 @@ def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
         # 财报窗口扣分
         earnings_penalty = -15 if in_earnings_window else 0
 
+        market_env_label = "🟢正常" if market_penalty == 0 else ("🔴极险" if market_penalty <= -15 else "🟡偏弱")
         total_score = round(
             sup_score + mom_score + pos_score + rs_score +
             touch_score + persist_score + earnings_penalty +
-            opt["opt_score"], 2)
+            market_penalty + opt["opt_score"], 2)
 
         return {
             "代码":           ticker,
@@ -765,6 +800,7 @@ def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
             "OI集中倍数":     opt["oi_ratio"],
             "OI日变化%":      opt["oi_change_pct"],
             "认沽认购比":     opt["pc_ratio"],
+            "大盘风险":       market_env_label,
             "综合评分":       total_score,
         }
 
@@ -1015,15 +1051,8 @@ def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
     if cfg["market_filter"]:
         log.info("检查大盘环境...")
         market_env = check_market_environment(cfg)
-        if not market_env["ok"]:
-            msg = f"⛔ 大盘环境不佳: {market_env['reason']}，今日跳过扫描"
-            print(f"\n  {msg}\n")
-            tg_token = tg_token or os.environ.get("TELEGRAM_TOKEN", "")
-            tg_chat  = tg_chat  or os.environ.get("TELEGRAM_CHAT_ID", "")
-            if tg_token and tg_chat:
-                _tg_send(tg_token, tg_chat,
-                         f"📊 美股期权筛选器\n📅 {datetime.now().strftime('%Y-%m-%d')}\n{msg}")
-            return pd.DataFrame()
+        if market_env["warning_msg"]:
+            print(f"  {market_env['warning_msg']}")
 
     # 获取 SPY 历史（用于RS计算）
     log.info("获取 SPY 基准数据...")
@@ -1039,7 +1068,8 @@ def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
     with ThreadPoolExecutor(max_workers=cfg["workers"]) as pool:
         futures = {
             pool.submit(analyze, tk, cfg, spy_hist, oi_snapshot,
-                        iv_history, persistent_signals): tk
+                        iv_history, persistent_signals,
+                        market_env.get("score_penalty", 0)): tk
             for tk in universe
         }
         with tqdm(total=total_scanned, desc="扫描中", ncols=75, unit="只") as bar:
@@ -1101,7 +1131,7 @@ def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
     print(f"{'='*70}\n")
 
     data_cols = [
-        "代码","板块","股价","当日涨跌%","相对强弱RS","最近支撑位","距支撑%","支撑验证次数",
+        "代码","板块","大盘风险","股价","当日涨跌%","相对强弱RS","最近支撑位","距支撑%","支撑验证次数",
         "5日动量%","量能趋势","在均线上方","52周位置%",
         "财报日","财报在窗口内","连续信号",
         "到期日","剩余天数","行权价","虚值幅度%","期权参考价","隐含波动率%","IV百分位",
