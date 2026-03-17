@@ -1,22 +1,30 @@
 """
-美股期权筛选器 - 双因子策略
-════════════════════════════════════════════════════════
-条件1: 股价在支撑位附近 (±3%)
-条件2: Call OI 异常放大 + Call 成交量异常活跃
+美股期权筛选器 v3 - 五因子综合评分
+════════════════════════════════════════════════════════════════
+核心逻辑升级:
+  旧版: 按到期日汇总评分，只输出最优到期日
+  新版: 按【单个行权价】评分，找出全部到期日中最异常的具体合约
 
-数据来源: yfinance (免费, 盘后运行)
-股票池: S&P500 + 纳斯达克100 + 热门标的 (~650只有期权股票)
+五大因子:
+  1. 支撑位因子  - 股价距支撑位距离 (技术面确认)
+  2. 成交量因子  - 单行权价当日成交量 (真实资金流入)
+  3. OI集中度因子- OI相对同到期日均值的倍数 (机构持仓集中)
+  4. 方向性因子  - OTM程度 + Put/Call比 (看涨方向强度)
+  5. 动量因子    - 近5日价格动量 + 量能趋势 (趋势配合)
 
-安装依赖:
+输出: 每只股票输出【最优一个行权价】含具体参考价格
+
+数据来源: yfinance (免费，盘后运行)
+股票池: S&P500 + Nasdaq100 + 热门标的 (~650只)
+
+安装:
     pip install yfinance pandas numpy requests tqdm lxml
 
-运行示例:
-    python options_screener.py                        # 默认参数
-    python options_screener.py --top 30 --workers 8   # 输出30条，8线程
-    python options_screener.py --tolerance 0.05        # 放宽支撑位容差至5%
-    python options_screener.py --min-oi 300            # 降低OI门槛
-    python options_screener.py --max-dte 60            # 只看60天内到期
-════════════════════════════════════════════════════════
+运行:
+    python options_screener.py
+    python options_screener.py --top 25 --workers 8
+    python options_screener.py --tolerance 0.04 --min-oi 200
+════════════════════════════════════════════════════════════════
 """
 
 import yfinance as yf
@@ -29,39 +37,39 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
-# ─────────────────────────────────────────────────────
-# 配置参数 (可通过命令行参数覆盖)
-# ─────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+# 配置
+# ──────────────────────────────────────────────────────────────
 CONFIG = {
-    # ── 支撑位判断 ──
-    "support_window":     60,    # 回看天数 (用于识别支撑位)
-    "support_tolerance":  0.03,  # 价格在支撑位 ±3% 内视为"在支撑位"
-    "local_min_window":   5,     # 滚动局部最低点窗口 (±5天)
+    # 支撑位
+    "support_window":    60,
+    "support_tolerance": 0.03,
+    "local_min_window":  5,
 
-    # ── 期权异常判断 ──
-    "min_oi":             1000,  # 最小 Call OI (过滤流动性差的期权)
-    "min_call_volume":    500,   # 最小 Call 日成交量 (汇总口径)
-    "min_vol_oi_ratio":   0.15,  # Vol/OI 最小比值 (汇总口径，≥0.15 说明当日活跃)
-    "min_dte":            14,    # 最小到期天数 (过滤末日期权，至少2周)
-    "max_dte":            60,    # 最大到期天数 (聚焦近期催化剂)
+    # 期权过滤 (单行权价口径)
+    "min_strike_oi":     300,   # 单行权价最小OI
+    "min_strike_vol":    50,    # 单行权价最小当日成交量
+    "min_dte":           14,    # 最小到期天数
+    "max_dte":           60,    # 最大到期天数
+    "otm_min":           0.00,  # OTM最小幅度 (0=包含ATM)
+    "otm_max":           0.15,  # OTM最大幅度
 
-    # ── 股票流动性过滤 ──
-    "min_avg_volume":     300_000,  # 日均成交量下限
-    "min_price":          5.0,      # 最低股价 (过滤仙股)
+    # 股票流动性
+    "min_avg_volume":    300_000,
+    "min_price":         5.0,
 
-    # ── 并发与限速 ──
-    "workers":            5,     # 并发线程数 (建议 5~8，太高易被限速)
-    "delay_per_ticker":   0.1,   # 每只股票请求前的等待时间(秒)
+    # 动量过滤
+    "min_momentum_5d":   -0.05,  # 近5日涨幅不低于-5%
 
-    # ── 输出 ──
-    "top_n":              20,
-    "output_csv":         f"signals_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+    # 并发
+    "workers":           5,
+    "delay_per_ticker":  0.1,
+
+    # 输出
+    "top_n":             20,
+    "output_csv":        f"signals_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
 }
 
-
-# ─────────────────────────────────────────────────────
-# 日志配置
-# ─────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -70,158 +78,118 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ═════════════════════════════════════════════════════
-# 模块1: 股票池获取
-# ═════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# 模块1: 股票池
+# ══════════════════════════════════════════════════════════════
 
-def _fetch_wikipedia_tickers(url: str, col_name: str, label: str) -> list[str]:
+def _wiki_tickers(url: str, col: str, label: str) -> list:
     try:
-        tables = pd.read_html(url)
-        for t in tables:
-            if col_name in t.columns:
-                tickers = t[col_name].dropna().tolist()
-                tickers = [str(tk).strip().replace(".", "-") for tk in tickers]
-                log.info(f"  {label}: {len(tickers)} 只")
-                return tickers
+        for t in pd.read_html(url):
+            if col in t.columns:
+                result = [str(s).strip().replace(".", "-")
+                          for s in t[col].dropna()]
+                log.info(f"  {label}: {len(result)} 只")
+                return result
     except Exception as e:
         log.warning(f"  {label} 获取失败: {e}")
     return []
 
 
-def get_universe() -> list[str]:
-    """
-    构建全美有期权股票池。
-
-    免费方案策略:
-      S&P 500  (~500只) + 纳斯达克100 (~100只) + 补充热门标的
-      合并去重后约 650 只，覆盖美股绝大多数有期权流动性标的。
-
-    如需扩展到 ~4000 只全量有期权标的，可取消
-    下方 CBOE 注释块，但运行时间会增加到 2~3 小时。
-    """
+def get_universe() -> list:
     log.info("构建股票池...")
     tickers = set()
-
-    # S&P 500
-    tickers.update(_fetch_wikipedia_tickers(
+    tickers.update(_wiki_tickers(
         "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-        "Symbol", "S&P 500"
-    ))
-
-    # 纳斯达克 100
-    tickers.update(_fetch_wikipedia_tickers(
+        "Symbol", "S&P 500"))
+    tickers.update(_wiki_tickers(
         "https://en.wikipedia.org/wiki/Nasdaq-100",
-        "Ticker", "纳斯达克 100"
-    ))
-
-    # 补充高流动性热门标的 (大量期权活动但可能不在指数内)
-    supplemental = [
-        # 热门成长股 / 高波动标的
+        "Ticker", "Nasdaq 100"))
+    tickers.update([
         "TSLA", "NVDA", "AMD", "MSTR", "COIN", "PLTR", "SOFI", "RIVN",
         "LCID", "NIO", "BABA", "JD", "PDD", "XPEV", "DKNG", "HOOD",
         "RBLX", "SNAP", "UBER", "LYFT", "ABNB", "DASH", "NET", "DDOG",
         "SNOW", "CRWD", "OKTA", "ZS", "MDB", "SMCI", "ARM", "AVGO",
         "AAPL", "MSFT", "AMZN", "GOOGL", "META", "NFLX", "INTC",
-        # 高流动性 ETF (期权市场最活跃的品种)
-        "SPY", "QQQ", "IWM", "GLD", "SLV", "TLT", "XLF", "XLE",
-        "XLK", "ARKK", "SQQQ", "TQQQ", "SPXU", "VIX",
-    ]
-    tickers.update(supplemental)
-
+        "SPY", "QQQ", "IWM", "GLD", "TLT", "XLF", "XLE", "XLK", "ARKK",
+    ])
     result = sorted(tickers)
     log.info(f"  股票池合计: {len(result)} 只\n")
     return result
 
-    # ── 可选扩展: CBOE 全量有期权标的 (~4000只) ──────────────
-    # 取消注释后，上面的 return 要删掉
-    #
-    # try:
-    #     url = ("https://www.cboe.com/us/options/symboldir/"
-    #            "equity_index_options/?download=csv")
-    #     df = pd.read_csv(url, skiprows=2, header=0)
-    #     cboe = df.iloc[:, 0].dropna().str.strip().tolist()
-    #     tickers.update(cboe)
-    #     log.info(f"  CBOE 全量: {len(cboe)} 只")
-    # except Exception as e:
-    #     log.warning(f"  CBOE 下载失败: {e}")
-    #
-    # return sorted(tickers)
 
+# ══════════════════════════════════════════════════════════════
+# 模块2: 支撑位
+# ══════════════════════════════════════════════════════════════
 
-# ═════════════════════════════════════════════════════
-# 模块2: 支撑位识别
-# ═════════════════════════════════════════════════════
-
-def find_support_levels(close: pd.Series, window: int = 5) -> list[float]:
-    """
-    通过滚动局部最低点方法识别支撑位。
-    合并距离 < 2% 的相近支撑位，返回从低到高排列的价格列表。
-    """
-    supports = []
+def find_supports(close: pd.Series, window: int = 5) -> list:
     prices = close.values
-
+    raw = []
     for i in range(window, len(prices) - window):
-        segment = prices[i - window: i + window + 1]
-        if prices[i] == segment.min():
-            supports.append(float(prices[i]))
-
-    if not supports:
+        seg = prices[i - window: i + window + 1]
+        if prices[i] == seg.min():
+            raw.append(float(prices[i]))
+    if not raw:
         return []
-
-    # 合并相近支撑位 (差距 < 2% 视为同一支撑)
-    supports = sorted(set(supports))
-    merged = [supports[0]]
-    for p in supports[1:]:
+    merged = [sorted(set(raw))[0]]
+    for p in sorted(set(raw))[1:]:
         if (p - merged[-1]) / merged[-1] > 0.02:
             merged.append(p)
-
     return merged
 
 
-def check_support(price: float, supports: list[float], tol: float) -> tuple[bool, float, float]:
-    """
-    判断价格是否在某支撑位附近。
-
-    Returns:
-        (命中, 最近支撑位价格, 距支撑位百分比)
-    """
+def check_support(price: float, supports: list,
+                  tol: float) -> tuple:
     if not supports:
         return False, 0.0, 99.0
-
     dists = [(abs(price - s) / s, s) for s in supports]
     min_dist, nearest = min(dists, key=lambda x: x[0])
-
-    # 必须在支撑位上方或仅轻微跌破 (≤1%)
-    above = price >= nearest * 0.99
-
-    hit = (min_dist <= tol) and above
+    hit = (min_dist <= tol) and (price >= nearest * 0.99)
     return hit, round(nearest, 2), round(min_dist * 100, 2)
 
 
-# ═════════════════════════════════════════════════════
-# 模块3: 期权异常检测
-# ═════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# 模块3: 动量
+# ══════════════════════════════════════════════════════════════
 
-def scan_options(tk: yf.Ticker, price: float, cfg: dict) -> dict | None:
+def calc_momentum(hist: pd.DataFrame) -> dict:
+    close  = hist["Close"]
+    volume = hist["Volume"]
+    m5d    = float((close.iloc[-1] / close.iloc[-6] - 1)) if len(close) >= 6 else 0.0
+    vol5   = float(volume.iloc[-5:].mean())  if len(volume) >= 5  else 0.0
+    vol20  = float(volume.iloc[-20:].mean()) if len(volume) >= 20 else vol5
+    ma20   = float(close.iloc[-20:].mean())  if len(close)  >= 20 else float(close.mean())
+    return {
+        "momentum_5d": round(m5d * 100, 2),
+        "vol_trend":   round(vol5 / (vol20 + 1), 2),
+        "above_ma20":  bool(close.iloc[-1] >= ma20),
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# 模块4: 期权逐行权价扫描
+# ══════════════════════════════════════════════════════════════
+
+def scan_options_by_strike(tk, price: float, cfg: dict):
     """
-    扫描期权链，寻找 Call OI + 成交量异常信号。
+    逐行权价扫描所有到期日，找出五因子综合评分最高的单个合约。
 
-    修复说明:
-      - vol/oi 统一用汇总口径计算 (total_vol / total_oi)，与 call_oi/call_volume 一致
-      - 新增 put_call_ratio: put总OI / call总OI，越低说明看涨情绪越强
-      - 新增 otm_call_pct: OTM call OI 占比，机构倾向买 OTM 表达方向性押注
-      - 评分重构: 成交量绝对值 + vol/oi活跃度 + OTM押注强度
+    评分分项 (满分 100):
+      A. 成交量绝对值  (max 35): 当日成交量越大资金流入越真实
+      B. OI集中度      (max 25): 该行权价OI / 同到期日均OI倍数
+      C. Vol/OI活跃度  (max 20): 当日异常活跃程度
+      D. 方向性        (max 12): OTM区间适中 + Put/Call低
+      E. 到期时间      (max  8): 偏好30~45天 (Theta可控，杠杆足)
     """
     try:
         expirations = tk.options
     except Exception:
         return None
-
     if not expirations:
         return None
 
     today = datetime.today().date()
-    best = None
+    best_strike = None
+    best_score  = -1.0
 
     for exp_str in expirations:
         try:
@@ -235,143 +203,165 @@ def scan_options(tk: yf.Ticker, price: float, cfg: dict) -> dict | None:
 
         try:
             chain = tk.option_chain(exp_str)
-            calls = chain.calls.copy()
-            puts  = chain.puts.copy()
+            calls = chain.calls.copy().fillna(0)
+            puts  = chain.puts.copy().fillna(0)
         except Exception:
             continue
 
         if calls.empty:
             continue
 
-        calls = calls.fillna(0)
-        puts  = puts.fillna(0)
+        mean_oi_exp   = calls["openInterest"].mean()
+        total_put_oi  = puts["openInterest"].sum()
+        total_call_oi = calls["openInterest"].sum()
+        pc_ratio      = total_put_oi / (total_call_oi + 1)
 
-        # ── ATM 附近的 call (85%~120% 当前价) ──
-        calls_atm = calls[
-            (calls["strike"] >= price * 0.85) &
-            (calls["strike"] <= price * 1.20)
+        otm_lo = price * (1 + cfg["otm_min"])
+        otm_hi = price * (1 + cfg["otm_max"])
+        candidates = calls[
+            (calls["strike"] >= otm_lo) &
+            (calls["strike"] <= otm_hi)
         ]
-        if calls_atm.empty:
-            continue
 
-        # 全部汇总 (统一口径)
-        total_call_oi  = int(calls_atm["openInterest"].sum())
-        total_call_vol = int(calls_atm["volume"].sum())
+        for _, row in candidates.iterrows():
+            strike = float(row["strike"])
+            oi     = int(row["openInterest"])
+            vol    = int(row["volume"])
+            bid    = float(row.get("bid", 0))
+            ask    = float(row.get("ask", 0))
+            iv     = float(row.get("impliedVolatility", 0))
 
-        if total_call_oi < cfg["min_oi"] or total_call_vol < cfg["min_call_volume"]:
-            continue
+            if oi < cfg["min_strike_oi"] or vol < cfg["min_strike_vol"]:
+                continue
 
-        # vol/oi: 全部用汇总数据，口径统一
-        vol_oi = round(total_call_vol / (total_call_oi + 1), 3)
-        if vol_oi < cfg["min_vol_oi_ratio"]:
-            continue
+            otm_pct = (strike - price) / price
 
-        # ── OTM call 占比 (行权价 > 当前价的 call OI 占比) ──
-        otm_calls = calls_atm[calls_atm["strike"] > price * 1.01]
-        otm_call_pct = round(
-            otm_calls["openInterest"].sum() / (total_call_oi + 1), 3
-        )
+            # A. 成交量分
+            vol_score = min(vol / 200, 35)
 
-        # ── Put/Call OI 比值 (越低越看涨) ──
-        puts_atm = puts[
-            (puts["strike"] >= price * 0.85) &
-            (puts["strike"] <= price * 1.15)
-        ]
-        put_oi = int(puts_atm["openInterest"].sum()) if not puts_atm.empty else 0
-        pc_ratio = round(put_oi / (total_call_oi + 1), 3)
+            # B. OI集中度分
+            oi_ratio  = oi / (mean_oi_exp + 1)
+            oi_score  = min(oi_ratio * 5, 25)
 
-        # ── 最大 OI 行权价 (机构集中押注位) ──
-        top_idx    = calls_atm["openInterest"].idxmax()
-        top_strike = float(calls_atm.loc[top_idx, "strike"])
+            # C. Vol/OI活跃度分
+            vol_oi    = vol / (oi + 1)
+            act_score = min(vol_oi * 40, 20)
 
-        # ── 评分重构 ──
-        # 1. 成交量规模分 (max 40): 真实流量大小
-        vol_score = min(total_call_vol / 500, 40)
-        # 2. 活跃度分 (max 30): vol/oi 越高当日越异常
-        activity_score = min(vol_oi * 60, 30)
-        # 3. OTM押注分 (max 20): 机构倾向买 OTM 表达看涨
-        otm_score = otm_call_pct * 20
-        # 4. 看涨情绪分 (max 10): put/call 越低越看涨
-        bullish_score = max(0, 10 - pc_ratio * 10)
+            # D. 方向性分
+            if 0.05 <= otm_pct <= 0.10:
+                otm_score = 8   # 最理想区间
+            elif 0.02 <= otm_pct < 0.05:
+                otm_score = 5
+            elif otm_pct < 0.02:
+                otm_score = 3   # ATM，方向性弱
+            else:
+                otm_score = 2   # 太深OTM
+            pc_score  = max(0, 4 - pc_ratio * 4)
+            dir_score = otm_score + pc_score
 
-        opt_score = round(vol_score + activity_score + otm_score + bullish_score, 2)
+            # E. 到期时间分
+            if 30 <= dte <= 45:
+                dte_score = 8
+            elif 20 <= dte < 30 or 45 < dte <= 55:
+                dte_score = 5
+            else:
+                dte_score = 2
 
-        candidate = {
-            "expiry":        exp_str,
-            "dte":           dte,
-            "call_oi":       total_call_oi,
-            "call_volume":   total_call_vol,
-            "vol_oi":        vol_oi,          # 统一汇总口径
-            "top_strike":    top_strike,
-            "otm_call_pct":  otm_call_pct,
-            "pc_ratio":      pc_ratio,
-            "opt_score":     opt_score,
-        }
+            total = round(vol_score + oi_score + act_score
+                          + dir_score + dte_score, 2)
 
-        if best is None or opt_score > best["opt_score"]:
-            best = candidate
+            if total > best_score:
+                best_score  = total
+                mid_price   = round((bid + ask) / 2, 2) if (bid + ask) > 0 else None
+                best_strike = {
+                    "expiry":     exp_str,
+                    "dte":        dte,
+                    "strike":     strike,
+                    "otm_pct":    round(otm_pct * 100, 1),
+                    "strike_oi":  oi,
+                    "strike_vol": vol,
+                    "vol_oi":     round(vol_oi, 3),
+                    "oi_ratio":   round(oi_ratio, 1),
+                    "iv_pct":     round(iv * 100, 1),
+                    "mid_price":  mid_price,
+                    "pc_ratio":   round(pc_ratio, 2),
+                    "opt_score":  total,
+                }
 
         time.sleep(0.04)
 
-    return best
+    return best_strike
 
 
-# ═════════════════════════════════════════════════════
-# 模块4: 单只股票完整分析
-# ═════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# 模块5: 单只股票分析
+# ══════════════════════════════════════════════════════════════
 
-def analyze(ticker: str, cfg: dict) -> dict | None:
-    """
-    对单只股票执行双因子检测，返回信号字典或 None。
-    """
+def analyze(ticker: str, cfg: dict):
     try:
         time.sleep(cfg["delay_per_ticker"])
-        tk = yf.Ticker(ticker)
+        tk   = yf.Ticker(ticker)
+        hist = tk.history(period=f"{cfg['support_window']}d",
+                          interval="1d", auto_adjust=True)
 
-        # 获取价格历史
-        hist = tk.history(period=f"{cfg['support_window']}d", interval="1d", auto_adjust=True)
-        if hist.empty or len(hist) < 15:
+        if hist.empty or len(hist) < 20:
             return None
 
-        price      = float(hist["Close"].iloc[-1])
-        avg_vol    = float(hist["Volume"].mean())
-        price_chg  = round((hist["Close"].iloc[-1] / hist["Close"].iloc[-2] - 1) * 100, 2)
+        price   = float(hist["Close"].iloc[-1])
+        avg_vol = float(hist["Volume"].mean())
+        chg_pct = round((hist["Close"].iloc[-1] /
+                         hist["Close"].iloc[-2] - 1) * 100, 2)
 
-        # ── 流动性过滤 ──
         if price < cfg["min_price"] or avg_vol < cfg["min_avg_volume"]:
             return None
 
-        # ── 因子1: 支撑位 ──
-        supports = find_support_levels(hist["Close"], window=cfg["local_min_window"])
-        hit, nearest_sup, dist_pct = check_support(price, supports, cfg["support_tolerance"])
+        # 因子1: 支撑位
+        supports = find_supports(hist["Close"], cfg["local_min_window"])
+        hit, nearest_sup, dist_pct = check_support(
+            price, supports, cfg["support_tolerance"])
         if not hit:
             return None
 
-        # ── 因子2: 期权异常 ──
-        opt = scan_options(tk, price, cfg)
+        # 因子5: 动量过滤
+        mom = calc_momentum(hist)
+        if (cfg["min_momentum_5d"] is not None and
+                mom["momentum_5d"] < cfg["min_momentum_5d"] * 100):
+            return None
+
+        # 因子2~4: 期权逐行权价扫描
+        opt = scan_options_by_strike(tk, price, cfg)
         if opt is None:
             return None
 
-        # 综合评分: 支撑位得分 (越靠近支撑位越高) + 期权得分
-        sup_score   = (cfg["support_tolerance"] * 100 - dist_pct) / (cfg["support_tolerance"] * 100) * 30
-        total_score = round(sup_score + opt["opt_score"], 2)
+        # 综合评分
+        sup_score = ((cfg["support_tolerance"] * 100 - dist_pct)
+                     / (cfg["support_tolerance"] * 100) * 20)
+        mom_score = (min(mom["vol_trend"], 2) / 2 * 6
+                     + (4 if mom["above_ma20"] else 0))
+        total_score = round(sup_score + mom_score + opt["opt_score"], 2)
 
         return {
-            "ticker":          ticker,
-            "price":           round(price, 2),
-            "chg_pct":         price_chg,
-            "avg_vol_m":       round(avg_vol / 1e6, 2),
-            "nearest_support": nearest_sup,
-            "dist_to_sup_%":   dist_pct,
-            "expiry":          opt["expiry"],
-            "dte":             opt["dte"],
-            "call_oi":         opt["call_oi"],
-            "call_volume":     opt["call_volume"],
-            "vol/oi":          opt["vol_oi"],        # 统一汇总口径
-            "top_strike":      opt["top_strike"],
-            "otm_call_%":      round(opt["otm_call_pct"] * 100, 1),  # OTM call占比%
-            "put/call":        opt["pc_ratio"],       # 越低越看涨
-            "score":           total_score,
+            "ticker":      ticker,
+            "price":       round(price, 2),
+            "chg_%":       chg_pct,
+            "avg_vol_m":   round(avg_vol / 1e6, 2),
+            "support":     nearest_sup,
+            "dist_%":      dist_pct,
+            "mom_5d_%":    mom["momentum_5d"],
+            "vol_trend":   mom["vol_trend"],
+            "above_ma20":  mom["above_ma20"],
+            "expiry":      opt["expiry"],
+            "dte":         opt["dte"],
+            "strike":      opt["strike"],
+            "otm_%":       opt["otm_pct"],
+            "mid_price":   opt["mid_price"],
+            "iv_%":        opt["iv_pct"],
+            "strike_oi":   opt["strike_oi"],
+            "strike_vol":  opt["strike_vol"],
+            "vol/oi":      opt["vol_oi"],
+            "oi_ratio":    opt["oi_ratio"],
+            "put/call":    opt["pc_ratio"],
+            "score":       total_score,
         }
 
     except Exception as e:
@@ -379,32 +369,31 @@ def analyze(ticker: str, cfg: dict) -> dict | None:
         return None
 
 
-# ═════════════════════════════════════════════════════
-# 模块5: 主流程
-# ═════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# 模块6: 主流程
+# ══════════════════════════════════════════════════════════════
 
 def run(cfg: dict) -> pd.DataFrame:
     print()
-    print("╔══════════════════════════════════════════════════════╗")
-    print("║        美股期权双因子筛选器 (盘后版)                 ║")
-    print("║  因子1: 股价在支撑位附近                             ║")
-    print("║  因子2: Call OI 异常 + Call 成交量异常               ║")
-    print("╚══════════════════════════════════════════════════════╝")
+    print("╔══════════════════════════════════════════════════════════╗")
+    print("║       美股期权筛选器 v3  -  五因子综合评分               ║")
+    print("║  1.支撑位  2.成交量  3.OI集中度  4.方向性  5.动量        ║")
+    print("╚══════════════════════════════════════════════════════════╝")
     print(f"  运行时间 : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  支撑容差 : ±{cfg['support_tolerance']*100:.0f}%")
-    print(f"  OI 门槛  : {cfg['min_oi']:,}")
+    print(f"  支撑容差 : +-{cfg['support_tolerance']*100:.0f}%")
     print(f"  到期范围 : {cfg['min_dte']} ~ {cfg['max_dte']} 天")
+    print(f"  OTM范围  : {cfg['otm_min']*100:.0f}% ~ {cfg['otm_max']*100:.0f}%")
+    print(f"  OI门槛   : {cfg['min_strike_oi']:,} (单行权价)")
     print(f"  并发线程 : {cfg['workers']}")
     print()
 
     universe = get_universe()
-    signals  = []
-    errors   = 0
+    signals, errors = [], 0
 
     with ThreadPoolExecutor(max_workers=cfg["workers"]) as pool:
         futures = {pool.submit(analyze, tk, cfg): tk for tk in universe}
-
-        with tqdm(total=len(universe), desc="扫描中", ncols=72, unit="只") as bar:
+        with tqdm(total=len(universe), desc="扫描中",
+                  ncols=75, unit="只") as bar:
             for future in as_completed(futures):
                 tk = futures[future]
                 try:
@@ -412,12 +401,13 @@ def run(cfg: dict) -> pd.DataFrame:
                     if res:
                         signals.append(res)
                         tqdm.write(
-                            f"  ✅ {tk:<6}  ${res['price']:>8.2f}"
-                            f"  支撑距离={res['dist_to_sup_%']:.1f}%"
-                            f"  CallOI={res['call_oi']:>7,}"
-                            f"  Vol/OI={res['vol/oi']:.2f}"
-                            f"  P/C={res['put/call']:.2f}"
-                            f"  评分={res['score']:.1f}"
+                            f"  OK {tk:<6} ${res['price']:>8.2f}"
+                            f"  dist={res['dist_%']:.1f}%"
+                            f"  {res['strike']}C {res['expiry']}"
+                            f"  OTM={res['otm_%']:.1f}%"
+                            f"  OIx{res['oi_ratio']:.1f}"
+                            f"  V/OI={res['vol/oi']:.2f}"
+                            f"  score={res['score']:.1f}"
                         )
                 except Exception:
                     errors += 1
@@ -425,83 +415,88 @@ def run(cfg: dict) -> pd.DataFrame:
                     bar.update(1)
 
     if not signals:
-        print("\n⚠️  本次未找到符合条件的标的。建议尝试放宽参数：")
-        print("   --tolerance 0.05   (支撑位容差放宽到5%)")
-        print("   --min-oi 200       (降低OI门槛)")
-        print("   --min-vol 100      (降低成交量门槛)")
+        print("\n  No signals found. Try:")
+        print("   --tolerance 0.05")
+        print("   --min-oi 200")
         return pd.DataFrame()
 
-    df = (
-        pd.DataFrame(signals)
-        .sort_values("score", ascending=False)
-        .head(cfg["top_n"])
-        .reset_index(drop=True)
-    )
-    df.index += 1  # 从1开始编号
-
-    # ── 打印结果表 ──
-    print(f"\n{'═'*60}")
-    print(f"  筛选完成  ·  命中 {len(signals)} 只  ·  展示前 {cfg['top_n']} 名")
-    print(f"{'═'*60}\n")
+    df = (pd.DataFrame(signals)
+          .sort_values("score", ascending=False)
+          .head(cfg["top_n"])
+          .reset_index(drop=True))
+    df.index += 1
 
     display_cols = [
-        "ticker", "price", "chg_pct", "nearest_support", "dist_to_sup_%",
-        "expiry", "dte", "call_oi", "call_volume", "vol/oi",
-        "top_strike", "otm_call_%", "put/call", "score"
+        "ticker", "price", "chg_%", "support", "dist_%",
+        "mom_5d_%", "vol_trend", "above_ma20",
+        "expiry", "dte", "strike", "otm_%", "mid_price", "iv_%",
+        "strike_oi", "strike_vol", "vol/oi", "oi_ratio", "put/call",
+        "score",
     ]
     pd.set_option("display.max_columns", None)
-    pd.set_option("display.width", 140)
+    pd.set_option("display.width", 180)
     pd.set_option("display.float_format", "{:.2f}".format)
+
+    print(f"\n{'='*65}")
+    print(f"  Done: {len(signals)} signals found, top {cfg['top_n']} shown")
+    print(f"{'='*65}\n")
     print(df[display_cols].to_string())
 
-    # ── 保存 CSV ──
-    df.to_csv(cfg["output_csv"], index=True, encoding="utf-8-sig")
-    print(f"\n  💾 结果已保存: {cfg['output_csv']}")
-    print(f"  ⚠️  扫描出错标的数: {errors}  (通常是无期权或被限速)")
-    print()
+    print("""
+  Column Guide:
+  strike     : recommended strike price to watch
+  otm_%      : how far OTM (5~10% is ideal for directional bets)
+  mid_price  : option mid price in USD (bid/ask midpoint)
+  iv_%       : implied volatility (lower = cheaper entry)
+  oi_ratio   : this strike's OI vs avg OI for same expiry (>3x = unusual)
+  vol/oi     : daily volume / OI  (>0.3 = abnormally active today)
+  put/call   : put OI / call OI   (<0.5 = strong bullish sentiment)
+  vol_trend  : 5d avg vol / 20d avg vol  (>1.2 = volume expanding)
+""")
 
+    df.to_csv(cfg["output_csv"], index=True, encoding="utf-8-sig")
+    print(f"  Saved: {cfg['output_csv']}")
+    print(f"  Errors: {errors}")
+    print()
     return df
 
 
-# ═════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 # 入口
-# ═════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 
 def main():
     p = argparse.ArgumentParser(
-        description="美股期权双因子筛选器",
+        description="US Options Screener v3 - 5-Factor Scoring",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--top",       type=int,   default=CONFIG["top_n"],
-                   help="输出前N名")
-    p.add_argument("--workers",   type=int,   default=CONFIG["workers"],
-                   help="并发线程数")
+    p.add_argument("--top",       type=int,   default=CONFIG["top_n"])
+    p.add_argument("--workers",   type=int,   default=CONFIG["workers"])
     p.add_argument("--tolerance", type=float, default=CONFIG["support_tolerance"],
-                   help="支撑位容差, 如 0.03 = 3%%")
-    p.add_argument("--min-oi",    type=int,   default=CONFIG["min_oi"],
-                   help="最小 Call OI")
-    p.add_argument("--min-vol",   type=int,   default=CONFIG["min_call_volume"],
-                   help="最小 Call 日成交量")
-    p.add_argument("--min-dte",   type=int,   default=CONFIG["min_dte"],
-                   help="最短到期天数")
-    p.add_argument("--max-dte",   type=int,   default=CONFIG["max_dte"],
-                   help="最长到期天数")
-    p.add_argument("--output",    type=str,   default=CONFIG["output_csv"],
-                   help="输出 CSV 文件名")
+                   help="support tolerance e.g. 0.03=3%%")
+    p.add_argument("--min-oi",    type=int,   default=CONFIG["min_strike_oi"],
+                   help="min OI per strike")
+    p.add_argument("--min-vol",   type=int,   default=CONFIG["min_strike_vol"],
+                   help="min daily volume per strike")
+    p.add_argument("--min-dte",   type=int,   default=CONFIG["min_dte"])
+    p.add_argument("--max-dte",   type=int,   default=CONFIG["max_dte"])
+    p.add_argument("--otm-max",   type=float, default=CONFIG["otm_max"],
+                   help="max OTM e.g. 0.15=15%%")
+    p.add_argument("--output",    type=str,   default=CONFIG["output_csv"])
     args = p.parse_args()
 
     cfg = CONFIG.copy()
     cfg.update({
-        "top_n":              args.top,
-        "workers":            args.workers,
-        "support_tolerance":  args.tolerance,
-        "min_oi":             args.min_oi,
-        "min_call_volume":    args.min_vol,
-        "min_dte":            args.min_dte,
-        "max_dte":            args.max_dte,
-        "output_csv":         args.output,
+        "top_n":             args.top,
+        "workers":           args.workers,
+        "support_tolerance": args.tolerance,
+        "min_strike_oi":     args.min_oi,
+        "min_strike_vol":    args.min_vol,
+        "min_dte":           args.min_dte,
+        "max_dte":           args.max_dte,
+        "otm_max":           args.otm_max,
+        "output_csv":        args.output,
     })
-
     run(cfg)
 
 
