@@ -28,6 +28,9 @@ jobs:
         run: pip install yfinance pandas numpy requests tqdm lxml
 
       - name: Run screener
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python options_screener.py --top 20 --workers 6
 
       - name: Upload CSV artifact
