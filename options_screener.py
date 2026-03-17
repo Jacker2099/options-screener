@@ -696,8 +696,7 @@ def scan_options_by_strike(tk, price: float, cfg: dict,
 
 def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
             oi_snapshot: dict, iv_history: dict,
-            persistent_signals: set,
-            market_penalty: int = 0) -> dict | None:
+            persistent_signals: set) -> dict | None:
     try:
         time.sleep(cfg["delay_per_ticker"])
         tk   = yf.Ticker(ticker)
@@ -715,10 +714,8 @@ def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
         if price < cfg["min_price"] or avg_vol < cfg["min_avg_volume"]:
             return None
 
-        # 相对强弱过滤
+        # 相对强弱 (仅作评分参考，不过滤)
         rs = calc_rs(hist, spy_hist, cfg["rs_window"])
-        if rs < cfg["min_rs_ratio"]:
-            return None
 
         # 支撑位 (含强度验证)
         supports = find_supports_with_strength(hist["Close"], cfg["local_min_window"])
@@ -764,11 +761,10 @@ def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
         # 财报窗口扣分
         earnings_penalty = -15 if in_earnings_window else 0
 
-        market_env_label = "🟢正常" if market_penalty == 0 else ("🔴极险" if market_penalty <= -15 else "🟡偏弱")
         total_score = round(
             sup_score + mom_score + pos_score + rs_score +
             touch_score + persist_score + earnings_penalty +
-            market_penalty + opt["opt_score"], 2)
+            opt["opt_score"], 2)
 
         return {
             "代码":           ticker,
@@ -800,7 +796,6 @@ def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
             "OI集中倍数":     opt["oi_ratio"],
             "OI日变化%":      opt["oi_change_pct"],
             "认沽认购比":     opt["pc_ratio"],
-            "大盘风险":       market_env_label,
             "综合评分":       total_score,
         }
 
@@ -1068,8 +1063,7 @@ def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
     with ThreadPoolExecutor(max_workers=cfg["workers"]) as pool:
         futures = {
             pool.submit(analyze, tk, cfg, spy_hist, oi_snapshot,
-                        iv_history, persistent_signals,
-                        market_env.get("score_penalty", 0)): tk
+                        iv_history, persistent_signals): tk
             for tk in universe
         }
         with tqdm(total=total_scanned, desc="扫描中", ncols=75, unit="只") as bar:
@@ -1131,7 +1125,7 @@ def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
     print(f"{'='*70}\n")
 
     data_cols = [
-        "代码","板块","大盘风险","股价","当日涨跌%","相对强弱RS","最近支撑位","距支撑%","支撑验证次数",
+        "代码","板块","股价","当日涨跌%","相对强弱RS","最近支撑位","距支撑%","支撑验证次数",
         "5日动量%","量能趋势","在均线上方","52周位置%",
         "财报日","财报在窗口内","连续信号",
         "到期日","剩余天数","行权价","虚值幅度%","期权参考价","隐含波动率%","IV百分位",
