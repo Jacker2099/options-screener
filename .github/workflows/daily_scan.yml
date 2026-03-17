@@ -1,1 +1,47 @@
-00000
+name: Daily Options Scan
+
+on:
+  schedule:
+    - cron: '0 22 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install yfinance pandas numpy requests tqdm lxml
+
+      - name: 运行筛选器
+        run: python options_screener.py --top 20 --workers 6
+
+      - name: 上传结果 CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: signals-${{ github.run_number }}
+          path: signals_*.csv
+          retention-days: 30
+
+      - name: 提交结果到仓库
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p results
+          cp signals_*.csv results/ 2>/dev/null || true
+          git add results/
+          git diff --staged --quiet || git commit -m "scan $(date +'%Y-%m-%d')"
+          git push
