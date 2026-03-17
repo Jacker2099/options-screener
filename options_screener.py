@@ -57,13 +57,15 @@ CONFIG = {
     "otm_min":               0.00,
     "otm_max":               0.15,
 
-    # OI 净变化
+    # OI 净变化 (核心信号)
     "oi_snapshot_file":      "oi_snapshot.json",   # 本地OI快照文件
-    "min_oi_increase_pct":   10.0,                 # OI净增加至少10%才算新资金
+    "oi_history_file":       "oi_history.json",    # 多日OI历史，用于连续增长检测
+    "min_oi_increase_pct":   5.0,                  # OI净增加至少5%进入候选
+    "oi_no_data_penalty":    False,                # 无历史数据时是否降权(False=不惩罚，等数据积累)
 
     # IV 历史百分位
     "iv_history_file":       "iv_history.json",    # 本地IV历史文件
-    "max_iv_percentile":     70.0,                 # IV百分位超过70%不买
+    "max_iv_percentile":     80.0,                 # IV百分位超过80%不买(放宽，避免过滤太多)
 
     # 信号持续性
     "results_dir":           "results",            # 历史CSV目录
@@ -323,6 +325,53 @@ def save_oi_snapshot(snapshot: dict, filepath: str):
         log.warning(f"OI快照保存失败: {e}")
 
 
+def load_oi_history(filepath: str) -> dict:
+    """加载多日 OI 历史 {key: [oi_day-2, oi_day-1, oi_today]}"""
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_oi_history(oi_history: dict, filepath: str):
+    """保存多日 OI 历史，每个 key 只保留最近3天"""
+    try:
+        # 只保留最近3条，节省空间
+        trimmed = {k: v[-3:] for k, v in oi_history.items()}
+        with open(filepath, "w") as f:
+            json.dump(trimmed, f)
+    except Exception as e:
+        log.warning(f"OI历史保存失败: {e}")
+
+
+def update_oi_history(key: str, current_oi: int, oi_history: dict):
+    """把今日 OI 追加到历史队列"""
+    if key not in oi_history:
+        oi_history[key] = []
+    # 避免同一天重复追加
+    oi_history[key].append(current_oi)
+
+
+def calc_oi_consecutive_growth(key: str, oi_history: dict) -> int:
+    """
+    计算 OI 连续增长天数。
+    返回: 0=无增长, 1=今日增长, 2=连续2天增长, 3=连续3天增长
+    """
+    records = oi_history.get(key, [])
+    if len(records) < 2:
+        return 0
+    consecutive = 0
+    for i in range(len(records) - 1, 0, -1):
+        if records[i] > records[i-1] * 1.02:  # 至少增长2%才算
+            consecutive += 1
+        else:
+            break
+    return consecutive
+
+
 def calc_oi_change(ticker: str, expiry: str, strike: float,
                    current_oi: int, snapshot: dict) -> float:
     """
@@ -533,10 +582,29 @@ def calc_technicals(hist: pd.DataFrame) -> dict:
 # ══════════════════════════════════════════════════════════════
 
 def scan_options_by_strike(tk, price: float, cfg: dict,
-                           oi_snapshot: dict, iv_history: dict,
-                           ticker: str) -> dict | None:
+                           oi_snapshot: dict, oi_history: dict,
+                           iv_history: dict, ticker: str) -> dict | None:
     """
-    逐行权价扫描，五因子评分 + OI净变化 + IV百分位过滤。
+    逐行权价扫描 - OI净变化为核心，其他因子辅助。
+
+    新评分体系 (满分约 130):
+    ┌─────────────────────────────────────────────────────┐
+    │ 核心 (70分): OI净变化为主轴                         │
+    │   A. OI日净变化    (max 40) ← 最重要，新资金流入    │
+    │   B. OI连续增长    (max 20) ← 机构持续建仓          │
+    │   C. OI集中倍数    (max 10) ← 仓位集中度(log压缩)   │
+    ├─────────────────────────────────────────────────────┤
+    │ 辅助 (60分): 验证信号质量                           │
+    │   D. 成交量规模    (max 20) ← 流动性验证            │
+    │   E. Vol/OI活跃度  (max 15) ← 当日活跃程度          │
+    │   F. 方向性        (max 12) ← OTM区间+Put/Call      │
+    │   G. 到期时间      (max  8) ← 偏好30~45天           │
+    │   H. IV百分位      (max  5) ← 买入成本高低          │
+    └─────────────────────────────────────────────────────┘
+
+    OI净变化无历史数据时(第一天运行):
+      - 不惩罚，其他因子照常评分
+      - 在输出中标注"OI数据积累中"
     """
     try:
         expirations = tk.options
@@ -547,8 +615,8 @@ def scan_options_by_strike(tk, price: float, cfg: dict,
 
     today = datetime.today().date()
     best_strike = None
-    best_score  = -1.0
-    today_oi_updates = {}  # 用于更新今日快照
+    best_score  = -999.0
+    today_oi_updates = {}  # 用于更新今日OI快照
 
     for exp_str in expirations:
         try:
@@ -593,48 +661,84 @@ def scan_options_by_strike(tk, price: float, cfg: dict,
             if oi < cfg["min_strike_oi"] or vol < cfg["min_strike_vol"]:
                 continue
 
-            # 保存今日OI快照
+            # 保存今日OI快照 & 历史
             snap_key = f"{ticker}_{exp_str}_{strike}"
             today_oi_updates[snap_key] = oi
+            update_oi_history(snap_key, oi, oi_history)
 
-            # OI净变化
-            oi_change_pct = calc_oi_change(ticker, exp_str, strike,
-                                           oi, oi_snapshot)
+            # ── OI 净变化 (核心) ──
+            oi_change_pct   = calc_oi_change(ticker, exp_str, strike, oi, oi_snapshot)
+            oi_consecutive  = calc_oi_consecutive_growth(snap_key, oi_history)
+            has_oi_data     = (snap_key in oi_snapshot)  # 是否有历史数据
 
-            # IV百分位过滤
-            iv_pct_val = round(iv * 100, 1)
+            # OI平仓过滤：有历史数据且OI明显减少，跳过
+            if has_oi_data and oi_change_pct < -15:
+                continue  # OI减少超15%，机构在平仓，跳过
+
+            # IV 百分位
+            iv_pct_val    = round(iv * 100, 1)
             iv_percentile = calc_iv_percentile(ticker, iv_pct_val, iv_history)
             update_iv_history(ticker, iv_pct_val, iv_history)
 
+            # IV过高过滤
             if iv_percentile > cfg["max_iv_percentile"]:
-                continue  # IV过高，期权太贵，跳过
+                continue
 
-            otm_pct = (strike - price) / price
+            otm_pct  = (strike - price) / price
+            oi_ratio = oi / mean_oi_exp
+            vol_oi   = vol / (oi + 1)
 
-            # A. 成交量分 (max 35)
-            vol_score = min(vol / 200, 35)
+            # ══ A. OI日净变化分 (max 40) ← 核心 ══
+            if not has_oi_data:
+                # 无历史数据：给中性分，不惩罚也不奖励
+                oi_change_score = 15
+            elif oi_change_pct >= 50:
+                oi_change_score = 40   # 爆发式增长，极强信号
+            elif oi_change_pct >= 30:
+                oi_change_score = 32
+            elif oi_change_pct >= 20:
+                oi_change_score = 25
+            elif oi_change_pct >= 10:
+                oi_change_score = 18
+            elif oi_change_pct >= 5:
+                oi_change_score = 10
+            elif oi_change_pct >= 0:
+                oi_change_score = 5    # 小幅增长，弱信号
+            else:
+                oi_change_score = 0   # 轻微减少，中性（大幅减少已在上面过滤）
 
-            # B. OI集中度分 (max 25, log压缩)
-            oi_ratio  = oi / mean_oi_exp
-            oi_score  = min(math.log2(oi_ratio + 1) * 6, 25)
+            # ══ B. OI连续增长分 (max 20) ← 机构持续建仓 ══
+            if oi_consecutive >= 3:
+                consecutive_score = 20  # 连续3天及以上，机构持续重仓
+            elif oi_consecutive == 2:
+                consecutive_score = 14
+            elif oi_consecutive == 1:
+                consecutive_score = 7
+            else:
+                consecutive_score = 0
 
-            # C. Vol/OI 活跃度分 (max 20)
-            vol_oi    = vol / (oi + 1)
-            act_score = min(vol_oi * 40, 20)
+            # ══ C. OI集中倍数分 (max 10, log压缩) ══
+            oi_conc_score = min(math.log2(oi_ratio + 1) * 3, 10)
 
-            # D. 方向性分 (max 12)
+            # ══ D. 成交量规模分 (max 20) ══
+            vol_score = min(vol / 300, 20)
+
+            # ══ E. Vol/OI 活跃度分 (max 15) ══
+            act_score = min(vol_oi * 30, 15)
+
+            # ══ F. 方向性分 (max 12) ══
             if 0.05 <= otm_pct <= 0.10:
-                otm_score = 8
+                otm_score = 8   # 最理想区间
             elif 0.02 <= otm_pct < 0.05:
                 otm_score = 5
             elif otm_pct < 0.02:
-                otm_score = 3
+                otm_score = 3   # ATM，方向性弱
             else:
-                otm_score = 2
+                otm_score = 2   # 太深OTM
             pc_score  = max(0, 4 - pc_ratio * 4)
             dir_score = otm_score + pc_score
 
-            # E. 到期时间分 (max 8)
+            # ══ G. 到期时间分 (max 8) ══
             if 30 <= dte <= 45:
                 dte_score = 8
             elif 20 <= dte < 30 or 45 < dte <= 55:
@@ -642,17 +746,7 @@ def scan_options_by_strike(tk, price: float, cfg: dict,
             else:
                 dte_score = 2
 
-            # F. OI净变化加分 (max 10): 新资金流入才是真信号
-            if oi_change_pct >= 20:
-                oi_change_score = 10
-            elif oi_change_pct >= cfg["min_oi_increase_pct"]:
-                oi_change_score = 5
-            elif oi_change_pct < -10:
-                oi_change_score = -5  # OI在减少，可能是平仓
-            else:
-                oi_change_score = 0
-
-            # G. IV百分位加分 (max 5): IV越低买入越便宜
+            # ══ H. IV百分位加分 (max 5) ══
             if iv_percentile <= 30:
                 iv_score = 5
             elif iv_percentile <= 50:
@@ -660,27 +754,33 @@ def scan_options_by_strike(tk, price: float, cfg: dict,
             else:
                 iv_score = 0
 
-            total = round(vol_score + oi_score + act_score + dir_score
-                          + dte_score + oi_change_score + iv_score, 2)
+            total = round(
+                oi_change_score + consecutive_score + oi_conc_score +
+                vol_score + act_score + dir_score + dte_score + iv_score,
+                2)
 
             if total > best_score:
                 best_score  = total
                 mid_price   = round((bid + ask) / 2, 2) if (bid + ask) > 0 else None
                 best_strike = {
-                    "expiry":          exp_str,
-                    "dte":             dte,
-                    "strike":          strike,
-                    "otm_pct":         round(otm_pct * 100, 1),
-                    "strike_oi":       oi,
-                    "strike_vol":      vol,
-                    "vol_oi":          round(vol_oi, 3),
-                    "oi_ratio":        round(oi_ratio, 1),
-                    "oi_change_pct":   oi_change_pct,
-                    "iv_pct":          iv_pct_val,
-                    "iv_percentile":   iv_percentile,
-                    "mid_price":       mid_price,
-                    "pc_ratio":        round(pc_ratio, 2),
-                    "opt_score":       total,
+                    "expiry":           exp_str,
+                    "dte":              dte,
+                    "strike":           strike,
+                    "otm_pct":          round(otm_pct * 100, 1),
+                    "strike_oi":        oi,
+                    "strike_vol":       vol,
+                    "vol_oi":           round(vol_oi, 3),
+                    "oi_ratio":         round(oi_ratio, 1),
+                    "oi_change_pct":    oi_change_pct,
+                    "oi_consecutive":   oi_consecutive,
+                    "has_oi_data":      has_oi_data,
+                    "iv_pct":           iv_pct_val,
+                    "iv_percentile":    iv_percentile,
+                    "mid_price":        mid_price,
+                    "pc_ratio":         round(pc_ratio, 2),
+                    "oi_change_score":  oi_change_score,
+                    "consecutive_score":consecutive_score,
+                    "opt_score":        total,
                 }
 
         time.sleep(0.04)
@@ -695,7 +795,7 @@ def scan_options_by_strike(tk, price: float, cfg: dict,
 # ══════════════════════════════════════════════════════════════
 
 def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
-            oi_snapshot: dict, iv_history: dict,
+            oi_snapshot: dict, oi_history: dict, iv_history: dict,
             persistent_signals: set) -> dict | None:
     try:
         time.sleep(cfg["delay_per_ticker"])
@@ -734,7 +834,7 @@ def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
 
         # 期权扫描
         opt = scan_options_by_strike(tk, price, cfg, oi_snapshot,
-                                     iv_history, ticker)
+                                     oi_history, iv_history, ticker)
         if opt is None:
             return None
 
@@ -795,6 +895,8 @@ def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
             "量OI比":         opt["vol_oi"],
             "OI集中倍数":     opt["oi_ratio"],
             "OI日变化%":      opt["oi_change_pct"],
+            "OI连续增长天":   opt["oi_consecutive"],
+            "OI有历史数据":   opt["has_oi_data"],
             "认沽认购比":     opt["pc_ratio"],
             "综合评分":       total_score,
         }
@@ -836,14 +938,25 @@ def generate_interpretation(row: pd.Series) -> str:
         signals.append(f"强于大盘(RS={row['相对强弱RS']:.2f})")
     parts.append("，".join(signals))
 
-    # 期权信号
+    # 期权信号 - OI净变化为核心
     opt_parts = []
-    if row["OI日变化%"] >= 20:
-        opt_parts.append(f"今日OI新增{row['OI日变化%']:.0f}%(新资金流入🔥)")
+    if not row["OI有历史数据"]:
+        opt_parts.append("OI数据积累中(明日起显示净变化)")
+    elif row["OI日变化%"] >= 50:
+        opt_parts.append(f"🚨OI爆增{row['OI日变化%']:.0f}%(极强新资金信号)")
+    elif row["OI日变化%"] >= 30:
+        opt_parts.append(f"🔥OI大增{row['OI日变化%']:.0f}%(强资金流入)")
     elif row["OI日变化%"] >= 10:
-        opt_parts.append(f"今日OI新增{row['OI日变化%']:.0f}%")
-    elif row["OI日变化%"] < -10:
-        opt_parts.append(f"今日OI减少{abs(row['OI日变化%']):.0f}%(注意平仓⚠️)")
+        opt_parts.append(f"OI新增{row['OI日变化%']:.0f}%(新资金流入)")
+    elif row["OI日变化%"] >= 0:
+        opt_parts.append(f"OI小增{row['OI日变化%']:.0f}%")
+    else:
+        opt_parts.append(f"OI减少{row['OI日变化%']:.0f}%⚠️")
+
+    if row["OI连续增长天"] >= 3:
+        opt_parts.append(f"🔄连续{row['OI连续增长天']}天OI增长(机构持续建仓!)")
+    elif row["OI连续增长天"] == 2:
+        opt_parts.append(f"🔄连续2天OI增长(机构在建仓)")
 
     if row["OI集中倍数"] >= 10:
         opt_parts.append(f"OI高度集中{row['OI集中倍数']:.0f}倍")
@@ -935,7 +1048,24 @@ def send_to_telegram(df: pd.DataFrame, total_scanned: int,
         header += f"{sector_str}\n"
     header += "━━━━━━━━━━━━━━━━━━━━"
     _tg_send(token, chat_id, header)
-    time.sleep(0.5)
+    time.sleep(0.3)
+
+    # 🚨 先单独推送高优先信号 (OI爆增>=30% 或 连续3天增长)
+    hot = df[
+        (df["OI有历史数据"] == True) &
+        ((df["OI日变化%"] >= 30) | (df["OI连续增长天"] >= 3))
+    ]
+    if not hot.empty:
+        alert_lines = []
+        for _, r in hot.iterrows():
+            consec_str = f" 🔄连续{r['OI连续增长天']}天" if r["OI连续增长天"] >= 2 else ""
+            alert_lines.append(
+                f"🚨 <b>{r['代码']}</b> {r['行权价']}C {r['到期日']}"
+                f"  OI+{r['OI日变化%']:.0f}%{consec_str}"
+            )
+        alert_msg = "🚨 <b>高优先信号 (OI异常放大)</b>\n" + "\n".join(alert_lines)
+        _tg_send(token, chat_id, alert_msg)
+        time.sleep(0.3)
 
     for i, (_, row) in enumerate(df.iterrows()):
         medal     = MEDAL[i] if i < len(MEDAL) else f"{i+1}."
@@ -963,16 +1093,26 @@ def send_to_telegram(df: pd.DataFrame, total_scanned: int,
         else:
             pc_str = f"P/C={row['认沽认购比']:.2f}"
 
-        # OI变化
+        # OI变化 (核心信号)
         oi_chg = row["OI日变化%"]
-        if oi_chg >= 20:
-            oi_chg_str = f"🔥OI+{oi_chg:.0f}%(新资金)"
+        consec = row["OI连续增长天"]
+        has_data = row["OI有历史数据"]
+        if not has_data:
+            oi_chg_str = "📊OI数据积累中"
+        elif oi_chg >= 50:
+            oi_chg_str = f"🚨OI爆增+{oi_chg:.0f}%(极强新资金!)"
+        elif oi_chg >= 30:
+            oi_chg_str = f"🔥OI大增+{oi_chg:.0f}%(强资金流入)"
         elif oi_chg >= 10:
-            oi_chg_str = f"OI+{oi_chg:.0f}%"
-        elif oi_chg < -10:
-            oi_chg_str = f"⚠️OI{oi_chg:.0f}%(平仓)"
+            oi_chg_str = f"📈OI+{oi_chg:.0f}%(新资金流入)"
+        elif oi_chg >= 0:
+            oi_chg_str = f"OI+{oi_chg:.0f}%(小增)"
         else:
-            oi_chg_str = f"OI变化{oi_chg:.0f}%"
+            oi_chg_str = f"⚠️OI{oi_chg:.0f}%(减少)"
+        if consec >= 3:
+            oi_chg_str += f"  🔄连续{consec}天增长!"
+        elif consec == 2:
+            oi_chg_str += f"  🔄连续{consec}天增长"
 
         # IV百分位
         iv_pct_str = f"IV{row['IV百分位']:.0f}%分位"
@@ -991,12 +1131,13 @@ def send_to_telegram(df: pd.DataFrame, total_scanned: int,
         msg = (
             f"{medal} <b>{row['代码']}</b>  [{row['板块']}]  评分 <b>{row['综合评分']:.1f}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔑 {oi_chg_str}\n"
+            f"📊 {oi_str}  量OI比{row['量OI比']:.2f}  {pc_str}\n"
             f"💰 股价 <b>${row['股价']:.2f}</b>  当日{row['当日涨跌%']:+.2f}%\n"
             f"🛡 支撑 ${row['最近支撑位']:.2f}  距离{row['距支撑%']:.1f}%  验证{row['支撑验证次数']}次\n"
             f"🎯 关注 <b>{row['行权价']}C</b>  到期{row['到期日']}({row['剩余天数']}天)\n"
             f"💵 参考价{mid_str}  {iv_pct_str}  虚值{row['虚值幅度%']:.1f}%\n"
             f"{mom_icon} 动量{row['5日动量%']:+.1f}%  量能{row['量能趋势']:.2f}x  {above_str}  RS={row['相对强弱RS']:.2f}\n"
-            f"📊 {oi_str}  {oi_chg_str}  量OI比{row['量OI比']:.2f}  {pc_str}\n"
             f"🗒 {row['信号解读']}"
             f"{flags}"
         )
@@ -1035,6 +1176,7 @@ def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
 
     # 加载持久化数据
     oi_snapshot = load_oi_snapshot(cfg["oi_snapshot_file"])
+    oi_history  = load_oi_history(cfg["oi_history_file"])
     iv_history  = load_iv_history(cfg["iv_history_file"])
     persistent_signals = load_historical_signals(
         cfg["results_dir"], cfg["signal_lookback_days"])
@@ -1063,7 +1205,7 @@ def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
     with ThreadPoolExecutor(max_workers=cfg["workers"]) as pool:
         futures = {
             pool.submit(analyze, tk, cfg, spy_hist, oi_snapshot,
-                        iv_history, persistent_signals): tk
+                        oi_history, iv_history, persistent_signals): tk
             for tk in universe
         }
         with tqdm(total=total_scanned, desc="扫描中", ncols=75, unit="只") as bar:
@@ -1075,12 +1217,19 @@ def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
                         signals.append(res)
                         persist_flag = "🔄" if res["连续信号"] else ""
                         earnings_flag = "📅" if res["财报在窗口内"] else ""
+                        oi_flag = ""
+                        if res["OI有历史数据"]:
+                            if res["OI日变化%"] >= 30:
+                                oi_flag = "🚨"
+                            elif res["OI日变化%"] >= 10:
+                                oi_flag = "🔥"
+                        consec = f"连{res['OI连续增长天']}天" if res["OI连续增长天"] >= 2 else ""
                         tqdm.write(
                             f"  命中 {tk:<6} ${res['股价']:>8.2f}"
-                            f"  支撑{res['距支撑%']:.1f}%({res['支撑验证次数']}次)"
+                            f"  支撑{res['距支撑%']:.1f}%"
                             f"  {res['行权价']}C {res['到期日']}"
+                            f"  OI变{res['OI日变化%']:+.0f}%{oi_flag}{consec}"
                             f"  OIx{res['OI集中倍数']:.1f}"
-                            f"  OI变{res['OI日变化%']:+.0f}%"
                             f"  IV{res['IV百分位']:.0f}%位"
                             f"  评分{res['综合评分']:.1f}"
                             f"  {persist_flag}{earnings_flag}"
@@ -1092,6 +1241,7 @@ def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
 
     # 保存持久化数据
     save_oi_snapshot(oi_snapshot, cfg["oi_snapshot_file"])
+    save_oi_history(oi_history, cfg["oi_history_file"])
     save_iv_history(iv_history, cfg["iv_history_file"])
 
     if not signals:
@@ -1129,8 +1279,9 @@ def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
         "5日动量%","量能趋势","在均线上方","52周位置%",
         "财报日","财报在窗口内","连续信号",
         "到期日","剩余天数","行权价","虚值幅度%","期权参考价","隐含波动率%","IV百分位",
-        "行权价OI","行权价成交量","量OI比","OI集中倍数","OI日变化%","认沽认购比",
-        "综合评分",
+        "行权价OI","行权价成交量","量OI比","OI集中倍数",
+        "OI日变化%","OI连续增长天","OI有历史数据",
+        "认沽认购比","综合评分",
     ]
     print(df[data_cols].to_string())
 
@@ -1151,7 +1302,9 @@ def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
     print("  指标说明:")
     print("  相对强弱RS    : 近20日涨幅/SPY涨幅，>1跑赢大盘，<0.95被过滤")
     print("  支撑验证次数  : 该支撑位历史上被触碰反弹的次数，越多越可靠")
-    print("  OI日变化%     : 今日OI相比昨日变化，>10%说明新资金流入")
+    print("  OI日变化%     : 今日OI相比昨日变化，核心信号，>10%新资金流入，>30%极强信号")
+    print("  OI连续增长天  : OI连续N天增长，机构持续建仓，2天以上信号显著增强")
+    print("  OI有历史数据  : 第1天运行为False，第2天起有数据，净变化才生效")
     print("  IV百分位      : 当前IV在历史中的位置，<30%便宜，>70%贵(已过滤)")
     print("  连续信号      : 过去5天内该标的多次出现，信号持续性强")
     print("  财报在窗口内  : 财报在期权到期前，存在IV crush风险")
