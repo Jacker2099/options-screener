@@ -2,17 +2,11 @@ name: Daily Options Scan
 
 on:
   schedule:
-    # GitHub Actions cron is UTC.
-    - cron: "0 22 * * 1-5"
+    - cron: '0 22 * * 1-5'
   workflow_dispatch:
 
-concurrency:
-  group: daily-options-scan
-  cancel-in-progress: false
-
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  PYTHONUNBUFFERED: "1"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   scan:
@@ -20,55 +14,36 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: write
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref_name }}
-          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
         run: pip install yfinance pandas numpy requests tqdm lxml
 
       - name: Run screener
-        id: run_screener
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          mkdir -p results scripts/.state
-          OUTPUT_FILE="results/signals_$(date -u +'%Y%m%d_%H%M').csv"
-          echo "output_file=${OUTPUT_FILE}" >> "$GITHUB_OUTPUT"
-          if [ -f "options_screener.py" ]; then
-            python options_screener.py --top 20 --workers 6 --output "${OUTPUT_FILE}"
-          else
-            python scripts/options_screener.py --top 20 --workers 6 --output "${OUTPUT_FILE}"
-          fi
+        run: python options_screener.py --top 20 --workers 6
 
       - name: Upload CSV artifact
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: signals-${{ github.run_number }}
-          path: |
-            results/signals_*.csv
-            scripts/.state/*.json
+          path: results/signals_*.csv
           retention-days: 30
-          if-no-files-found: warn
 
-      - name: Commit results and state
-        if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+      - name: Commit results and snapshots
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add results/*.csv scripts/.state/*.json || true
-          git diff --staged --quiet || git commit -m "scan $(date -u +'%Y-%m-%d')"
+          git add results/ oi_snapshot.json iv_history.json 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "scan $(date +'%Y-%m-%d')"
           git push
