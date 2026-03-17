@@ -34,6 +34,8 @@ import time
 import argparse
 import logging
 import math
+import os
+import requests
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
@@ -456,11 +458,111 @@ def generate_interpretation(row: pd.Series) -> str:
     return "，".join(parts) + "。"
 
 
+
 # ══════════════════════════════════════════════════════════════
-# 模块7: 主流程
+# 模块7: Telegram 推送
 # ══════════════════════════════════════════════════════════════
 
-def run(cfg: dict) -> pd.DataFrame:
+MEDAL = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+
+def _tg_send(token: str, chat_id: str, text: str) -> bool:
+    """发送单条 Telegram 消息，超过4096字符自动截断"""
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    if len(text) > 4096:
+        text = text[:4090] + "\n..."
+    try:
+        resp = requests.post(url, json={
+            "chat_id":    chat_id,
+            "text":       text,
+            "parse_mode": "HTML",
+        }, timeout=15)
+        if resp.status_code == 200:
+            return True
+        log.warning(f"Telegram 发送失败: {resp.status_code} {resp.text[:200]}")
+        return False
+    except Exception as e:
+        log.warning(f"Telegram 请求异常: {e}")
+        return False
+
+
+def send_to_telegram(df: pd.DataFrame, total_scanned: int, token: str, chat_id: str):
+    """
+    将筛选结果格式化后推送到 Telegram。
+    每条信号单独一条消息，避免超过字符限制。
+    """
+    if not token or not chat_id:
+        log.info("未配置 Telegram，跳过推送")
+        return
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    count    = len(df)
+
+    # 第一条：汇总头部
+    header = (
+        f"📊 <b>美股期权信号播报</b>\n"
+        f"📅 {date_str}  盘后扫描\n"
+        f"🔍 共扫描 {total_scanned} 只，命中 <b>{count}</b> 个信号\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
+    _tg_send(token, chat_id, header)
+    time.sleep(0.5)
+
+    # 每条信号单独一条消息
+    for i, (_, row) in enumerate(df.iterrows()):
+        medal     = MEDAL[i] if i < len(MEDAL) else f"{i+1}."
+        above_str = "✅均线上方" if row["在均线上方"] else "⚠️均线下方"
+        mid_str   = f"${row['期权参考价']:.2f}" if row["期权参考价"] else "待确认"
+
+        if row["5日动量%"] >= 2:
+            mom_icon = "📈"
+        elif row["5日动量%"] <= -2:
+            mom_icon = "📉"
+        else:
+            mom_icon = "➡️"
+
+        if row["OI集中倍数"] >= 10:
+            oi_str = f"🔥OI集中{row['OI集中倍数']:.0f}倍(极异常)"
+        elif row["OI集中倍数"] >= 3:
+            oi_str = f"⚡OI集中{row['OI集中倍数']:.0f}倍"
+        else:
+            oi_str = f"OI集中{row['OI集中倍数']:.0f}倍"
+
+        if row["认沽认购比"] < 0.5:
+            pc_str = f"看涨情绪强(P/C={row['认沽认购比']:.2f})"
+        elif row["认沽认购比"] > 1.0:
+            pc_str = f"⚠️看涨情绪弱(P/C={row['认沽认购比']:.2f})"
+        else:
+            pc_str = f"P/C={row['认沽认购比']:.2f}"
+
+        msg = (
+            f"{medal} <b>{row['代码']}</b>  评分 <b>{row['综合评分']:.1f}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 股价 <b>${row['股价']:.2f}</b>  当日{row['当日涨跌%']:+.2f}%\n"
+            f"🛡 支撑位 ${row['最近支撑位']:.2f}  距离 {row['距支撑%']:.1f}%\n"
+            f"🎯 关注 <b>{row['行权价']}C</b>  到期 {row['到期日']}  ({row['剩余天数']}天)\n"
+            f"💵 期权参考价 {mid_str}  IV {row['隐含波动率%']:.1f}%  虚值{row['虚值幅度%']:.1f}%\n"
+            f"{mom_icon} 5日动量 {row['5日动量%']:+.1f}%  量能趋势 {row['量能趋势']:.2f}x  {above_str}\n"
+            f"📊 {oi_str}  量OI比 {row['量OI比']:.2f}  {pc_str}\n"
+            f"🗒 {row['信号解读']}"
+        )
+        _tg_send(token, chat_id, msg)
+        time.sleep(0.3)
+
+    # 最后一条：风险提示
+    footer = (
+        f"⚠️ <b>风险提示</b>\n"
+        f"以上信号基于期权异常活动和技术面筛选，\n"
+        f"不构成投资建议。期权交易风险较高，\n"
+        f"请结合大盘环境和个股催化剂自行判断。"
+    )
+    _tg_send(token, chat_id, footer)
+    log.info(f"Telegram 推送完成，共 {count} 条信号")
+
+# ══════════════════════════════════════════════════════════════
+# 模块8: 主流程
+# ══════════════════════════════════════════════════════════════
+
+def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
     print()
     print("╔══════════════════════════════════════════════════════════╗")
     print("║       美股期权筛选器 v4  -  五因子综合评分               ║")
@@ -475,6 +577,7 @@ def run(cfg: dict) -> pd.DataFrame:
     print()
 
     universe = get_universe()
+    total_scanned = len(universe)
     signals, errors = [], 0
 
     with ThreadPoolExecutor(max_workers=cfg["workers"]) as pool:
@@ -559,6 +662,12 @@ def run(cfg: dict) -> pd.DataFrame:
     print(f"  结果已保存: {cfg['output_csv']}")
     print(f"  扫描出错数: {errors}  (通常是无期权或网络限速)")
     print()
+
+    # Telegram 推送
+    tg_token = tg_token or os.environ.get("TELEGRAM_TOKEN", "")
+    tg_chat  = tg_chat  or os.environ.get("TELEGRAM_CHAT_ID", "")
+    send_to_telegram(df, total_scanned, tg_token, tg_chat)
+
     return df
 
 
@@ -598,7 +707,9 @@ def main():
         "otm_max":           args.otm_max,
         "output_csv":        args.output,
     })
-    run(cfg)
+    tg_token = os.environ.get("TELEGRAM_TOKEN", "")
+    tg_chat  = os.environ.get("TELEGRAM_CHAT_ID", "")
+    run(cfg, tg_token=tg_token, tg_chat=tg_chat)
 
 
 if __name__ == "__main__":
