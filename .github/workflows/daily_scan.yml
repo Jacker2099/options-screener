@@ -1,0 +1,82 @@
+name: Daily Options Scan
+
+on:
+  schedule:
+    # 美东时间 17:00 (盘后1小时) = UTC 22:00，周一到周五
+    - cron: '0 22 * * 1-5'
+  workflow_dispatch:   # 允许手动触发
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90   # 最长90分钟，超时自动终止
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: |
+          pip install yfinance pandas numpy requests tqdm lxml
+
+      - name: 运行筛选器
+        run: |
+          python options_screener.py --top 20 --workers 6
+
+      - name: 上传结果 CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: signals-${{ github.run_number }}
+          path: signals_*.csv
+          retention-days: 30   # 保存30天
+
+      - name: 提交结果到仓库 (可选)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p results
+          cp signals_*.csv results/ 2>/dev/null || true
+          git add results/
+          git diff --staged --quiet || git commit -m "📊 $(date +'%Y-%m-%d') 盘后扫描结果"
+          git push
+```
+
+点 **"Commit new file"** 保存。
+
+---
+
+## 第四步：手动触发测试一次
+
+1. 点仓库顶部的 **"Actions"** 标签
+2. 左边找到 **"Daily Options Scan"**
+3. 右边点 **"Run workflow"** → **"Run workflow"**
+4. 刷新页面，点进运行记录可以看实时日志
+
+运行完成后（约30分钟），在该次运行记录页面底部 **Artifacts** 区域可下载 CSV 结果。
+
+---
+
+## 第五步：查看每日结果
+
+**方式A — 下载 Artifact**
+- Actions → 点某次运行 → 底部下载 CSV
+
+**方式B — 直接看仓库文件**（已通过上面的 commit 步骤自动提交）
+- 仓库 → `results/` 文件夹 → 点 CSV 文件 → 右上角下载
+
+---
+
+## 时间表说明
+```
+cron: '0 22 * * 1-5'
+       │  │  │ │ └── 周一到周五
+       │  │  │ └──── 每月每天
+       │  │  └────── 每月
+       │  └───────── UTC 22:00 = 美东 17:00 (夏令时)
+       └──────────── 0分
