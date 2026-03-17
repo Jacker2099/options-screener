@@ -1,101 +1,98 @@
-#!/usr/bin/env python3
 """
-美股期权筛选器 v5 - 八项增强版
+美股期权筛选器 v5 - 全面增强版
+════════════════════════════════════════════════════════════════
+v5 新增模块:
+  1. 财报日过滤     - 避开 IV crush 陷阱，标注财报窗口内标的
+  2. 大盘环境过滤   - SPY/QQQ 趋势 + VIX 过滤，避免逆势操作
+  3. OI 净变化      - 对比前日 OI 快照，识别真正的新资金流入
+  4. 相对强弱(RS)   - 只保留近20日跑赢 SPY 的强势股
+  5. 板块共振       - 标注同板块命中数量，共振信号可信度更高
+  6. 支撑位验证次数 - 区分强支撑(多次验证)和弱支撑(仅1次)
+  7. IV 历史百分位  - 本地记录每日IV，计算IV百分位避免高位买入
+  8. 信号持续性     - 对比历史信号CSV，连续命中2日以上加分
 
-增强项:
-1) 财报日过滤 / 标注
-2) 大盘环境过滤 (SPY/QQQ + VIX)
-3) OI 净变化 (相对昨日快照)
-4) 相对强弱 RS(20d) 过滤
-5) 行业板块共振统计
-6) 支撑位验证次数
-7) IV 百分位过滤 (基于本地历史)
-8) 信号持续性追踪 (基于历史 CSV)
+数据来源: yfinance (免费，盘后运行)
+股票池: S&P500 + Nasdaq100 + 热门标的 (~650只)
 
 安装:
     pip install yfinance pandas numpy requests tqdm lxml
 
 运行:
-    python scripts/options_screener.py
-    python scripts/options_screener.py --top 25 --workers 8
-    python scripts/options_screener.py --earnings-mode exclude
+    python options_screener.py
+    python options_screener.py --top 25 --workers 8
+    python options_screener.py --no-market-filter   # 关闭大盘过滤
+════════════════════════════════════════════════════════════════
 """
 
-from __future__ import annotations
-
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import time
 import argparse
-import html
-import json
 import logging
 import math
 import os
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-import numpy as np
-import pandas as pd
+import json
+import glob
 import requests
-import yfinance as yf
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
-
-BASE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = BASE_DIR if (BASE_DIR / ".github").exists() else BASE_DIR.parent
-STATE_DIR = BASE_DIR / ".state"
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-
-OI_SNAPSHOT_PATH = STATE_DIR / "oi_snapshot.json"
-IV_HISTORY_PATH = STATE_DIR / "iv_history.json"
-
-
+# ──────────────────────────────────────────────────────────────
+# 配置
+# ──────────────────────────────────────────────────────────────
 CONFIG = {
     # 支撑位
-    "support_window": 60,
-    "support_tolerance": 0.03,
-    "local_min_window": 5,
+    "support_window":        60,
+    "support_tolerance":     0.03,
+    "local_min_window":      5,
+    "min_support_touches":   2,      # 支撑位最少被验证次数
 
-    # 期权过滤
-    "min_strike_oi": 300,
-    "min_strike_vol": 50,
-    "min_dte": 14,
-    "max_dte": 60,
-    "otm_min": 0.00,
-    "otm_max": 0.15,
-    "max_bid_ask_spread_pct": 0.25,   # 期权买卖价差上限(中间价比例)
+    # 期权过滤 (单行权价口径)
+    "min_strike_oi":         300,
+    "min_strike_vol":        50,
+    "min_dte":               14,
+    "max_dte":               60,
+    "otm_min":               0.00,
+    "otm_max":               0.15,
+
+    # OI 净变化
+    "oi_snapshot_file":      "oi_snapshot.json",   # 本地OI快照文件
+    "min_oi_increase_pct":   10.0,                 # OI净增加至少10%才算新资金
+
+    # IV 历史百分位
+    "iv_history_file":       "iv_history.json",    # 本地IV历史文件
+    "max_iv_percentile":     70.0,                 # IV百分位超过70%不买
+
+    # 信号持续性
+    "results_dir":           "results",            # 历史CSV目录
+    "signal_lookback_days":  5,                    # 回看几天的历史信号
+
+    # 大盘过滤
+    "market_filter":         True,                 # 是否启用大盘过滤
+    "max_vix":               30.0,                 # VIX超过此值暂停信号
+    "market_spy_ma":         20,                   # SPY需在N日均线上方
+
+    # 相对强弱
+    "rs_window":             20,                   # RS计算窗口(天)
+    "min_rs_ratio":          0.95,                 # 相对SPY涨幅至少95%
 
     # 股票流动性
-    "min_avg_volume": 300_000,
-    "min_price": 5.0,
+    "min_avg_volume":        300_000,
+    "min_price":             5.0,
 
-    # 动量
-    "min_momentum_5d": -5.0,
-
-    # RS 与 IV
-    "min_rs_20d": 0.0,
-    "iv_pctile_max": 70.0,
-
-    # 大盘环境
-    "market_vix_threshold": 30.0,
-    "market_mode": "strict",  # strict | score
-    "market_penalty": 8.0,
-
-    # 财报过滤
-    "earnings_mode": "exclude",  # exclude | mark
-    "max_oi_snapshot_gap_days": 4,  # OI快照允许最大间隔(覆盖周末)
+    # 动量过滤
+    "min_momentum_5d":       -5.0,
 
     # 并发
-    "workers": 5,
-    "delay_per_ticker": 0.1,
+    "workers":               5,
+    "delay_per_ticker":      0.1,
 
     # 输出
-    "top_n": 20,
-    "output_csv": f"signals_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+    "top_n":                 20,
+    "output_csv":            f"signals_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
 }
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -104,445 +101,421 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# GICS 板块映射 (用于板块共振检测)
+SECTOR_MAP = {
+    "XLK": "科技", "XLF": "金融", "XLE": "能源", "XLV": "医疗",
+    "XLI": "工业", "XLY": "消费", "XLP": "必需消费", "XLU": "公用事业",
+    "XLB": "材料", "XLRE": "房地产", "XLC": "通信",
+}
+# 主要个股板块归属
+STOCK_SECTOR = {
+    "AAPL":"科技","MSFT":"科技","NVDA":"科技","AMD":"科技","INTC":"科技",
+    "AVGO":"科技","ARM":"科技","SMCI":"科技","NET":"科技","DDOG":"科技",
+    "SNOW":"科技","CRWD":"科技","OKTA":"科技","ZS":"科技","MDB":"科技",
+    "AMZN":"科技","GOOGL":"科技","META":"科技","NFLX":"通信",
+    "TSLA":"消费","NIO":"消费","RIVN":"消费","LCID":"消费","UBER":"消费",
+    "LYFT":"消费","ABNB":"消费","DASH":"消费","DKNG":"消费","RBLX":"通信",
+    "SNAP":"通信","COIN":"金融","HOOD":"金融","MSTR":"金融","SOFI":"金融",
+    "BABA":"科技","JD":"消费","PDD":"消费","XPEV":"消费",
+    "PLTR":"科技","ARKK":"科技",
+}
 
-def load_json(path: Path, default: Any) -> Any:
-    try:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        log.warning("读取 %s 失败: %s", path.name, e)
-    return default
 
-
-def save_json(path: Path, payload: Any) -> None:
-    try:
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        log.warning("写入 %s 失败: %s", path.name, e)
-
+# ══════════════════════════════════════════════════════════════
+# 模块1: 股票池
+# ══════════════════════════════════════════════════════════════
 
 def _wiki_tickers(url: str, col: str, label: str) -> list:
     try:
         for t in pd.read_html(url):
             if col in t.columns:
-                result = [str(s).strip().replace(".", "-") for s in t[col].dropna()]
-                log.info("  %s: %d 只", label, len(result))
+                result = [str(s).strip().replace(".", "-")
+                          for s in t[col].dropna()]
+                log.info(f"  {label}: {len(result)} 只")
                 return result
     except Exception as e:
-        log.warning("  %s 获取失败: %s", label, e)
+        log.warning(f"  {label} 获取失败: {e}")
     return []
 
 
 def get_universe() -> list:
     log.info("构建股票池...")
     tickers = set()
-    tickers.update(
-        _wiki_tickers(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "Symbol", "S&P 500"
-        )
-    )
-    tickers.update(_wiki_tickers("https://en.wikipedia.org/wiki/Nasdaq-100", "Ticker", "Nasdaq 100"))
-    tickers.update(
-        [
-            "TSLA",
-            "NVDA",
-            "AMD",
-            "MSTR",
-            "COIN",
-            "PLTR",
-            "SOFI",
-            "RIVN",
-            "LCID",
-            "NIO",
-            "BABA",
-            "JD",
-            "PDD",
-            "XPEV",
-            "DKNG",
-            "HOOD",
-            "RBLX",
-            "SNAP",
-            "UBER",
-            "LYFT",
-            "ABNB",
-            "DASH",
-            "NET",
-            "DDOG",
-            "SNOW",
-            "CRWD",
-            "OKTA",
-            "ZS",
-            "MDB",
-            "SMCI",
-            "ARM",
-            "AVGO",
-            "AAPL",
-            "MSFT",
-            "AMZN",
-            "GOOGL",
-            "META",
-            "NFLX",
-            "INTC",
-            "SPY",
-            "QQQ",
-            "IWM",
-            "GLD",
-            "TLT",
-            "XLF",
-            "XLE",
-            "XLK",
-            "ARKK",
-        ]
-    )
+    tickers.update(_wiki_tickers(
+        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+        "Symbol", "S&P 500"))
+    tickers.update(_wiki_tickers(
+        "https://en.wikipedia.org/wiki/Nasdaq-100",
+        "Ticker", "Nasdaq 100"))
+    tickers.update([
+        "TSLA","NVDA","AMD","MSTR","COIN","PLTR","SOFI","RIVN",
+        "LCID","NIO","BABA","JD","PDD","XPEV","DKNG","HOOD",
+        "RBLX","SNAP","UBER","LYFT","ABNB","DASH","NET","DDOG",
+        "SNOW","CRWD","OKTA","ZS","MDB","SMCI","ARM","AVGO",
+        "AAPL","MSFT","AMZN","GOOGL","META","NFLX","INTC",
+        "SPY","QQQ","IWM","GLD","TLT","XLF","XLE","XLK","ARKK",
+    ])
     result = sorted(tickers)
-    log.info("  股票池合计: %d 只\n", len(result))
+    log.info(f"  股票池合计: {len(result)} 只\n")
     return result
 
 
-def find_supports(close: pd.Series, window: int = 5) -> List[Dict[str, float]]:
+# ══════════════════════════════════════════════════════════════
+# 模块2: 大盘环境过滤
+# ══════════════════════════════════════════════════════════════
+
+def check_market_environment(cfg: dict) -> dict:
     """
-    返回支撑位簇:
-    [{"price": xx, "touches": n}, ...]
+    检查大盘环境是否适合做多期权。
+    返回: {
+        ok: bool,           # True=可以操作, False=大盘环境差暂停
+        vix: float,         # 当前VIX
+        spy_above_ma: bool, # SPY是否在均线上方
+        qqq_above_ma: bool, # QQQ是否在均线上方
+        reason: str         # 过滤原因说明
+    }
+    """
+    result = {"ok": True, "vix": 0.0, "spy_above_ma": True,
+              "qqq_above_ma": True, "reason": ""}
+    try:
+        # VIX
+        vix_hist = yf.Ticker("^VIX").history(period="5d")
+        if not vix_hist.empty:
+            vix = float(vix_hist["Close"].iloc[-1])
+            result["vix"] = round(vix, 1)
+            if vix > cfg["max_vix"]:
+                result["ok"] = False
+                result["reason"] = f"VIX={vix:.1f} 超过{cfg['max_vix']}，市场恐慌，暂停看涨信号"
+                log.warning(f"  ⚠️ {result['reason']}")
+                return result
+
+        # SPY 均线
+        spy_hist = yf.Ticker("SPY").history(period="60d")
+        if not spy_hist.empty and len(spy_hist) >= cfg["market_spy_ma"]:
+            spy_price = float(spy_hist["Close"].iloc[-1])
+            spy_ma    = float(spy_hist["Close"].iloc[-cfg["market_spy_ma"]:].mean())
+            result["spy_above_ma"] = spy_price >= spy_ma * 0.99
+            if not result["spy_above_ma"]:
+                result["ok"] = False
+                result["reason"] = f"SPY 跌破{cfg['market_spy_ma']}日均线，大盘趋势偏空"
+                log.warning(f"  ⚠️ {result['reason']}")
+                return result
+
+        # QQQ 均线
+        qqq_hist = yf.Ticker("QQQ").history(period="60d")
+        if not qqq_hist.empty and len(qqq_hist) >= cfg["market_spy_ma"]:
+            qqq_price = float(qqq_hist["Close"].iloc[-1])
+            qqq_ma    = float(qqq_hist["Close"].iloc[-cfg["market_spy_ma"]:].mean())
+            result["qqq_above_ma"] = qqq_price >= qqq_ma * 0.99
+
+        log.info(f"  大盘环境: VIX={result['vix']} "
+                 f"SPY均线{'上方✅' if result['spy_above_ma'] else '下方⚠️'} "
+                 f"QQQ均线{'上方✅' if result['qqq_above_ma'] else '下方⚠️'}")
+
+    except Exception as e:
+        log.warning(f"  大盘环境检查失败: {e}，继续运行")
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
+# 模块3: 财报日检测
+# ══════════════════════════════════════════════════════════════
+
+def get_earnings_date(tk) -> str | None:
+    """
+    获取下次财报日期。
+    返回日期字符串如 '2026-04-15'，或 None（无法获取）
+    """
+    try:
+        cal = tk.calendar
+        if cal is None:
+            return None
+        # calendar 返回格式可能是 dict 或 DataFrame
+        if isinstance(cal, dict):
+            dates = cal.get("Earnings Date", [])
+            if dates:
+                d = dates[0]
+                if hasattr(d, "strftime"):
+                    return d.strftime("%Y-%m-%d")
+                return str(d)[:10]
+        elif isinstance(cal, pd.DataFrame):
+            if "Earnings Date" in cal.index:
+                val = cal.loc["Earnings Date"].iloc[0]
+                if hasattr(val, "strftime"):
+                    return val.strftime("%Y-%m-%d")
+                return str(val)[:10]
+    except Exception:
+        pass
+    return None
+
+
+def earnings_in_window(earnings_date_str: str | None, expiry_str: str) -> bool:
+    """
+    判断财报日是否在期权到期日之前（在窗口内）。
+    如果在窗口内，IV crush 风险高。
+    """
+    if not earnings_date_str:
+        return False
+    try:
+        ed  = datetime.strptime(earnings_date_str, "%Y-%m-%d").date()
+        exp = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+        today = datetime.today().date()
+        return today <= ed <= exp
+    except Exception:
+        return False
+
+
+# ══════════════════════════════════════════════════════════════
+# 模块4: OI 净变化追踪
+# ══════════════════════════════════════════════════════════════
+
+def load_oi_snapshot(filepath: str) -> dict:
+    """加载昨日 OI 快照"""
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_oi_snapshot(snapshot: dict, filepath: str):
+    """保存今日 OI 快照供明天对比"""
+    try:
+        with open(filepath, "w") as f:
+            json.dump(snapshot, f)
+    except Exception as e:
+        log.warning(f"OI快照保存失败: {e}")
+
+
+def calc_oi_change(ticker: str, expiry: str, strike: float,
+                   current_oi: int, snapshot: dict) -> float:
+    """
+    计算 OI 净变化百分比。
+    正值表示新增仓位，负值表示平仓。
+    """
+    key = f"{ticker}_{expiry}_{strike}"
+    prev_oi = snapshot.get(key, None)
+    if prev_oi is None or prev_oi == 0:
+        return 0.0  # 无历史数据，视为中性
+    change_pct = (current_oi - prev_oi) / prev_oi * 100
+    return round(change_pct, 1)
+
+
+# ══════════════════════════════════════════════════════════════
+# 模块5: IV 历史百分位
+# ══════════════════════════════════════════════════════════════
+
+def load_iv_history(filepath: str) -> dict:
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_iv_history(iv_history: dict, filepath: str):
+    try:
+        # 只保留最近180天数据
+        cutoff = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
+        cleaned = {}
+        for ticker, records in iv_history.items():
+            cleaned[ticker] = {d: v for d, v in records.items() if d >= cutoff}
+        with open(filepath, "w") as f:
+            json.dump(cleaned, f)
+    except Exception as e:
+        log.warning(f"IV历史保存失败: {e}")
+
+
+def calc_iv_percentile(ticker: str, current_iv: float, iv_history: dict) -> float:
+    """
+    计算当前IV在历史中的百分位。
+    0=历史最低，100=历史最高。
+    历史数据不足30天时返回50(中性)。
+    """
+    records = iv_history.get(ticker, {})
+    hist_values = list(records.values())
+    if len(hist_values) < 30:
+        return 50.0  # 数据不足，中性
+    pct = sum(1 for v in hist_values if v <= current_iv) / len(hist_values) * 100
+    return round(pct, 1)
+
+
+def update_iv_history(ticker: str, iv: float, iv_history: dict):
+    """更新今日IV记录"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    if ticker not in iv_history:
+        iv_history[ticker] = {}
+    iv_history[ticker][today] = iv
+
+
+# ══════════════════════════════════════════════════════════════
+# 模块6: 信号持续性
+# ══════════════════════════════════════════════════════════════
+
+def load_historical_signals(results_dir: str, lookback_days: int) -> set:
+    """
+    加载最近N天的历史信号，返回连续出现的 ticker 集合。
+    """
+    if not os.path.exists(results_dir):
+        return set()
+
+    cutoff = datetime.now() - timedelta(days=lookback_days)
+    appeared = {}  # ticker -> 出现天数
+
+    csv_files = sorted(glob.glob(os.path.join(results_dir, "signals_*.csv")))
+    for fp in csv_files:
+        try:
+            # 从文件名提取日期
+            fname = os.path.basename(fp)
+            date_str = fname.replace("signals_", "").replace(".csv", "")[:8]
+            file_date = datetime.strptime(date_str, "%Y%m%d")
+            if file_date < cutoff:
+                continue
+            df = pd.read_csv(fp, encoding="utf-8-sig")
+            if "代码" in df.columns:
+                for t in df["代码"].dropna():
+                    appeared[t] = appeared.get(t, 0) + 1
+        except Exception:
+            continue
+
+    # 返回连续出现2天以上的 ticker
+    return {t for t, cnt in appeared.items() if cnt >= 2}
+
+
+# ══════════════════════════════════════════════════════════════
+# 模块7: 相对强弱 (RS)
+# ══════════════════════════════════════════════════════════════
+
+def calc_rs(ticker_hist: pd.DataFrame, spy_hist: pd.DataFrame,
+            window: int = 20) -> float:
+    """
+    计算相对强弱: 股票近N日涨幅 / SPY近N日涨幅
+    >1 说明跑赢大盘，<1 说明跑输大盘
+    """
+    try:
+        if len(ticker_hist) < window + 1 or len(spy_hist) < window + 1:
+            return 1.0
+        stock_ret = float(ticker_hist["Close"].iloc[-1] /
+                          ticker_hist["Close"].iloc[-window] - 1)
+        spy_ret   = float(spy_hist["Close"].iloc[-1] /
+                          spy_hist["Close"].iloc[-window] - 1)
+        if spy_ret == 0:
+            return 1.0
+        return round(stock_ret / (abs(spy_ret) + 0.001), 2)
+    except Exception:
+        return 1.0
+
+
+# ══════════════════════════════════════════════════════════════
+# 模块8: 支撑位 (增加验证次数)
+# ══════════════════════════════════════════════════════════════
+
+def find_supports_with_strength(close: pd.Series,
+                                 window: int = 5) -> list:
+    """
+    识别支撑位并统计每个支撑位被验证的次数。
+    返回: [(价格, 验证次数), ...]
     """
     prices = close.values
-    raw: List[float] = []
+    raw = []
     for i in range(window, len(prices) - window):
-        seg = prices[i - window : i + window + 1]
+        seg = prices[i - window: i + window + 1]
         if prices[i] == seg.min():
             raw.append(float(prices[i]))
     if not raw:
         return []
 
-    uniq = sorted(raw)
-    clusters: List[Dict[str, Any]] = [{"price": uniq[0], "items": [uniq[0]]}]
-    for p in uniq[1:]:
-        base = clusters[-1]["price"]
-        if (p - base) / max(base, 0.01) <= 0.02:
-            clusters[-1]["items"].append(p)
-            clusters[-1]["price"] = float(np.mean(clusters[-1]["items"]))
-        else:
-            clusters.append({"price": p, "items": [p]})
-
-    result = []
-    for c in clusters:
-        lo = min(c["items"]) * 0.99
-        hi = max(c["items"]) * 1.01
-        touches = sum(1 for x in raw if lo <= x <= hi)
-        result.append({"price": round(float(c["price"]), 2), "touches": int(touches)})
-    return result
+    # 合并相近支撑位并统计次数
+    sorted_raw = sorted(raw)
+    merged = []
+    for p in sorted_raw:
+        found = False
+        for i, (mp, cnt) in enumerate(merged):
+            if abs(p - mp) / mp <= 0.02:
+                # 合并：更新为均值，次数+1
+                merged[i] = (round((mp * cnt + p) / (cnt + 1), 2), cnt + 1)
+                found = True
+                break
+        if not found:
+            merged.append((round(p, 2), 1))
+    return merged
 
 
-def check_support(price: float, supports: List[Dict[str, float]], tol: float) -> Tuple[bool, float, float, int]:
+def check_support_strength(price: float,
+                            supports: list,
+                            tol: float,
+                            min_touches: int) -> tuple:
+    """
+    判断价格是否在有效支撑位附近（支撑强度达标）。
+    返回: (命中, 最近支撑价, 距离%, 验证次数)
+    """
     if not supports:
         return False, 0.0, 99.0, 0
-    dists = [(abs(price - s["price"]) / max(s["price"], 0.01), s) for s in supports]
-    min_dist, nearest = min(dists, key=lambda x: x[0])
-    hit = (min_dist <= tol) and (price >= nearest["price"] * 0.99)
-    return hit, round(nearest["price"], 2), round(min_dist * 100, 2), int(nearest["touches"])
 
+    valid = [(p, cnt) for p, cnt in supports if cnt >= min_touches]
+    # 如果没有足够强的支撑，降级使用所有支撑位
+    candidates = valid if valid else supports
+
+    dists = [(abs(price - p) / p, p, cnt) for p, cnt in candidates]
+    min_dist, nearest, touches = min(dists, key=lambda x: x[0])
+    hit = (min_dist <= tol) and (price >= nearest * 0.99)
+    return hit, round(nearest, 2), round(min_dist * 100, 2), touches
+
+
+# ══════════════════════════════════════════════════════════════
+# 模块9: 技术指标
+# ══════════════════════════════════════════════════════════════
 
 def calc_technicals(hist: pd.DataFrame) -> dict:
-    close = hist["Close"]
+    close  = hist["Close"]
     volume = hist["Volume"]
 
-    m5d = float((close.iloc[-1] / close.iloc[-6] - 1) * 100) if len(close) >= 6 else 0.0
-
-    vol5 = float(volume.iloc[-5:].mean()) if len(volume) >= 5 else 0.0
+    m5d   = float((close.iloc[-1] / close.iloc[-6] - 1) * 100) if len(close) >= 6 else 0.0
+    vol5  = float(volume.iloc[-5:].mean())  if len(volume) >= 5  else 0.0
     vol20 = float(volume.iloc[-20:].mean()) if len(volume) >= 20 else vol5
-    if vol5 == 0:
-        vol_trend = 1.0
-    else:
-        vol_trend = round(vol5 / (vol20 + 1), 2)
+    vol_trend = 1.0 if vol5 == 0 else round(vol5 / (vol20 + 1), 2)
 
     ma20 = float(close.iloc[-20:].mean()) if len(close) >= 20 else float(close.mean())
-    above_ma20 = bool(close.iloc[-1] >= ma20)
 
-    week52_hi = float(close.max())
-    week52_lo = float(close.min())
-    rng = week52_hi - week52_lo
-    week52_pos = round((float(close.iloc[-1]) - week52_lo) / (rng + 0.01) * 100, 1)
-
-    ret20 = float((close.iloc[-1] / close.iloc[-21] - 1) * 100) if len(close) >= 21 else 0.0
+    week52_hi  = float(close.max())
+    week52_lo  = float(close.min())
+    week52_pos = round((float(close.iloc[-1]) - week52_lo) /
+                       (week52_hi - week52_lo + 0.01) * 100, 1)
 
     return {
         "momentum_5d": round(m5d, 2),
-        "vol_trend": vol_trend,
-        "above_ma20": above_ma20,
-        "week52_pos": week52_pos,
-        "ret20": round(ret20, 2),
+        "vol_trend":   vol_trend,
+        "above_ma20":  bool(close.iloc[-1] >= ma20),
+        "week52_pos":  week52_pos,
     }
 
 
-def parse_any_date(v: Any) -> Optional[datetime.date]:
-    if v is None:
-        return None
-    if isinstance(v, pd.Timestamp):
-        return v.date()
-    if isinstance(v, datetime):
-        return v.date()
-    if hasattr(v, "date"):
-        try:
-            return v.date()
-        except Exception:
-            pass
-    try:
-        return pd.to_datetime(v).date()
-    except Exception:
-        return None
+# ══════════════════════════════════════════════════════════════
+# 模块10: 期权逐行权价扫描
+# ══════════════════════════════════════════════════════════════
 
-
-def get_next_earnings_date(tk: yf.Ticker) -> Optional[datetime.date]:
-    """优先 calendar，失败则回退 earnings_dates。"""
-    today = datetime.today().date()
-
-    # 1) calendar
-    try:
-        cal = tk.calendar
-        if isinstance(cal, pd.DataFrame) and not cal.empty:
-            for label in ["Earnings Date"]:
-                if label in cal.index:
-                    raw = cal.loc[label].values
-                    for x in raw:
-                        d = parse_any_date(x)
-                        if d and d >= today:
-                            return d
-    except Exception:
-        pass
-
-    # 2) earnings_dates
-    try:
-        ed = tk.earnings_dates
-        if isinstance(ed, pd.DataFrame) and not ed.empty:
-            idx = ed.index
-            for ts in idx:
-                d = parse_any_date(ts)
-                if d and d >= today:
-                    return d
-    except Exception:
-        pass
-
-    return None
-
-
-def get_sector(tk: yf.Ticker) -> str:
-    try:
-        info = tk.info or {}
-        sec = str(info.get("sector") or "未知")
-        return sec if sec else "未知"
-    except Exception:
-        return "未知"
-
-
-def get_market_context(cfg: dict) -> dict:
+def scan_options_by_strike(tk, price: float, cfg: dict,
+                           oi_snapshot: dict, iv_history: dict,
+                           ticker: str) -> dict | None:
     """
-    读取大盘状态：SPY/QQQ 趋势与支撑、VIX水平。
+    逐行权价扫描，五因子评分 + OI净变化 + IV百分位过滤。
     """
-    context = {
-        "ok": True,
-        "risk_off": False,
-        "reason": "",
-        "spy_ret20": 0.0,
-        "spy_above_ma20": True,
-        "qqq_above_ma20": True,
-        "vix": None,
-    }
-
-    try:
-        spy = yf.Ticker("SPY").history(period="90d", interval="1d", auto_adjust=True)
-        qqq = yf.Ticker("QQQ").history(period="90d", interval="1d", auto_adjust=True)
-        vix = yf.Ticker("^VIX").history(period="30d", interval="1d", auto_adjust=True)
-
-        if spy.empty or qqq.empty:
-            return context
-
-        spy_close = spy["Close"]
-        qqq_close = qqq["Close"]
-
-        spy_ma20 = float(spy_close.iloc[-20:].mean()) if len(spy_close) >= 20 else float(spy_close.mean())
-        qqq_ma20 = float(qqq_close.iloc[-20:].mean()) if len(qqq_close) >= 20 else float(qqq_close.mean())
-
-        spy_sup = find_supports(spy_close, cfg["local_min_window"])
-        qqq_sup = find_supports(qqq_close, cfg["local_min_window"])
-        spy_hit, _, _, _ = check_support(float(spy_close.iloc[-1]), spy_sup, cfg["support_tolerance"])
-        qqq_hit, _, _, _ = check_support(float(qqq_close.iloc[-1]), qqq_sup, cfg["support_tolerance"])
-
-        spy_above_ma20 = bool(spy_close.iloc[-1] >= spy_ma20)
-        qqq_above_ma20 = bool(qqq_close.iloc[-1] >= qqq_ma20)
-
-        spy_ret20 = (
-            float((spy_close.iloc[-1] / spy_close.iloc[-21] - 1) * 100) if len(spy_close) >= 21 else 0.0
-        )
-
-        vix_now = float(vix["Close"].iloc[-1]) if not vix.empty else None
-
-        context.update(
-            {
-                "spy_ret20": round(spy_ret20, 2),
-                "spy_above_ma20": spy_above_ma20,
-                "qqq_above_ma20": qqq_above_ma20,
-                "spy_hit_support": spy_hit,
-                "qqq_hit_support": qqq_hit,
-                "vix": round(vix_now, 2) if vix_now is not None else None,
-            }
-        )
-
-        risk_off = False
-        reasons = []
-        if vix_now is not None and vix_now > cfg["market_vix_threshold"]:
-            risk_off = True
-            reasons.append(f"VIX={vix_now:.1f}>")
-        if (not spy_above_ma20 and not qqq_above_ma20) or (not spy_hit and not qqq_hit):
-            risk_off = True
-            reasons.append("SPY/QQQ趋势偏弱")
-
-        context["risk_off"] = risk_off
-        context["reason"] = "，".join(reasons)
-        context["ok"] = not (cfg["market_mode"] == "strict" and risk_off)
-        return context
-    except Exception as e:
-        log.warning("读取大盘环境失败: %s", e)
-        return context
-
-
-def percentile_rank(values: List[float], x: float) -> Optional[float]:
-    if not values:
-        return None
-    arr = np.array(values, dtype=float)
-    pct = float((arr <= x).sum() / len(arr) * 100)
-    return round(pct, 1)
-
-
-def previous_trading_day(d: datetime.date) -> datetime.date:
-    cur = d - timedelta(days=1)
-    while cur.weekday() >= 5:
-        cur -= timedelta(days=1)
-    return cur
-
-
-def is_recent_snapshot(prev_date: Optional[datetime.date], today: datetime.date, max_gap_days: int) -> bool:
-    if prev_date is None or prev_date >= today:
-        return False
-    gap = (today - prev_date).days
-    return 1 <= gap <= max_gap_days
-
-
-def build_iv_profile_key(ticker: str, dte: int, otm_pct: float) -> str:
-    if dte <= 25:
-        dte_bucket = "dte_14_25"
-    elif dte <= 45:
-        dte_bucket = "dte_26_45"
-    else:
-        dte_bucket = "dte_46_60"
-
-    m = max(float(otm_pct), 0.0)
-    if m < 2:
-        otm_bucket = "otm_0_2"
-    elif m < 5:
-        otm_bucket = "otm_2_5"
-    elif m <= 10:
-        otm_bucket = "otm_5_10"
-    else:
-        otm_bucket = "otm_10_15"
-
-    return f"{ticker}|{dte_bucket}|{otm_bucket}"
-
-
-def _iv_values(iv_history: Dict[str, Any], key: str) -> List[float]:
-    rows = iv_history.get(key, [])
-    vals = [float(r.get("iv", 0)) for r in rows if r.get("iv") is not None]
-    vals = [v for v in vals if v > 0]
-    return vals
-
-
-def calc_iv_percentile(
-    iv_history: Dict[str, Any], profile_key: str, ticker_key: str, iv_now: float
-) -> Optional[float]:
-    vals_profile = _iv_values(iv_history, profile_key)
-    if len(vals_profile) >= 15:
-        return percentile_rank(vals_profile, iv_now)
-
-    vals_ticker = _iv_values(iv_history, ticker_key)
-    if len(vals_ticker) >= 20:
-        return percentile_rank(vals_ticker, iv_now)
-
-    return None
-
-
-def append_iv_history(iv_history: Dict[str, Any], key: str, iv_now: float, asof: str) -> None:
-    if iv_now <= 0:
-        return
-    rows = iv_history.get(key, [])
-    if rows and rows[-1].get("date") == asof:
-        rows[-1]["iv"] = iv_now
-    else:
-        rows.append({"date": asof, "iv": iv_now})
-    # 保留最近 300 天
-    iv_history[key] = rows[-300:]
-
-
-def get_signal_streak(ticker: str, current_file: str) -> int:
-    """统计历史 CSV 连续命中天数(不含今天)，今天命中后会 +1。"""
-    cur = Path(current_file).name
-    files_all: List[Path] = []
-    files_all.extend(list((PROJECT_ROOT / "results").glob("signals_*.csv")))
-    files_all.extend(list(PROJECT_ROOT.glob("signals_*.csv")))
-    files_all.extend(list(BASE_DIR.glob("signals_*.csv")))
-    files_all.extend(list((BASE_DIR / "results").glob("signals_*.csv")))
-
-    dedup: Dict[str, Path] = {}
-    for fp in files_all:
-        dedup[str(fp.resolve())] = fp
-
-    files = sorted(dedup.values(), key=lambda p: p.stat().st_mtime, reverse=True)
-    streak = 0
-    expected_day = previous_trading_day(datetime.today().date())
-
-    for fp in files:
-        if fp.name == cur:
-            continue
-        # 从文件名解析日期，失败则用mtime
-        d = None
-        try:
-            part = fp.stem.split("_")[1]
-            d = datetime.strptime(part, "%Y%m%d").date()
-        except Exception:
-            d = datetime.fromtimestamp(fp.stat().st_mtime).date()
-
-        if d > expected_day:
-            continue
-        if d < expected_day:
-            break
-
-        try:
-            df = pd.read_csv(fp)
-            if "代码" in df.columns and ticker in set(df["代码"].astype(str)):
-                streak += 1
-                expected_day = previous_trading_day(expected_day)
-                continue
-        except Exception:
-            break
-        break
-    return streak
-
-
-def scan_options_by_strike(
-    tk: yf.Ticker,
-    price: float,
-    cfg: dict,
-    earnings_date: Optional[datetime.date],
-    oi_snapshot_prev: Dict[str, Any],
-):
     try:
         expirations = tk.options
     except Exception:
-        return None, {}
+        return None
     if not expirations:
-        return None, {}
+        return None
 
     today = datetime.today().date()
     best_strike = None
-    best_score = -1.0
-    oi_snapshot_local: Dict[str, Any] = {}
+    best_score  = -1.0
+    today_oi_updates = {}  # 用于更新今日快照
 
     for exp_str in expirations:
         try:
@@ -554,85 +527,69 @@ def scan_options_by_strike(
         if not (cfg["min_dte"] <= dte <= cfg["max_dte"]):
             continue
 
-        earnings_in_window = bool(earnings_date and earnings_date <= exp_date)
-        if cfg["earnings_mode"] == "exclude" and earnings_in_window:
-            continue
-
         try:
             chain = tk.option_chain(exp_str)
             calls = chain.calls.copy().fillna(0)
-            puts = chain.puts.copy().fillna(0)
+            puts  = chain.puts.copy().fillna(0)
         except Exception:
             continue
 
         if calls.empty:
             continue
 
-        mean_oi_exp = max(calls["openInterest"].mean(), 1.0)
-        total_put_oi = puts["openInterest"].sum()
+        mean_oi_exp   = max(calls["openInterest"].mean(), 1.0)
+        total_put_oi  = puts["openInterest"].sum()
         total_call_oi = calls["openInterest"].sum()
-        pc_ratio = total_put_oi / (total_call_oi + 1)
+        pc_ratio      = total_put_oi / (total_call_oi + 1)
 
         otm_lo = price * (1 + cfg["otm_min"])
         otm_hi = price * (1 + cfg["otm_max"])
-        candidates = calls[(calls["strike"] >= otm_lo) & (calls["strike"] <= otm_hi)]
+        candidates = calls[
+            (calls["strike"] >= otm_lo) &
+            (calls["strike"] <= otm_hi)
+        ]
 
         for _, row in candidates.iterrows():
             strike = float(row["strike"])
-            oi = int(row["openInterest"])
-            vol = int(row["volume"])
-            bid = float(row.get("bid", 0))
-            ask = float(row.get("ask", 0))
-            iv = float(row.get("impliedVolatility", 0))
-            contract = str(row.get("contractSymbol", ""))
-
-            if contract:
-                oi_snapshot_local[contract] = {
-                    "oi": oi,
-                    "date": today.isoformat(),
-                    "expiry": exp_str,
-                }
+            oi     = int(row["openInterest"])
+            vol    = int(row["volume"])
+            bid    = float(row.get("bid", 0))
+            ask    = float(row.get("ask", 0))
+            iv     = float(row.get("impliedVolatility", 0))
 
             if oi < cfg["min_strike_oi"] or vol < cfg["min_strike_vol"]:
                 continue
 
-            # 仅在快照日期足够近时才计算 OI 净增，避免把历史陈旧仓位误判为今日新增
-            prev_oi = oi
-            oi_delta = 0
-            oi_delta_ratio = 0.0
-            if contract:
-                prev_info = oi_snapshot_prev.get(contract) or {}
-                prev_date = parse_any_date(prev_info.get("date"))
-                if is_recent_snapshot(prev_date, today, cfg["max_oi_snapshot_gap_days"]):
-                    prev_oi = max(int(prev_info.get("oi", 0)), 0)
-                    oi_delta = max(0, oi - prev_oi)
-                    oi_delta_ratio = oi_delta / (prev_oi + 1)
+            # 保存今日OI快照
+            snap_key = f"{ticker}_{exp_str}_{strike}"
+            today_oi_updates[snap_key] = oi
 
-            # 点差过滤，降低成交滑点风险
-            spread_pct = None
-            if bid > 0 and ask > 0:
-                mid_for_spread = (bid + ask) / 2
-                spread_pct = (ask - bid) / max(mid_for_spread, 0.01)
-                if spread_pct > cfg["max_bid_ask_spread_pct"]:
-                    continue
+            # OI净变化
+            oi_change_pct = calc_oi_change(ticker, exp_str, strike,
+                                           oi, oi_snapshot)
+
+            # IV百分位过滤
+            iv_pct_val = round(iv * 100, 1)
+            iv_percentile = calc_iv_percentile(ticker, iv_pct_val, iv_history)
+            update_iv_history(ticker, iv_pct_val, iv_history)
+
+            if iv_percentile > cfg["max_iv_percentile"]:
+                continue  # IV过高，期权太贵，跳过
 
             otm_pct = (strike - price) / price
 
-            # A. 成交量 (max 30)
-            vol_score = min(vol / 220, 30)
+            # A. 成交量分 (max 35)
+            vol_score = min(vol / 200, 35)
 
-            # B. OI集中度 (max 20)
-            oi_ratio = oi / mean_oi_exp
-            oi_score = min(math.log2(oi_ratio + 1) * 5, 20)
+            # B. OI集中度分 (max 25, log压缩)
+            oi_ratio  = oi / mean_oi_exp
+            oi_score  = min(math.log2(oi_ratio + 1) * 6, 25)
 
-            # C. Vol/OI活跃度 (max 16)
-            vol_oi = vol / (oi + 1)
-            act_score = min(vol_oi * 32, 16)
+            # C. Vol/OI 活跃度分 (max 20)
+            vol_oi    = vol / (oi + 1)
+            act_score = min(vol_oi * 40, 20)
 
-            # D. 新增 OI 资金流 (max 14)
-            new_oi_score = min(math.log2(oi_delta + 1) * 2.2, 10) + min(oi_delta_ratio * 5, 4)
-
-            # E. 方向性 (max 12)
+            # D. 方向性分 (max 12)
             if 0.05 <= otm_pct <= 0.10:
                 otm_score = 8
             elif 0.02 <= otm_pct < 0.05:
@@ -641,10 +598,10 @@ def scan_options_by_strike(
                 otm_score = 3
             else:
                 otm_score = 2
-            pc_score = max(0, 4 - pc_ratio * 4)
+            pc_score  = max(0, 4 - pc_ratio * 4)
             dir_score = otm_score + pc_score
 
-            # F. 到期时间 (max 8)
+            # E. 到期时间分 (max 8)
             if 30 <= dte <= 45:
                 dte_score = 8
             elif 20 <= dte < 30 or 45 < dte <= 55:
@@ -652,605 +609,593 @@ def scan_options_by_strike(
             else:
                 dte_score = 2
 
-            total = round(vol_score + oi_score + act_score + new_oi_score + dir_score + dte_score, 2)
+            # F. OI净变化加分 (max 10): 新资金流入才是真信号
+            if oi_change_pct >= 20:
+                oi_change_score = 10
+            elif oi_change_pct >= cfg["min_oi_increase_pct"]:
+                oi_change_score = 5
+            elif oi_change_pct < -10:
+                oi_change_score = -5  # OI在减少，可能是平仓
+            else:
+                oi_change_score = 0
+
+            # G. IV百分位加分 (max 5): IV越低买入越便宜
+            if iv_percentile <= 30:
+                iv_score = 5
+            elif iv_percentile <= 50:
+                iv_score = 3
+            else:
+                iv_score = 0
+
+            total = round(vol_score + oi_score + act_score + dir_score
+                          + dte_score + oi_change_score + iv_score, 2)
 
             if total > best_score:
-                best_score = total
-                mid_price = round((bid + ask) / 2, 2) if (bid + ask) > 0 else None
+                best_score  = total
+                mid_price   = round((bid + ask) / 2, 2) if (bid + ask) > 0 else None
                 best_strike = {
-                    "expiry": exp_str,
-                    "dte": dte,
-                    "strike": strike,
-                    "otm_pct": round(otm_pct * 100, 1),
-                    "strike_oi": oi,
-                    "strike_vol": vol,
-                    "vol_oi": round(vol_oi, 3),
-                    "oi_ratio": round(oi_ratio, 1),
-                    "prev_oi": prev_oi,
-                    "oi_delta": oi_delta,
-                    "oi_delta_ratio": round(oi_delta_ratio, 2),
-                    "spread_pct": round(spread_pct * 100, 1) if spread_pct is not None else None,
-                    "iv_pct": round(iv * 100, 1),
-                    "mid_price": mid_price,
-                    "pc_ratio": round(pc_ratio, 2),
-                    "opt_score": total,
-                    "earnings_in_window": earnings_in_window,
+                    "expiry":          exp_str,
+                    "dte":             dte,
+                    "strike":          strike,
+                    "otm_pct":         round(otm_pct * 100, 1),
+                    "strike_oi":       oi,
+                    "strike_vol":      vol,
+                    "vol_oi":          round(vol_oi, 3),
+                    "oi_ratio":        round(oi_ratio, 1),
+                    "oi_change_pct":   oi_change_pct,
+                    "iv_pct":          iv_pct_val,
+                    "iv_percentile":   iv_percentile,
+                    "mid_price":       mid_price,
+                    "pc_ratio":        round(pc_ratio, 2),
+                    "opt_score":       total,
                 }
 
         time.sleep(0.04)
 
-    return best_strike, oi_snapshot_local
+    # 更新OI快照
+    oi_snapshot.update(today_oi_updates)
+    return best_strike
 
 
-def analyze(
-    ticker: str,
-    cfg: dict,
-    market: dict,
-    oi_snapshot_prev: Dict[str, Any],
-    oi_snapshot_new: Dict[str, Any],
-    iv_history: Dict[str, Any],
-    state_lock: threading.Lock,
-):
+# ══════════════════════════════════════════════════════════════
+# 模块11: 单只股票分析
+# ══════════════════════════════════════════════════════════════
+
+def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
+            oi_snapshot: dict, iv_history: dict,
+            persistent_signals: set) -> dict | None:
     try:
         time.sleep(cfg["delay_per_ticker"])
-        tk = yf.Ticker(ticker)
-        hist = tk.history(period=f"{max(cfg['support_window'], 260)}d", interval="1d", auto_adjust=True)
+        tk   = yf.Ticker(ticker)
+        hist = tk.history(period=f"{cfg['support_window']}d",
+                          interval="1d", auto_adjust=True)
 
-        if hist.empty or len(hist) < 30:
+        if hist.empty or len(hist) < 20:
             return None
 
-        price = float(hist["Close"].iloc[-1])
+        price   = float(hist["Close"].iloc[-1])
         avg_vol = float(hist["Volume"].mean())
-        chg_pct = round((hist["Close"].iloc[-1] / hist["Close"].iloc[-2] - 1) * 100, 2)
+        chg_pct = round((hist["Close"].iloc[-1] /
+                         hist["Close"].iloc[-2] - 1) * 100, 2)
 
         if price < cfg["min_price"] or avg_vol < cfg["min_avg_volume"]:
             return None
 
-        supports = find_supports(hist["Close"], cfg["local_min_window"])
-        hit, nearest_sup, dist_pct, sup_touches = check_support(price, supports, cfg["support_tolerance"])
+        # 相对强弱过滤
+        rs = calc_rs(hist, spy_hist, cfg["rs_window"])
+        if rs < cfg["min_rs_ratio"]:
+            return None
+
+        # 支撑位 (含强度验证)
+        supports = find_supports_with_strength(hist["Close"], cfg["local_min_window"])
+        hit, nearest_sup, dist_pct, sup_touches = check_support_strength(
+            price, supports, cfg["support_tolerance"], cfg["min_support_touches"])
         if not hit:
             return None
 
+        # 技术指标 + 动量过滤
         tech = calc_technicals(hist)
         if cfg["min_momentum_5d"] is not None and tech["momentum_5d"] < cfg["min_momentum_5d"]:
             return None
 
-        rs20 = round(tech["ret20"] - market.get("spy_ret20", 0.0), 2)
-        if rs20 < cfg["min_rs_20d"]:
-            return None
+        # 财报日
+        earnings_date = get_earnings_date(tk)
 
-        earnings_date = get_next_earnings_date(tk)
-        sector = get_sector(tk)
-
-        # 扫描阶段不加锁，避免串行化；仅在合并共享状态时加锁
-        opt, oi_updates = scan_options_by_strike(tk, price, cfg, earnings_date, oi_snapshot_prev)
-        if oi_updates:
-            with state_lock:
-                oi_snapshot_new.update(oi_updates)
+        # 期权扫描
+        opt = scan_options_by_strike(tk, price, cfg, oi_snapshot,
+                                     iv_history, ticker)
         if opt is None:
             return None
 
-        iv_profile_key = build_iv_profile_key(ticker, opt["dte"], opt["otm_pct"])
-        iv_pctile = calc_iv_percentile(iv_history, iv_profile_key, ticker, opt["iv_pct"])
-        if iv_pctile is not None and iv_pctile > cfg["iv_pctile_max"]:
-            return None
+        # 财报窗口标注
+        in_earnings_window = earnings_in_window(earnings_date, opt["expiry"])
 
-        sup_score = ((cfg["support_tolerance"] * 100 - dist_pct) / (cfg["support_tolerance"] * 100) * 18)
-        mom_score = min(tech["vol_trend"], 2) / 2 * 5 + (4 if tech["above_ma20"] else 0)
-        pos_score = max(0, (50 - tech["week52_pos"]) / 50 * 4)
-        rs_score = min(max(rs20, -5), 10) / 10 * 8
-        touch_score = min(sup_touches, 5) / 5 * 6
+        # 信号持续性
+        is_persistent = ticker in persistent_signals
 
-        iv_bonus = 0
-        if iv_pctile is not None:
-            iv_bonus = max(0, (70 - iv_pctile) / 70 * 6)
+        # 板块
+        sector = STOCK_SECTOR.get(ticker, "其他")
 
-        market_penalty = cfg["market_penalty"] if market.get("risk_off") else 0
+        # 综合评分
+        sup_score  = ((cfg["support_tolerance"] * 100 - dist_pct)
+                      / (cfg["support_tolerance"] * 100) * 20)
+        mom_score  = (min(tech["vol_trend"], 2) / 2 * 6
+                      + (4 if tech["above_ma20"] else 0))
+        pos_score  = max(0, (50 - tech["week52_pos"]) / 50 * 5)
+        rs_score   = min((rs - 0.95) / 0.05 * 5, 5) if rs >= 0.95 else 0
+        # 支撑强度加分 (max 5)
+        touch_score = min(sup_touches - 1, 4) * 1.25
+        # 持续信号加分
+        persist_score = 8 if is_persistent else 0
+        # 财报窗口扣分
+        earnings_penalty = -15 if in_earnings_window else 0
+
         total_score = round(
-            sup_score + mom_score + pos_score + rs_score + touch_score + iv_bonus + opt["opt_score"] - market_penalty,
-            2,
-        )
-
-        today_str = datetime.today().date().isoformat()
-        with state_lock:
-            append_iv_history(iv_history, iv_profile_key, opt["iv_pct"], today_str)
-            # 保留ticker级别历史，便于分桶样本不足时回退
-            append_iv_history(iv_history, ticker, opt["iv_pct"], today_str)
+            sup_score + mom_score + pos_score + rs_score +
+            touch_score + persist_score + earnings_penalty +
+            opt["opt_score"], 2)
 
         return {
-            "代码": ticker,
-            "股价": round(price, 2),
-            "当日涨跌%": chg_pct,
-            "日均成交量M": round(avg_vol / 1e6, 2),
-            "最近支撑位": nearest_sup,
-            "支撑验证次数": sup_touches,
-            "距支撑%": dist_pct,
-            "5日动量%": tech["momentum_5d"],
-            "20日相对强弱RS": rs20,
-            "量能趋势": tech["vol_trend"],
-            "在均线上方": tech["above_ma20"],
-            "52周位置%": tech["week52_pos"],
-            "行业": sector,
-            "下次财报日": earnings_date.isoformat() if earnings_date else "未知",
-            "财报窗口内": bool(opt["earnings_in_window"]),
-            "到期日": opt["expiry"],
-            "剩余天数": opt["dte"],
-            "行权价": opt["strike"],
-            "虚值幅度%": opt["otm_pct"],
-            "期权参考价": opt["mid_price"],
-            "价差%": opt["spread_pct"],
-            "隐含波动率%": opt["iv_pct"],
-            "IV百分位%": iv_pctile,
-            "行权价OI": opt["strike_oi"],
-            "昨日OI": opt["prev_oi"],
-            "OI净增": opt["oi_delta"],
-            "OI净增比": opt["oi_delta_ratio"],
-            "行权价成交量": opt["strike_vol"],
-            "量OI比": opt["vol_oi"],
-            "OI集中倍数": opt["oi_ratio"],
-            "认沽认购比": opt["pc_ratio"],
-            "大盘风险": market.get("reason") if market.get("risk_off") else "正常",
-            "综合评分": total_score,
+            "代码":           ticker,
+            "板块":           sector,
+            "股价":           round(price, 2),
+            "当日涨跌%":      chg_pct,
+            "日均成交量M":    round(avg_vol / 1e6, 2),
+            "相对强弱RS":     rs,
+            "最近支撑位":     nearest_sup,
+            "距支撑%":        dist_pct,
+            "支撑验证次数":   sup_touches,
+            "5日动量%":       tech["momentum_5d"],
+            "量能趋势":       tech["vol_trend"],
+            "在均线上方":     tech["above_ma20"],
+            "52周位置%":      tech["week52_pos"],
+            "财报日":         earnings_date or "未知",
+            "财报在窗口内":   in_earnings_window,
+            "连续信号":       is_persistent,
+            "到期日":         opt["expiry"],
+            "剩余天数":       opt["dte"],
+            "行权价":         opt["strike"],
+            "虚值幅度%":      opt["otm_pct"],
+            "期权参考价":     opt["mid_price"],
+            "隐含波动率%":    opt["iv_pct"],
+            "IV百分位":       opt["iv_percentile"],
+            "行权价OI":       opt["strike_oi"],
+            "行权价成交量":   opt["strike_vol"],
+            "量OI比":         opt["vol_oi"],
+            "OI集中倍数":     opt["oi_ratio"],
+            "OI日变化%":      opt["oi_change_pct"],
+            "认沽认购比":     opt["pc_ratio"],
+            "综合评分":       total_score,
         }
 
     except Exception as e:
-        log.debug("%s 分析异常: %s", ticker, e)
+        log.debug(f"{ticker} 分析异常: {e}")
         return None
 
+
+# ══════════════════════════════════════════════════════════════
+# 模块12: 解读生成
+# ══════════════════════════════════════════════════════════════
 
 def generate_interpretation(row: pd.Series) -> str:
     parts = []
 
+    # 支撑位
+    touch_str = f"(已验证{row['支撑验证次数']}次)"
     if row["距支撑%"] < 0.5:
-        parts.append(f"股价紧贴支撑位({row['最近支撑位']})")
+        parts.append(f"股价紧贴支撑位${row['最近支撑位']}{touch_str}")
     else:
-        parts.append(f"股价距支撑位{row['距支撑%']}%")
-    parts.append(f"该支撑位近阶段验证{int(row['支撑验证次数'])}次")
+        parts.append(f"股价距支撑位{row['距支撑%']:.1f}%{touch_str}")
 
+    # 技术面
     signals = []
-    signals.append("均线上方" if row["在均线上方"] else "均线下方⚠️")
-    signals.append(f"20日RS={row['20日相对强弱RS']:+.1f}%")
+    if row["在均线上方"]:
+        signals.append("均线上方✅")
+    else:
+        signals.append("均线下方⚠️")
     if row["5日动量%"] > 2:
-        signals.append(f"近5日上涨{row['5日动量%']}%")
+        signals.append(f"近5日涨{row['5日动量%']:.1f}%")
     elif row["5日动量%"] < -2:
-        signals.append(f"近5日下跌{abs(row['5日动量%'])}%⚠️")
+        signals.append(f"近5日跌{abs(row['5日动量%']):.1f}%⚠️")
     if row["量能趋势"] > 1.2:
         signals.append("量能放大")
     if row["52周位置%"] < 30:
-        signals.append("处于52周低位区间")
+        signals.append("处于52周低位")
+    if row["相对强弱RS"] > 1.1:
+        signals.append(f"强于大盘(RS={row['相对强弱RS']:.2f})")
     parts.append("，".join(signals))
 
+    # 期权信号
     opt_parts = []
+    if row["OI日变化%"] >= 20:
+        opt_parts.append(f"今日OI新增{row['OI日变化%']:.0f}%(新资金流入🔥)")
+    elif row["OI日变化%"] >= 10:
+        opt_parts.append(f"今日OI新增{row['OI日变化%']:.0f}%")
+    elif row["OI日变化%"] < -10:
+        opt_parts.append(f"今日OI减少{abs(row['OI日变化%']):.0f}%(注意平仓⚠️)")
+
     if row["OI集中倍数"] >= 10:
-        opt_parts.append(f"OI高度集中({row['OI集中倍数']:.0f}倍异常)")
+        opt_parts.append(f"OI高度集中{row['OI集中倍数']:.0f}倍")
     elif row["OI集中倍数"] >= 3:
-        opt_parts.append(f"OI集中({row['OI集中倍数']:.0f}倍)")
-    if row["OI净增"] >= 200:
-        opt_parts.append(f"OI净增{int(row['OI净增'])}")
+        opt_parts.append(f"OI集中{row['OI集中倍数']:.0f}倍")
+
     if row["量OI比"] >= 0.5:
         opt_parts.append("当日成交极活跃")
     elif row["量OI比"] >= 0.3:
         opt_parts.append("当日成交活跃")
-    if pd.notna(row.get("价差%")) and float(row["价差%"]) > 15:
-        opt_parts.append(f"点差偏宽({row['价差%']:.1f}%)⚠️")
+
     if row["认沽认购比"] < 0.5:
         opt_parts.append("看涨情绪强")
     elif row["认沽认购比"] > 1.0:
-        opt_parts.append("看涨情绪弱⚠️")
+        opt_parts.append("看涨情绪偏弱⚠️")
+
+    if row["IV百分位"] <= 30:
+        opt_parts.append(f"IV处历史低位({row['IV百分位']:.0f}%分位)买入便宜✅")
+    elif row["IV百分位"] >= 60:
+        opt_parts.append(f"IV偏高({row['IV百分位']:.0f}%分位)⚠️")
+
     if opt_parts:
         parts.append("；".join(opt_parts))
 
-    if bool(row["财报窗口内"]):
-        parts.append("财报窗口内⚠️，注意IV crush风险")
-    ivp = row.get("IV百分位%")
-    if pd.notna(ivp):
-        parts.append(f"当前IV百分位约{ivp:.1f}%")
+    # 特殊标注
+    flags = []
+    if row["财报在窗口内"]:
+        flags.append(f"⚠️财报在{row['财报日']}(IV crush风险)")
+    if row["连续信号"]:
+        flags.append("🔄连续多日命中(信号持续)")
+    if flags:
+        parts.append("，".join(flags))
 
-    parts.append(f"所属行业: {row['行业']}，同板块命中{int(row['同板块命中数'])}只")
-
-    mid = row["期权参考价"]
-    mid_str = f"约${mid:.2f}" if mid else "价格待确认"
+    # 建议
+    mid_str = f"约${row['期权参考价']:.2f}" if row["期权参考价"] else "价格待确认"
     parts.append(f"关注 {row['行权价']}C {row['到期日']}，参考价{mid_str}")
 
     return "，".join(parts) + "。"
 
 
-MEDAL = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+# ══════════════════════════════════════════════════════════════
+# 模块13: Telegram 推送
+# ══════════════════════════════════════════════════════════════
 
+MEDAL = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
 
-def _tg_send(token: str, chat_id: str, text: str, retries: int = 3) -> bool:
+def _tg_send(token: str, chat_id: str, text: str) -> bool:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     if len(text) > 4096:
         text = text[:4090] + "\n..."
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    for i in range(retries):
-        try:
-            resp = requests.post(url, json=payload, timeout=15)
-            if resp.status_code == 200:
-                return True
-
-            # Telegram 限流: 429 + retry_after
-            if resp.status_code == 429:
-                retry_after = 1
-                try:
-                    retry_after = int(resp.json().get("parameters", {}).get("retry_after", 1))
-                except Exception:
-                    retry_after = 1
-                time.sleep(min(max(retry_after, 1), 10))
-                continue
-
-            # 临时错误重试
-            if 500 <= resp.status_code < 600 and i < retries - 1:
-                time.sleep(1.2 * (i + 1))
-                continue
-
-            log.warning("Telegram 发送失败: %s %s", resp.status_code, resp.text[:200])
-            return False
-        except Exception as e:
-            if i < retries - 1:
-                time.sleep(1.2 * (i + 1))
-                continue
-            log.warning("Telegram 请求异常: %s", e)
-            return False
-    return False
-
-
-def _tg_send_document(token: str, chat_id: str, file_path: str, caption: str = "") -> bool:
-    url = f"https://api.telegram.org/bot{token}/sendDocument"
-    if not file_path or not Path(file_path).exists():
-        return False
     try:
-        with open(file_path, "rb") as f:
-            resp = requests.post(
-                url,
-                data={
-                    "chat_id": chat_id,
-                    "caption": caption[:900],
-                    "parse_mode": "HTML",
-                },
-                files={"document": f},
-                timeout=30,
-            )
-        if resp.status_code == 200:
-            return True
-        log.warning("Telegram 文档发送失败: %s %s", resp.status_code, resp.text[:200])
-        return False
+        resp = requests.post(url, json={
+            "chat_id":    chat_id,
+            "text":       text,
+            "parse_mode": "HTML",
+        }, timeout=15)
+        return resp.status_code == 200
     except Exception as e:
-        log.warning("Telegram 文档请求异常: %s", e)
+        log.warning(f"Telegram 发送异常: {e}")
         return False
 
 
-def send_to_telegram(
-    df: pd.DataFrame,
-    total_scanned: int,
-    token: str,
-    chat_id: str,
-    output_csv: str = "",
-    market: Optional[dict] = None,
-):
+def send_to_telegram(df: pd.DataFrame, total_scanned: int,
+                     market_env: dict, token: str, chat_id: str):
     if not token or not chat_id:
         log.info("未配置 Telegram，跳过推送")
         return
 
     date_str = datetime.now().strftime("%Y-%m-%d")
-    count = len(df)
-    risk_tag = "⚠️风险偏高" if (market or {}).get("risk_off") else "✅常态"
+    count    = len(df)
+
+    # 板块共振统计
+    sector_counts = df["板块"].value_counts().to_dict()
+    hot_sectors   = [f"{s}({n}只)" for s, n in sector_counts.items() if n >= 2]
+    sector_str    = "🔥板块共振: " + "、".join(hot_sectors) if hot_sectors else ""
+
+    # 大盘环境
+    vix_str = f"VIX={market_env.get('vix', 0):.1f}"
+    spy_str = "SPY✅" if market_env.get("spy_above_ma", True) else "SPY⚠️"
+    qqq_str = "QQQ✅" if market_env.get("qqq_above_ma", True) else "QQQ⚠️"
+
     header = (
-        f"📊 <b>美股期权信号播报 v5</b>\n"
+        f"📊 <b>美股期权信号播报</b>\n"
         f"📅 {date_str}  盘后扫描\n"
-        f"🔍 共扫描 {total_scanned} 只，命中 <b>{count}</b> 个信号\n"
-        f"🌐 市场环境: {risk_tag}\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
+        f"🌍 大盘: {vix_str}  {spy_str}  {qqq_str}\n"
+        f"🔍 扫描 {total_scanned} 只，命中 <b>{count}</b> 个信号\n"
     )
+    if sector_str:
+        header += f"{sector_str}\n"
+    header += "━━━━━━━━━━━━━━━━━━━━"
     _tg_send(token, chat_id, header)
-    time.sleep(0.4)
+    time.sleep(0.5)
 
     for i, (_, row) in enumerate(df.iterrows()):
-        medal = MEDAL[i] if i < len(MEDAL) else f"{i+1}."
-        code = html.escape(str(row["代码"]))
-        sector = html.escape(str(row["行业"]))
-        explanation = html.escape(str(row["信号解读"]))
+        medal     = MEDAL[i] if i < len(MEDAL) else f"{i+1}."
         above_str = "✅均线上方" if row["在均线上方"] else "⚠️均线下方"
-        mid_str = f"${row['期权参考价']:.2f}" if row["期权参考价"] else "待确认"
-        earn_tag = "⚠️财报窗口" if bool(row["财报窗口内"]) else "财报安全"
-        ivp = f"{row['IV百分位%']:.1f}%" if pd.notna(row["IV百分位%"]) else "NA"
-        spread_str = f"{row['价差%']:.1f}%" if pd.notna(row["价差%"]) else "NA"
+        mid_str   = f"${row['期权参考价']:.2f}" if row["期权参考价"] else "待确认"
+
+        if row["5日动量%"] >= 2:
+            mom_icon = "📈"
+        elif row["5日动量%"] <= -2:
+            mom_icon = "📉"
+        else:
+            mom_icon = "➡️"
+
+        if row["OI集中倍数"] >= 10:
+            oi_str = f"🔥OI集中{row['OI集中倍数']:.0f}倍"
+        elif row["OI集中倍数"] >= 3:
+            oi_str = f"⚡OI集中{row['OI集中倍数']:.0f}倍"
+        else:
+            oi_str = f"OI集中{row['OI集中倍数']:.0f}倍"
+
+        if row["认沽认购比"] < 0.5:
+            pc_str = f"看涨强(P/C={row['认沽认购比']:.2f})"
+        elif row["认沽认购比"] > 1.0:
+            pc_str = f"⚠️看涨弱(P/C={row['认沽认购比']:.2f})"
+        else:
+            pc_str = f"P/C={row['认沽认购比']:.2f}"
+
+        # OI变化
+        oi_chg = row["OI日变化%"]
+        if oi_chg >= 20:
+            oi_chg_str = f"🔥OI+{oi_chg:.0f}%(新资金)"
+        elif oi_chg >= 10:
+            oi_chg_str = f"OI+{oi_chg:.0f}%"
+        elif oi_chg < -10:
+            oi_chg_str = f"⚠️OI{oi_chg:.0f}%(平仓)"
+        else:
+            oi_chg_str = f"OI变化{oi_chg:.0f}%"
+
+        # IV百分位
+        iv_pct_str = f"IV{row['IV百分位']:.0f}%分位"
+        if row["IV百分位"] <= 30:
+            iv_pct_str = f"✅IV低位({row['IV百分位']:.0f}%分位)"
+        elif row["IV百分位"] >= 60:
+            iv_pct_str = f"⚠️IV偏高({row['IV百分位']:.0f}%分位)"
+
+        # 特殊标注
+        flags = ""
+        if row["财报在窗口内"]:
+            flags += f"\n⚠️ 财报日 {row['财报日']} 在期权到期前，注意IV crush风险"
+        if row["连续信号"]:
+            flags += "\n🔄 连续多日命中，信号持续性强"
 
         msg = (
-            f"{medal} <b>{code}</b>  评分 <b>{row['综合评分']:.1f}</b>\n"
+            f"{medal} <b>{row['代码']}</b>  [{row['板块']}]  评分 <b>{row['综合评分']:.1f}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"💰 股价 <b>${row['股价']:.2f}</b>  当日{row['当日涨跌%']:+.2f}%\n"
-            f"🛡 支撑位 ${row['最近支撑位']:.2f}  距离 {row['距支撑%']:.1f}%  验证{int(row['支撑验证次数'])}次\n"
-            f"🎯 关注 <b>{row['行权价']}C</b>  到期 {row['到期日']}  ({row['剩余天数']}天)\n"
-            f"💵 期权参考价 {mid_str}  点差 {spread_str}  IV {row['隐含波动率%']:.1f}%  IV百分位 {ivp}\n"
-            f"📊 OI净增 {int(row['OI净增'])}  量OI比 {row['量OI比']:.2f}  OI倍数 {row['OI集中倍数']:.1f}\n"
-            f"📈 RS20 {row['20日相对强弱RS']:+.1f}%  {above_str}  {earn_tag}\n"
-            f"🏭 {sector}  同板块命中 {int(row['同板块命中数'])}  连续信号 {int(row['连续信号天数'])}天\n"
-            f"🗒 {explanation}"
+            f"🛡 支撑 ${row['最近支撑位']:.2f}  距离{row['距支撑%']:.1f}%  验证{row['支撑验证次数']}次\n"
+            f"🎯 关注 <b>{row['行权价']}C</b>  到期{row['到期日']}({row['剩余天数']}天)\n"
+            f"💵 参考价{mid_str}  {iv_pct_str}  虚值{row['虚值幅度%']:.1f}%\n"
+            f"{mom_icon} 动量{row['5日动量%']:+.1f}%  量能{row['量能趋势']:.2f}x  {above_str}  RS={row['相对强弱RS']:.2f}\n"
+            f"📊 {oi_str}  {oi_chg_str}  量OI比{row['量OI比']:.2f}  {pc_str}\n"
+            f"🗒 {row['信号解读']}"
+            f"{flags}"
         )
         _tg_send(token, chat_id, msg)
-        time.sleep(0.25)
-
-    # 附件: 当日完整CSV，方便手机端下载复盘
-    if output_csv and Path(output_csv).exists():
-        caption = (
-            f"📎 <b>{date_str} 扫描结果CSV</b>\n"
-            f"含评分拆解、板块共振、持续性、逐行解读。"
-        )
-        _tg_send_document(token, chat_id, output_csv, caption=caption)
+        time.sleep(0.3)
 
     footer = (
-        "⚠️ <b>风险提示</b>\n"
-        "信号仅基于量价与期权结构筛选，不构成投资建议。\n"
-        "请结合市场环境、财报事件与仓位管理。"
+        f"⚠️ <b>风险提示</b>\n"
+        f"以上信号基于期权异常活动和技术面筛选，\n"
+        f"不构成投资建议。期权交易风险较高，\n"
+        f"请结合大盘环境和个股催化剂自行判断。\n"
+        f"建议等第二天开盘股价稳守支撑后再进场。"
     )
     _tg_send(token, chat_id, footer)
+    log.info(f"Telegram 推送完成，共 {count} 条信号")
 
 
-def notify_telegram_status(
-    token: str,
-    chat_id: str,
-    title: str,
-    reason: str,
-    total_scanned: int,
-) -> None:
-    if not token or not chat_id:
-        return
-    msg = (
-        f"📣 <b>{html.escape(title)}</b>\n"
-        f"🔍 扫描数量: {total_scanned}\n"
-        f"📝 说明: {html.escape(reason)}"
-    )
-    _tg_send(token, chat_id, msg)
-
+# ══════════════════════════════════════════════════════════════
+# 模块14: 主流程
+# ══════════════════════════════════════════════════════════════
 
 def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
-    tg_token = tg_token or os.environ.get("TELEGRAM_TOKEN", "")
-    tg_chat = tg_chat or os.environ.get("TELEGRAM_CHAT_ID", "")
-
     print()
     print("╔══════════════════════════════════════════════════════════╗")
-    print("║       美股期权筛选器 v5  -  八项增强版                  ║")
-    print("║ 财报过滤/大盘过滤/OI净增/RS/板块/支撑次数/IV%/持续性   ║")
+    print("║       美股期权筛选器 v5  -  全面增强版                   ║")
+    print("║  支撑位·成交量·OI集中·方向性·动量·财报·大盘·RS·持续性   ║")
     print("╚══════════════════════════════════════════════════════════╝")
     print(f"  运行时间 : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  财报模式 : {cfg['earnings_mode']}")
-    print(f"  大盘模式 : {cfg['market_mode']} (VIX阈值={cfg['market_vix_threshold']})")
-    print(f"  RS门槛   : {cfg['min_rs_20d']:+.1f}%")
-    print(f"  IV百分位上限 : {cfg['iv_pctile_max']:.1f}%")
-    print(f"  价差上限 : {cfg['max_bid_ask_spread_pct']*100:.1f}%")
-    print(f"  OI比较窗口 : {cfg['max_oi_snapshot_gap_days']} 天")
+    print(f"  支撑容差 : +-{cfg['support_tolerance']*100:.0f}%  最少验证{cfg['min_support_touches']}次")
+    print(f"  到期范围 : {cfg['min_dte']} ~ {cfg['max_dte']} 天")
+    print(f"  OTM范围  : {cfg['otm_min']*100:.0f}% ~ {cfg['otm_max']*100:.0f}%")
+    print(f"  IV百分位 : 上限{cfg['max_iv_percentile']:.0f}%")
+    print(f"  大盘过滤 : {'开启' if cfg['market_filter'] else '关闭'}")
+    print(f"  并发线程 : {cfg['workers']}")
     print()
 
-    market = get_market_context(cfg)
-    print(
-        "  大盘状态 : "
-        f"SPY20d={market.get('spy_ret20', 0):+.2f}% "
-        f"VIX={market.get('vix', 'NA')} "
-        f"风险={'是' if market.get('risk_off') else '否'}"
-    )
-    if cfg["market_mode"] == "strict" and not market.get("ok", True):
-        print(f"  大盘过滤触发(严格模式): {market.get('reason', '风险偏高')}，本次不做Call筛选。")
-        notify_telegram_status(
-            token=tg_token,
-            chat_id=tg_chat,
-            title="本次无信号（大盘过滤触发）",
-            reason=market.get("reason", "风险偏高"),
-            total_scanned=0,
-        )
-        return pd.DataFrame()
+    # 加载持久化数据
+    oi_snapshot = load_oi_snapshot(cfg["oi_snapshot_file"])
+    iv_history  = load_iv_history(cfg["iv_history_file"])
+    persistent_signals = load_historical_signals(
+        cfg["results_dir"], cfg["signal_lookback_days"])
+    if persistent_signals:
+        log.info(f"  连续信号标的: {', '.join(sorted(persistent_signals))}")
+
+    # 大盘环境检查
+    market_env = {"ok": True, "vix": 0.0, "spy_above_ma": True, "qqq_above_ma": True}
+    if cfg["market_filter"]:
+        log.info("检查大盘环境...")
+        market_env = check_market_environment(cfg)
+        if not market_env["ok"]:
+            msg = f"⛔ 大盘环境不佳: {market_env['reason']}，今日跳过扫描"
+            print(f"\n  {msg}\n")
+            tg_token = tg_token or os.environ.get("TELEGRAM_TOKEN", "")
+            tg_chat  = tg_chat  or os.environ.get("TELEGRAM_CHAT_ID", "")
+            if tg_token and tg_chat:
+                _tg_send(tg_token, tg_chat,
+                         f"📊 美股期权筛选器\n📅 {datetime.now().strftime('%Y-%m-%d')}\n{msg}")
+            return pd.DataFrame()
+
+    # 获取 SPY 历史（用于RS计算）
+    log.info("获取 SPY 基准数据...")
+    try:
+        spy_hist = yf.Ticker("SPY").history(period="60d", auto_adjust=True)
+    except Exception:
+        spy_hist = pd.DataFrame()
 
     universe = get_universe()
     total_scanned = len(universe)
     signals, errors = [], 0
 
-    oi_snapshot_prev = load_json(OI_SNAPSHOT_PATH, {})
-    oi_snapshot_new: Dict[str, Any] = {}
-    iv_history = load_json(IV_HISTORY_PATH, {})
-    state_lock = threading.Lock()
-
     with ThreadPoolExecutor(max_workers=cfg["workers"]) as pool:
         futures = {
-            pool.submit(
-                analyze, tk, cfg, market, oi_snapshot_prev, oi_snapshot_new, iv_history, state_lock
-            ): tk
+            pool.submit(analyze, tk, cfg, spy_hist, oi_snapshot,
+                        iv_history, persistent_signals): tk
             for tk in universe
         }
-        with tqdm(total=len(universe), desc="扫描中", ncols=88, unit="只") as bar:
+        with tqdm(total=total_scanned, desc="扫描中", ncols=75, unit="只") as bar:
             for future in as_completed(futures):
                 tk = futures[future]
                 try:
                     res = future.result()
                     if res:
                         signals.append(res)
+                        persist_flag = "🔄" if res["连续信号"] else ""
+                        earnings_flag = "📅" if res["财报在窗口内"] else ""
                         tqdm.write(
-                            f"  命中 {tk:<6} 评分={res['综合评分']:.1f} "
-                            f"RS={res['20日相对强弱RS']:+.1f}% OI净增={int(res['OI净增'])}"
+                            f"  命中 {tk:<6} ${res['股价']:>8.2f}"
+                            f"  支撑{res['距支撑%']:.1f}%({res['支撑验证次数']}次)"
+                            f"  {res['行权价']}C {res['到期日']}"
+                            f"  OIx{res['OI集中倍数']:.1f}"
+                            f"  OI变{res['OI日变化%']:+.0f}%"
+                            f"  IV{res['IV百分位']:.0f}%位"
+                            f"  评分{res['综合评分']:.1f}"
+                            f"  {persist_flag}{earnings_flag}"
                         )
                 except Exception:
                     errors += 1
                 finally:
                     bar.update(1)
 
+    # 保存持久化数据
+    save_oi_snapshot(oi_snapshot, cfg["oi_snapshot_file"])
+    save_iv_history(iv_history, cfg["iv_history_file"])
+
     if not signals:
         print("\n  未找到符合条件的标的，建议尝试:")
-        print("   --market-mode score    (改为惩罚模式，不直接拦截)")
-        print("   --earnings-mode mark   (仅标注财报窗口，不过滤)")
-        print("   --min-rs -2            (放宽相对强弱)")
-        notify_telegram_status(
-            token=tg_token,
-            chat_id=tg_chat,
-            title="本次无命中信号",
-            reason="条件较严格，可放宽 market/earnings/RS 参数后重试",
-            total_scanned=total_scanned,
-        )
+        print("   --tolerance 0.05       (放宽支撑容差)")
+        print("   --min-oi 200           (降低OI门槛)")
+        print("   --no-market-filter     (关闭大盘过滤)")
         return pd.DataFrame()
 
-    df = pd.DataFrame(signals)
-
-    # 板块共振
-    sector_counts = df["行业"].value_counts().to_dict()
-    df["同板块命中数"] = df["行业"].map(sector_counts).fillna(1).astype(int)
-    df["板块共振加分"] = df["同板块命中数"].apply(lambda n: round(min((n - 1) * 1.5, 6), 2))
-    df["综合评分"] = (df["综合评分"] + df["板块共振加分"]).round(2)
-
-    # 信号持续性
-    df["连续信号天数"] = df["代码"].apply(lambda x: get_signal_streak(str(x), cfg["output_csv"]) + 1)
-    df["持续性加分"] = df["连续信号天数"].apply(lambda n: round(min((n - 1) * 1.5, 4.5), 2))
-    df["综合评分"] = (df["综合评分"] + df["持续性加分"]).round(2)
-
-    df = df.sort_values("综合评分", ascending=False).head(cfg["top_n"]).reset_index(drop=True)
+    df = (pd.DataFrame(signals)
+          .sort_values("综合评分", ascending=False)
+          .head(cfg["top_n"])
+          .reset_index(drop=True))
     df.index += 1
+
+    # 板块共振统计
+    sector_counts = df["板块"].value_counts()
+    hot_sectors = sector_counts[sector_counts >= 2].to_dict()
 
     df["信号解读"] = df.apply(generate_interpretation, axis=1)
 
     pd.set_option("display.max_columns", None)
     pd.set_option("display.width", 220)
-    pd.set_option("display.max_colwidth", 90)
+    pd.set_option("display.max_colwidth", 80)
     pd.set_option("display.float_format", "{:.2f}".format)
 
-    print(f"\n{'='*78}")
+    print(f"\n{'='*70}")
     print(f"  筛选完成  共命中 {len(signals)} 只  展示前 {cfg['top_n']} 名")
-    print(f"{'='*78}\n")
+    if hot_sectors:
+        print(f"  🔥板块共振: " + "  ".join([f"{s}({n}只)" for s, n in hot_sectors.items()]))
+    print(f"{'='*70}\n")
 
     data_cols = [
-        "代码",
-        "股价",
-        "当日涨跌%",
-        "最近支撑位",
-        "支撑验证次数",
-        "距支撑%",
-        "20日相对强弱RS",
-        "5日动量%",
-        "量能趋势",
-        "52周位置%",
-        "行业",
-        "同板块命中数",
-        "下次财报日",
-        "财报窗口内",
-        "到期日",
-        "剩余天数",
-        "行权价",
-        "虚值幅度%",
-        "期权参考价",
-        "价差%",
-        "隐含波动率%",
-        "IV百分位%",
-        "行权价OI",
-        "昨日OI",
-        "OI净增",
-        "OI净增比",
-        "行权价成交量",
-        "量OI比",
-        "OI集中倍数",
-        "认沽认购比",
-        "连续信号天数",
+        "代码","板块","股价","当日涨跌%","相对强弱RS","最近支撑位","距支撑%","支撑验证次数",
+        "5日动量%","量能趋势","在均线上方","52周位置%",
+        "财报日","财报在窗口内","连续信号",
+        "到期日","剩余天数","行权价","虚值幅度%","期权参考价","隐含波动率%","IV百分位",
+        "行权价OI","行权价成交量","量OI比","OI集中倍数","OI日变化%","认沽认购比",
         "综合评分",
     ]
-
     print(df[data_cols].to_string())
 
-    print(f"\n{'='*78}")
+    print(f"\n{'='*70}")
     print("  逐行信号解读")
-    print(f"{'='*78}")
+    print(f"{'='*70}")
     for idx, row in df.iterrows():
-        print(f"\n  [{idx}] {row['代码']}  评分={row['综合评分']:.1f}")
+        flags = []
+        if row["财报在窗口内"]:
+            flags.append("⚠️财报窗口")
+        if row["连续信号"]:
+            flags.append("🔄持续信号")
+        flag_str = "  " + "  ".join(flags) if flags else ""
+        print(f"\n  [{idx}] {row['代码']}  [{row['板块']}]  评分={row['综合评分']:.1f}{flag_str}")
         print(f"      {row['信号解读']}")
 
-    df[data_cols + ["板块共振加分", "持续性加分", "大盘风险", "信号解读"]].to_csv(
-        cfg["output_csv"], index=True, encoding="utf-8-sig"
-    )
-    print(f"\n  结果已保存: {cfg['output_csv']}")
+    print(f"\n{'─'*70}")
+    print("  指标说明:")
+    print("  相对强弱RS    : 近20日涨幅/SPY涨幅，>1跑赢大盘，<0.95被过滤")
+    print("  支撑验证次数  : 该支撑位历史上被触碰反弹的次数，越多越可靠")
+    print("  OI日变化%     : 今日OI相比昨日变化，>10%说明新资金流入")
+    print("  IV百分位      : 当前IV在历史中的位置，<30%便宜，>70%贵(已过滤)")
+    print("  连续信号      : 过去5天内该标的多次出现，信号持续性强")
+    print("  财报在窗口内  : 财报在期权到期前，存在IV crush风险")
+    print(f"{'─'*70}\n")
+
+    # 保存CSV
+    os.makedirs(cfg["results_dir"], exist_ok=True)
+    out_path = os.path.join(cfg["results_dir"],
+                            os.path.basename(cfg["output_csv"]))
+    df[data_cols + ["信号解读"]].to_csv(out_path, index=True, encoding="utf-8-sig")
+    print(f"  结果已保存: {out_path}")
     print(f"  扫描出错数: {errors}")
+    print()
 
-    # 保存快照
-    merged_oi = dict(oi_snapshot_prev)
-    merged_oi.update(oi_snapshot_new)
-    save_json(OI_SNAPSHOT_PATH, merged_oi)
-    save_json(IV_HISTORY_PATH, iv_history)
-    print(f"  OI快照已更新: {OI_SNAPSHOT_PATH}")
-    print(f"  IV历史已更新: {IV_HISTORY_PATH}\n")
-
-    send_to_telegram(
-        df=df,
-        total_scanned=total_scanned,
-        token=tg_token,
-        chat_id=tg_chat,
-        output_csv=cfg["output_csv"],
-        market=market,
-    )
+    # Telegram 推送
+    tg_token = tg_token or os.environ.get("TELEGRAM_TOKEN", "")
+    tg_chat  = tg_chat  or os.environ.get("TELEGRAM_CHAT_ID", "")
+    send_to_telegram(df, total_scanned, market_env, tg_token, tg_chat)
 
     return df
 
 
+# ══════════════════════════════════════════════════════════════
+# 入口
+# ══════════════════════════════════════════════════════════════
+
 def main():
     p = argparse.ArgumentParser(
-        description="美股期权五因子筛选器 v5(八项增强)",
+        description="美股期权筛选器 v5 - 全面增强版",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--top", type=int, default=CONFIG["top_n"])
-    p.add_argument("--workers", type=int, default=CONFIG["workers"])
-    p.add_argument("--tolerance", type=float, default=CONFIG["support_tolerance"], help="支撑位容差")
-    p.add_argument("--min-oi", type=int, default=CONFIG["min_strike_oi"], help="单行权价最小OI")
-    p.add_argument("--min-vol", type=int, default=CONFIG["min_strike_vol"], help="单行权价最小成交量")
-    p.add_argument("--min-dte", type=int, default=CONFIG["min_dte"])
-    p.add_argument("--max-dte", type=int, default=CONFIG["max_dte"])
-    p.add_argument("--otm-max", type=float, default=CONFIG["otm_max"], help="OTM最大幅度")
-    p.add_argument("--output", type=str, default=CONFIG["output_csv"])
-
-    p.add_argument("--earnings-mode", choices=["exclude", "mark"], default=CONFIG["earnings_mode"])
-    p.add_argument("--market-mode", choices=["strict", "score"], default=CONFIG["market_mode"])
-    p.add_argument("--vix-threshold", type=float, default=CONFIG["market_vix_threshold"])
-    p.add_argument("--market-penalty", type=float, default=CONFIG["market_penalty"])
-
-    p.add_argument("--min-rs", type=float, default=CONFIG["min_rs_20d"], help="20日相对SPY强弱门槛")
-    p.add_argument("--iv-pct-max", type=float, default=CONFIG["iv_pctile_max"], help="IV百分位上限")
-    p.add_argument(
-        "--max-spread-pct",
-        type=float,
-        default=CONFIG["max_bid_ask_spread_pct"],
-        help="期权最大买卖价差(中间价比例), 0.25=25%",
-    )
-    p.add_argument(
-        "--oi-gap-days",
-        type=int,
-        default=CONFIG["max_oi_snapshot_gap_days"],
-        help="OI快照最大可比较天数(覆盖周末建议4)",
-    )
-    p.add_argument("--tg-token", type=str, default=os.environ.get("TELEGRAM_TOKEN", ""))
-    p.add_argument("--tg-chat", type=str, default=os.environ.get("TELEGRAM_CHAT_ID", ""))
-
+    p.add_argument("--top",              type=int,   default=CONFIG["top_n"])
+    p.add_argument("--workers",          type=int,   default=CONFIG["workers"])
+    p.add_argument("--tolerance",        type=float, default=CONFIG["support_tolerance"],
+                   help="支撑位容差 0.03=3%%")
+    p.add_argument("--min-touches",      type=int,   default=CONFIG["min_support_touches"],
+                   help="支撑位最少验证次数")
+    p.add_argument("--min-oi",           type=int,   default=CONFIG["min_strike_oi"])
+    p.add_argument("--min-vol",          type=int,   default=CONFIG["min_strike_vol"])
+    p.add_argument("--min-dte",          type=int,   default=CONFIG["min_dte"])
+    p.add_argument("--max-dte",          type=int,   default=CONFIG["max_dte"])
+    p.add_argument("--otm-max",          type=float, default=CONFIG["otm_max"])
+    p.add_argument("--max-iv-pct",       type=float, default=CONFIG["max_iv_percentile"],
+                   help="IV百分位上限，超过此值跳过")
+    p.add_argument("--no-market-filter", action="store_true",
+                   help="关闭大盘环境过滤")
+    p.add_argument("--output",           type=str,   default=CONFIG["output_csv"])
     args = p.parse_args()
 
     cfg = CONFIG.copy()
-    cfg.update(
-        {
-            "top_n": args.top,
-            "workers": args.workers,
-            "support_tolerance": args.tolerance,
-            "min_strike_oi": args.min_oi,
-            "min_strike_vol": args.min_vol,
-            "min_dte": args.min_dte,
-            "max_dte": args.max_dte,
-            "otm_max": args.otm_max,
-            "output_csv": args.output,
-            "earnings_mode": args.earnings_mode,
-            "market_mode": args.market_mode,
-            "market_vix_threshold": args.vix_threshold,
-            "market_penalty": args.market_penalty,
-            "min_rs_20d": args.min_rs,
-            "iv_pctile_max": args.iv_pct_max,
-            "max_bid_ask_spread_pct": args.max_spread_pct,
-            "max_oi_snapshot_gap_days": args.oi_gap_days,
-        }
-    )
+    cfg.update({
+        "top_n":             args.top,
+        "workers":           args.workers,
+        "support_tolerance": args.tolerance,
+        "min_support_touches": args.min_touches,
+        "min_strike_oi":     args.min_oi,
+        "min_strike_vol":    args.min_vol,
+        "min_dte":           args.min_dte,
+        "max_dte":           args.max_dte,
+        "otm_max":           args.otm_max,
+        "max_iv_percentile": args.max_iv_pct,
+        "market_filter":     not args.no_market_filter,
+        "output_csv":        args.output,
+    })
 
-    run(cfg, tg_token=args.tg_token, tg_chat=args.tg_chat)
+    tg_token = os.environ.get("TELEGRAM_TOKEN", "")
+    tg_chat  = os.environ.get("TELEGRAM_CHAT_ID", "")
+    run(cfg, tg_token=tg_token, tg_chat=tg_chat)
 
 
 if __name__ == "__main__":
