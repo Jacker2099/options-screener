@@ -39,11 +39,11 @@ CONFIG = {
     "local_min_window":   5,     # 滚动局部最低点窗口 (±5天)
 
     # ── 期权异常判断 ──
-    "min_oi":             500,   # 最小 Call OI (过滤流动性差的期权)
-    "min_call_volume":    200,   # 最小 Call 日成交量
-    "min_vol_oi_ratio":   0.20,  # Vol/OI 最小比值 (≥0.2 说明当日明显活跃)
-    "min_dte":            7,     # 最小到期天数 (过滤末日期权)
-    "max_dte":            90,    # 最大到期天数
+    "min_oi":             1000,  # 最小 Call OI (过滤流动性差的期权)
+    "min_call_volume":    500,   # 最小 Call 日成交量 (汇总口径)
+    "min_vol_oi_ratio":   0.15,  # Vol/OI 最小比值 (汇总口径，≥0.15 说明当日活跃)
+    "min_dte":            14,    # 最小到期天数 (过滤末日期权，至少2周)
+    "max_dte":            60,    # 最大到期天数 (聚焦近期催化剂)
 
     # ── 股票流动性过滤 ──
     "min_avg_volume":     300_000,  # 日均成交量下限
@@ -206,12 +206,11 @@ def scan_options(tk: yf.Ticker, price: float, cfg: dict) -> dict | None:
     """
     扫描期权链，寻找 Call OI + 成交量异常信号。
 
-    筛选逻辑:
-      - 只看 min_dte ~ max_dte 范围内的到期日
-      - Call 行权价限定在当前价格 85% ~ 120% (ATM附近)
-      - 汇总所有行权价的总 OI 和总成交量
-      - 计算 Vol/OI 比值 (越高说明今日越活跃)
-      - 综合评分，返回最强信号的到期日
+    修复说明:
+      - vol/oi 统一用汇总口径计算 (total_vol / total_oi)，与 call_oi/call_volume 一致
+      - 新增 put_call_ratio: put总OI / call总OI，越低说明看涨情绪越强
+      - 新增 otm_call_pct: OTM call OI 占比，机构倾向买 OTM 表达方向性押注
+      - 评分重构: 成交量绝对值 + vol/oi活跃度 + OTM押注强度
     """
     try:
         expirations = tk.options
@@ -237,61 +236,82 @@ def scan_options(tk: yf.Ticker, price: float, cfg: dict) -> dict | None:
         try:
             chain = tk.option_chain(exp_str)
             calls = chain.calls.copy()
+            puts  = chain.puts.copy()
         except Exception:
             continue
 
         if calls.empty:
             continue
 
-        # ATM 附近过滤
-        calls = calls[
+        calls = calls.fillna(0)
+        puts  = puts.fillna(0)
+
+        # ── ATM 附近的 call (85%~120% 当前价) ──
+        calls_atm = calls[
             (calls["strike"] >= price * 0.85) &
             (calls["strike"] <= price * 1.20)
         ]
-        if calls.empty:
+        if calls_atm.empty:
             continue
 
-        calls = calls.fillna(0)
-        total_oi  = int(calls["openInterest"].sum())
-        total_vol = int(calls["volume"].sum())
+        # 全部汇总 (统一口径)
+        total_call_oi  = int(calls_atm["openInterest"].sum())
+        total_call_vol = int(calls_atm["volume"].sum())
 
-        if total_oi < cfg["min_oi"] or total_vol < cfg["min_call_volume"]:
+        if total_call_oi < cfg["min_oi"] or total_call_vol < cfg["min_call_volume"]:
             continue
 
-        vol_oi = round(total_vol / (total_oi + 1), 3)
+        # vol/oi: 全部用汇总数据，口径统一
+        vol_oi = round(total_call_vol / (total_call_oi + 1), 3)
         if vol_oi < cfg["min_vol_oi_ratio"]:
             continue
 
-        # 最大 OI 行权价 (机构集中押注位置)
-        top_idx    = calls["openInterest"].idxmax()
-        top_strike = float(calls.loc[top_idx, "strike"])
-        top_oi     = int(calls.loc[top_idx, "openInterest"])
-        top_vol    = int(calls.loc[top_idx, "volume"])
-
-        # 综合评分:
-        #   vol_oi_ratio 权重40 + 成交量规模(max50) + OI规模(max10)
-        score = (
-            vol_oi * 40
-            + min(total_vol / 1_000, 50)
-            + min(total_oi / 5_000, 10)
+        # ── OTM call 占比 (行权价 > 当前价的 call OI 占比) ──
+        otm_calls = calls_atm[calls_atm["strike"] > price * 1.01]
+        otm_call_pct = round(
+            otm_calls["openInterest"].sum() / (total_call_oi + 1), 3
         )
 
+        # ── Put/Call OI 比值 (越低越看涨) ──
+        puts_atm = puts[
+            (puts["strike"] >= price * 0.85) &
+            (puts["strike"] <= price * 1.15)
+        ]
+        put_oi = int(puts_atm["openInterest"].sum()) if not puts_atm.empty else 0
+        pc_ratio = round(put_oi / (total_call_oi + 1), 3)
+
+        # ── 最大 OI 行权价 (机构集中押注位) ──
+        top_idx    = calls_atm["openInterest"].idxmax()
+        top_strike = float(calls_atm.loc[top_idx, "strike"])
+
+        # ── 评分重构 ──
+        # 1. 成交量规模分 (max 40): 真实流量大小
+        vol_score = min(total_call_vol / 500, 40)
+        # 2. 活跃度分 (max 30): vol/oi 越高当日越异常
+        activity_score = min(vol_oi * 60, 30)
+        # 3. OTM押注分 (max 20): 机构倾向买 OTM 表达看涨
+        otm_score = otm_call_pct * 20
+        # 4. 看涨情绪分 (max 10): put/call 越低越看涨
+        bullish_score = max(0, 10 - pc_ratio * 10)
+
+        opt_score = round(vol_score + activity_score + otm_score + bullish_score, 2)
+
         candidate = {
-            "expiry":       exp_str,
-            "dte":          dte,
-            "call_oi":      total_oi,
-            "call_volume":  total_vol,
-            "vol_oi_ratio": vol_oi,
-            "top_strike":   top_strike,
-            "top_oi":       top_oi,
-            "top_vol":      top_vol,
-            "opt_score":    round(score, 2),
+            "expiry":        exp_str,
+            "dte":           dte,
+            "call_oi":       total_call_oi,
+            "call_volume":   total_call_vol,
+            "vol_oi":        vol_oi,          # 统一汇总口径
+            "top_strike":    top_strike,
+            "otm_call_pct":  otm_call_pct,
+            "pc_ratio":      pc_ratio,
+            "opt_score":     opt_score,
         }
 
-        if best is None or score > best["opt_score"]:
+        if best is None or opt_score > best["opt_score"]:
             best = candidate
 
-        time.sleep(0.04)  # 每个到期日之间小暂停，避免限速
+        time.sleep(0.04)
 
     return best
 
@@ -337,19 +357,21 @@ def analyze(ticker: str, cfg: dict) -> dict | None:
         total_score = round(sup_score + opt["opt_score"], 2)
 
         return {
-            "ticker":            ticker,
-            "price":             round(price, 2),
-            "chg_pct":           price_chg,
-            "avg_vol_m":         round(avg_vol / 1e6, 2),
-            "nearest_support":   nearest_sup,
-            "dist_to_sup_%":     dist_pct,
-            "expiry":            opt["expiry"],
-            "dte":               opt["dte"],
-            "call_oi":           opt["call_oi"],
-            "call_volume":       opt["call_volume"],
-            "vol/oi":            opt["vol_oi_ratio"],
-            "top_strike":        opt["top_strike"],
-            "score":             total_score,
+            "ticker":          ticker,
+            "price":           round(price, 2),
+            "chg_pct":         price_chg,
+            "avg_vol_m":       round(avg_vol / 1e6, 2),
+            "nearest_support": nearest_sup,
+            "dist_to_sup_%":   dist_pct,
+            "expiry":          opt["expiry"],
+            "dte":             opt["dte"],
+            "call_oi":         opt["call_oi"],
+            "call_volume":     opt["call_volume"],
+            "vol/oi":          opt["vol_oi"],        # 统一汇总口径
+            "top_strike":      opt["top_strike"],
+            "otm_call_%":      round(opt["otm_call_pct"] * 100, 1),  # OTM call占比%
+            "put/call":        opt["pc_ratio"],       # 越低越看涨
+            "score":           total_score,
         }
 
     except Exception as e:
@@ -394,6 +416,7 @@ def run(cfg: dict) -> pd.DataFrame:
                             f"  支撑距离={res['dist_to_sup_%']:.1f}%"
                             f"  CallOI={res['call_oi']:>7,}"
                             f"  Vol/OI={res['vol/oi']:.2f}"
+                            f"  P/C={res['put/call']:.2f}"
                             f"  评分={res['score']:.1f}"
                         )
                 except Exception:
@@ -423,7 +446,8 @@ def run(cfg: dict) -> pd.DataFrame:
 
     display_cols = [
         "ticker", "price", "chg_pct", "nearest_support", "dist_to_sup_%",
-        "expiry", "dte", "call_oi", "call_volume", "vol/oi", "top_strike", "score"
+        "expiry", "dte", "call_oi", "call_volume", "vol/oi",
+        "top_strike", "otm_call_%", "put/call", "score"
     ]
     pd.set_option("display.max_columns", None)
     pd.set_option("display.width", 140)
