@@ -1,15 +1,20 @@
 """
-美股期权筛选器 v5 - 全面增强版
+美股期权筛选器 v6 - OI净变化驱动版
 ════════════════════════════════════════════════════════════════
-v5 新增模块:
-  1. 财报日过滤     - 避开 IV crush 陷阱，标注财报窗口内标的
-  2. 大盘环境过滤   - SPY/QQQ 趋势 + VIX 过滤，避免逆势操作
-  3. OI 净变化      - 对比前日 OI 快照，识别真正的新资金流入
-  4. 相对强弱(RS)   - 只保留近20日跑赢 SPY 的强势股
-  5. 板块共振       - 标注同板块命中数量，共振信号可信度更高
-  6. 支撑位验证次数 - 区分强支撑(多次验证)和弱支撑(仅1次)
-  7. IV 历史百分位  - 本地记录每日IV，计算IV百分位避免高位买入
-  8. 信号持续性     - 对比历史信号CSV，连续命中2日以上加分
+核心理念: OI净变化是最接近真实新资金流入的信号
+  第一天运行：建立基准快照，其他因子正常工作
+  第二天起：OI净变化生效，信号质量显著提升
+  第三天起：OI连续增长检测生效，可识别机构持续建仓
+
+评分体系 (满分约150):
+  核心(70分) : OI日净变化(40) + OI连续增长(20) + OI集中倍数(10)
+  辅助(60分) : 成交量(20) + 活跃度(15) + 方向性(12) + 到期(8) + IV(5)
+  技术(20分) : 支撑位(20)
+  加分项     : 动量(10) + 52周位置(5) + RS(5) + 支撑验证(5) + 持续信号(8)
+  扣分项     : 财报在窗口内(-15)
+
+大盘环境: 仅作参考提示，不过滤信号（本策略本身是支撑位抄底逻辑）
+持久化文件: oi_snapshot.json / oi_history.json / iv_history.json
 
 数据来源: yfinance (免费，盘后运行)
 股票池: S&P500 + Nasdaq100 + 热门标的 (~650只)
@@ -20,7 +25,7 @@ v5 新增模块:
 运行:
     python options_screener.py
     python options_screener.py --top 25 --workers 8
-    python options_screener.py --no-market-filter   # 关闭大盘过滤
+    python options_screener.py --tolerance 0.04 --min-oi 200
 ════════════════════════════════════════════════════════════════
 """
 
@@ -47,7 +52,7 @@ CONFIG = {
     "support_window":        60,
     "support_tolerance":     0.03,
     "local_min_window":      5,
-    "min_support_touches":   2,      # 支撑位最少被验证次数
+    "min_support_touches":   1,      # 支撑位最少被验证次数(1=不过滤，让评分区分强弱)
 
     # 期权过滤 (单行权价口径)
     "min_strike_oi":         300,
@@ -71,21 +76,21 @@ CONFIG = {
     "results_dir":           "results",            # 历史CSV目录
     "signal_lookback_days":  5,                    # 回看几天的历史信号
 
-    # 大盘过滤
-    "market_filter":         True,                 # 是否启用大盘过滤
-    "max_vix":               30.0,                 # VIX超过此值暂停信号
-    "market_spy_ma":         20,                   # SPY需在N日均线上方
+    # 大盘环境 (仅作参考提示，不过滤信号)
+    "market_filter":         True,                 # 是否显示大盘提示
+    "max_vix":               30.0,                 # VIX警戒线（仅提示）
+    "market_spy_ma":         20,                   # SPY均线周期
 
-    # 相对强弱
+    # 相对强弱 (仅作评分参考，不过滤)
     "rs_window":             20,                   # RS计算窗口(天)
-    "min_rs_ratio":          0.95,                 # 相对SPY涨幅至少95%
+    "min_rs_ratio":          0.95,                 # 保留参数兼容性（已不用于过滤）
 
     # 股票流动性
     "min_avg_volume":        300_000,
     "min_price":             5.0,
 
     # 动量过滤
-    "min_momentum_5d":       -5.0,
+    "min_momentum_5d":       -15.0,  # 近5日跌幅不超过15%，抄底策略放宽此限制
 
     # 并发
     "workers":               5,
@@ -259,29 +264,46 @@ def check_market_environment(cfg: dict) -> dict:
 
 def get_earnings_date(tk) -> str | None:
     """
-    获取下次财报日期。
+    获取下次财报日期，带重试机制。
     返回日期字符串如 '2026-04-15'，或 None（无法获取）
+    yfinance calendar 接口不稳定，失败时静默返回 None，不影响主流程。
     """
-    try:
-        cal = tk.calendar
-        if cal is None:
+    for attempt in range(2):  # 最多重试1次
+        try:
+            cal = tk.calendar
+            if cal is None:
+                return None
+            today = datetime.today().date()
+            # calendar 返回格式可能是 dict 或 DataFrame
+            if isinstance(cal, dict):
+                dates = cal.get("Earnings Date", [])
+                for d in dates:
+                    try:
+                        if hasattr(d, "date"):
+                            ed = d.date()
+                        else:
+                            ed = datetime.strptime(str(d)[:10], "%Y-%m-%d").date()
+                        if ed >= today:  # 只返回未来的财报日
+                            return ed.strftime("%Y-%m-%d")
+                    except Exception:
+                        continue
+            elif isinstance(cal, pd.DataFrame):
+                if "Earnings Date" in cal.index:
+                    for val in cal.loc["Earnings Date"]:
+                        try:
+                            if hasattr(val, "date"):
+                                ed = val.date()
+                            else:
+                                ed = datetime.strptime(str(val)[:10], "%Y-%m-%d").date()
+                            if ed >= today:
+                                return ed.strftime("%Y-%m-%d")
+                        except Exception:
+                            continue
             return None
-        # calendar 返回格式可能是 dict 或 DataFrame
-        if isinstance(cal, dict):
-            dates = cal.get("Earnings Date", [])
-            if dates:
-                d = dates[0]
-                if hasattr(d, "strftime"):
-                    return d.strftime("%Y-%m-%d")
-                return str(d)[:10]
-        elif isinstance(cal, pd.DataFrame):
-            if "Earnings Date" in cal.index:
-                val = cal.loc["Earnings Date"].iloc[0]
-                if hasattr(val, "strftime"):
-                    return val.strftime("%Y-%m-%d")
-                return str(val)[:10]
-    except Exception:
-        pass
+        except Exception:
+            if attempt == 0:
+                time.sleep(0.5)  # 第一次失败等0.5秒重试
+            continue
     return None
 
 
@@ -337,10 +359,28 @@ def load_oi_history(filepath: str) -> dict:
 
 
 def save_oi_history(oi_history: dict, filepath: str):
-    """保存多日 OI 历史，每个 key 只保留最近3天"""
+    """
+    保存多日 OI 历史，每个 key 只保留最近7天内的记录（最多5条）。
+    格式: {key: ["2026-03-17|1234", "2026-03-18|1456", ...]}
+    """
     try:
-        # 只保留最近3条，节省空间
-        trimmed = {k: v[-3:] for k, v in oi_history.items()}
+        cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        trimmed = {}
+        for k, records in oi_history.items():
+            valid = []
+            for r in records:
+                try:
+                    # 格式 "date|oi"，只保留7天内的记录
+                    date_part = str(r).split("|")[0]
+                    if len(date_part) == 10 and date_part >= cutoff:
+                        valid.append(r)
+                    elif "|" not in str(r):
+                        # 兼容旧格式纯数字，直接保留
+                        valid.append(r)
+                except Exception:
+                    continue
+            if valid:
+                trimmed[k] = valid[-5:]  # 最多保留最近5条
         with open(filepath, "w") as f:
             json.dump(trimmed, f)
     except Exception as e:
@@ -348,24 +388,41 @@ def save_oi_history(oi_history: dict, filepath: str):
 
 
 def update_oi_history(key: str, current_oi: int, oi_history: dict):
-    """把今日 OI 追加到历史队列"""
+    """
+    把今日 OI 追加到历史队列。
+    用 date|oi 格式存储，避免多线程同一天重复追加。
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    record = f"{today}|{current_oi}"
     if key not in oi_history:
         oi_history[key] = []
-    # 避免同一天重复追加
-    oi_history[key].append(current_oi)
+    # 检查今天是否已记录（防多线程重复）
+    existing_dates = [r.split("|")[0] for r in oi_history[key] if "|" in r]
+    if today not in existing_dates:
+        oi_history[key].append(record)
 
 
 def calc_oi_consecutive_growth(key: str, oi_history: dict) -> int:
     """
     计算 OI 连续增长天数。
+    兼容 "date|oi" 格式和旧版纯数字格式。
     返回: 0=无增长, 1=今日增长, 2=连续2天增长, 3=连续3天增长
     """
     records = oi_history.get(key, [])
     if len(records) < 2:
         return 0
+    # 解析 OI 值（兼容新旧格式）
+    oi_values = []
+    for r in records:
+        try:
+            oi_values.append(int(str(r).split("|")[-1]))
+        except Exception:
+            continue
+    if len(oi_values) < 2:
+        return 0
     consecutive = 0
-    for i in range(len(records) - 1, 0, -1):
-        if records[i] > records[i-1] * 1.02:  # 至少增长2%才算
+    for i in range(len(oi_values) - 1, 0, -1):
+        if oi_values[i] > oi_values[i-1] * 1.02:
             consecutive += 1
         else:
             break
@@ -378,7 +435,7 @@ def calc_oi_change(ticker: str, expiry: str, strike: float,
     计算 OI 净变化百分比。
     正值表示新增仓位，负值表示平仓。
     """
-    key = f"{ticker}_{expiry}_{strike}"
+    key = f"{ticker}_{expiry}_{strike:.2f}"
     prev_oi = snapshot.get(key, None)
     if prev_oi is None or prev_oi == 0:
         return 0.0  # 无历史数据，视为中性
@@ -583,7 +640,8 @@ def calc_technicals(hist: pd.DataFrame) -> dict:
 
 def scan_options_by_strike(tk, price: float, cfg: dict,
                            oi_snapshot: dict, oi_history: dict,
-                           iv_history: dict, ticker: str) -> dict | None:
+                           iv_history: dict, ticker: str,
+                           lock=None) -> dict | None:
     """
     逐行权价扫描 - OI净变化为核心，其他因子辅助。
 
@@ -661,10 +719,14 @@ def scan_options_by_strike(tk, price: float, cfg: dict,
             if oi < cfg["min_strike_oi"] or vol < cfg["min_strike_vol"]:
                 continue
 
-            # 保存今日OI快照 & 历史
-            snap_key = f"{ticker}_{exp_str}_{strike}"
+            # 保存今日OI快照 & 历史 (线程安全)
+            snap_key = f"{ticker}_{exp_str}_{strike:.2f}"
             today_oi_updates[snap_key] = oi
-            update_oi_history(snap_key, oi, oi_history)
+            if lock:
+                with lock:
+                    update_oi_history(snap_key, oi, oi_history)
+            else:
+                update_oi_history(snap_key, oi, oi_history)
 
             # ── OI 净变化 (核心) ──
             oi_change_pct   = calc_oi_change(ticker, exp_str, strike, oi, oi_snapshot)
@@ -678,7 +740,11 @@ def scan_options_by_strike(tk, price: float, cfg: dict,
             # IV 百分位
             iv_pct_val    = round(iv * 100, 1)
             iv_percentile = calc_iv_percentile(ticker, iv_pct_val, iv_history)
-            update_iv_history(ticker, iv_pct_val, iv_history)
+            if lock:
+                with lock:
+                    update_iv_history(ticker, iv_pct_val, iv_history)
+            else:
+                update_iv_history(ticker, iv_pct_val, iv_history)
 
             # IV过高过滤
             if iv_percentile > cfg["max_iv_percentile"]:
@@ -785,8 +851,12 @@ def scan_options_by_strike(tk, price: float, cfg: dict,
 
         time.sleep(0.04)
 
-    # 更新OI快照
-    oi_snapshot.update(today_oi_updates)
+    # 更新OI快照 (lock由调用方传入保护并发写入)
+    if lock:
+        with lock:
+            oi_snapshot.update(today_oi_updates)
+    else:
+        oi_snapshot.update(today_oi_updates)
     return best_strike
 
 
@@ -796,7 +866,7 @@ def scan_options_by_strike(tk, price: float, cfg: dict,
 
 def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
             oi_snapshot: dict, oi_history: dict, iv_history: dict,
-            persistent_signals: set) -> dict | None:
+            persistent_signals: set, lock=None) -> dict | None:
     try:
         time.sleep(cfg["delay_per_ticker"])
         tk   = yf.Ticker(ticker)
@@ -834,7 +904,7 @@ def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
 
         # 期权扫描
         opt = scan_options_by_strike(tk, price, cfg, oi_snapshot,
-                                     oi_history, iv_history, ticker)
+                                     oi_history, iv_history, ticker, lock)
         if opt is None:
             return None
 
@@ -1052,7 +1122,7 @@ def send_to_telegram(df: pd.DataFrame, total_scanned: int,
 
     # 🚨 先单独推送高优先信号 (OI爆增>=30% 或 连续3天增长)
     hot = df[
-        (df["OI有历史数据"] == True) &
+        (df["OI有历史数据"].astype(bool)) &
         ((df["OI日变化%"] >= 30) | (df["OI连续增长天"] >= 3))
     ]
     if not hot.empty:
@@ -1162,8 +1232,8 @@ def send_to_telegram(df: pd.DataFrame, total_scanned: int,
 def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
     print()
     print("╔══════════════════════════════════════════════════════════╗")
-    print("║       美股期权筛选器 v5  -  全面增强版                   ║")
-    print("║  支撑位·成交量·OI集中·方向性·动量·财报·大盘·RS·持续性   ║")
+    print("║       美股期权筛选器 v6  -  OI净变化驱动版               ║")
+    print("║  OI净变化·连续增长·支撑位·技术面·IV百分位·持续性         ║")
     print("╚══════════════════════════════════════════════════════════╝")
     print(f"  运行时间 : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  支撑容差 : +-{cfg['support_tolerance']*100:.0f}%  最少验证{cfg['min_support_touches']}次")
@@ -1202,10 +1272,13 @@ def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
     total_scanned = len(universe)
     signals, errors = [], 0
 
+    import threading
+    lock = threading.Lock()  # 保护 oi_history / iv_history 并发写入
+
     with ThreadPoolExecutor(max_workers=cfg["workers"]) as pool:
         futures = {
             pool.submit(analyze, tk, cfg, spy_hist, oi_snapshot,
-                        oi_history, iv_history, persistent_signals): tk
+                        oi_history, iv_history, persistent_signals, lock): tk
             for tk in universe
         }
         with tqdm(total=total_scanned, desc="扫描中", ncols=75, unit="只") as bar:
@@ -1214,7 +1287,8 @@ def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
                 try:
                     res = future.result()
                     if res:
-                        signals.append(res)
+                        with lock:
+                            signals.append(res)
                         persist_flag = "🔄" if res["连续信号"] else ""
                         earnings_flag = "📅" if res["财报在窗口内"] else ""
                         oi_flag = ""
@@ -1248,7 +1322,7 @@ def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
         print("\n  未找到符合条件的标的，建议尝试:")
         print("   --tolerance 0.05       (放宽支撑容差)")
         print("   --min-oi 200           (降低OI门槛)")
-        print("   --no-market-filter     (关闭大盘过滤)")
+        print("   --no-market-filter     (关闭大盘环境提示)")
         return pd.DataFrame()
 
     df = (pd.DataFrame(signals)
@@ -1300,7 +1374,7 @@ def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
 
     print(f"\n{'─'*70}")
     print("  指标说明:")
-    print("  相对强弱RS    : 近20日涨幅/SPY涨幅，>1跑赢大盘，<0.95被过滤")
+    print("  相对强弱RS    : 近20日涨幅/SPY涨幅，>1跑赢大盘，仅作评分参考不过滤")
     print("  支撑验证次数  : 该支撑位历史上被触碰反弹的次数，越多越可靠")
     print("  OI日变化%     : 今日OI相比昨日变化，核心信号，>10%新资金流入，>30%极强信号")
     print("  OI连续增长天  : OI连续N天增长，机构持续建仓，2天以上信号显著增强")
@@ -1333,7 +1407,7 @@ def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
 
 def main():
     p = argparse.ArgumentParser(
-        description="美股期权筛选器 v5 - 全面增强版",
+        description="美股期权筛选器 v6 - OI净变化驱动版",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--top",              type=int,   default=CONFIG["top_n"])
@@ -1350,7 +1424,7 @@ def main():
     p.add_argument("--max-iv-pct",       type=float, default=CONFIG["max_iv_percentile"],
                    help="IV百分位上限，超过此值跳过")
     p.add_argument("--no-market-filter", action="store_true",
-                   help="关闭大盘环境过滤")
+                   help="关闭大盘环境提示(大盘不再用于过滤，此参数仅关闭提示)")
     p.add_argument("--output",           type=str,   default=CONFIG["output_csv"])
     args = p.parse_args()
 
