@@ -264,7 +264,7 @@ CONFIG = {
     "vol_anomaly_days":      5,      # 计算Vol异常倍数的回看天数
 
     # 权利金规模过滤 (机构信号核心标准)
-    "min_premium_usd":       50_000,  # 单合约日权利金至少5万美元(vol×mid×100)
+    "min_premium_usd":       10_000,  # 日权利金至少1万美元(有bid/ask时才检查)
     "premium_tier1":         1_000_000,  # 百万级权利金，极强机构信号
     "premium_tier2":         500_000,    # 50万级
     "premium_tier3":         100_000,    # 10万级
@@ -1183,32 +1183,56 @@ def scan_options_by_strike(tk, price: float, cfg: dict,
 
             otm_pct      = (strike - price) / price
             oi_ratio     = oi / mean_oi_exp
-            mid_price_   = (bid + ask) / 2 if (bid + ask) > 0 else ask
-            # 权利金规模 = 合约数 × 期权中间价 × 100（每张合约100股）
-            premium_usd  = vol * mid_price_ * 100
+
+            # mid_price 估算：bid/ask优先，为0时用IV和strike估算
+            if bid + ask > 0:
+                mid_price_ = (bid + ask) / 2
+            elif iv > 0 and dte > 0:
+                # 用Black-Scholes近似估算期权价格（粗略）
+                # ATM期权价格 ≈ stock_price × IV × sqrt(DTE/365) × 0.4
+                mid_price_ = price * iv * math.sqrt(dte / 365) * 0.4
+                # OTM折扣
+                mid_price_ *= max(0.1, 1 - otm_pct * 3)
+            else:
+                mid_price_ = 0.0
+
+            # 权利金规模 = 合约数 × 期权中间价 × 100
+            premium_usd = vol * mid_price_ * 100
             oi_abs_change = int(oi - oi_snapshot.get(
                 f"{ticker}_{exp_str}_{strike:.2f}", oi))
 
-            # ── 权利金过小过滤：低于5万美元说明不是机构资金 ──
-            if premium_usd < cfg["min_premium_usd"] and vol < 500:
-                continue  # 允许高成交量低单价合约（如SPY等便宜期权）通过
+            # 权利金过滤：bid/ask为0时跳过权利金检查，只用成交量判断
+            if bid + ask > 0 and premium_usd < cfg["min_premium_usd"] and vol < 500:
+                continue
 
             # ══════════════════════════════════════════════════
             # 新评分体系 (满分约 120)
             # 理念: 真实机构资金 = 权利金大 + OI净增 + 成交活跃
             # ══════════════════════════════════════════════════
 
-            # ══ A. 权利金规模分 (max 35) ← 最核心，代表真实资金量 ══
-            # 专业工具标准: >$100k才算机构信号，>$1M是极强信号
-            if premium_usd >= cfg["premium_tier1"]:   # ≥$100万
+            # ══ A. 权利金规模分 (max 35) ← 代表真实资金量 ══
+            # bid/ask为0(盘后数据不完整)时给中性分，不惩罚
+            if bid + ask <= 0:
+                # 无报价数据，用成交量规模代替权利金评分
+                if vol >= 5000:
+                    premium_score = 20
+                elif vol >= 2000:
+                    premium_score = 15
+                elif vol >= 1000:
+                    premium_score = 10
+                elif vol >= 500:
+                    premium_score = 6
+                else:
+                    premium_score = 3
+            elif premium_usd >= cfg["premium_tier1"]:   # ≥$100万
                 premium_score = 35
-            elif premium_usd >= cfg["premium_tier2"]: # ≥$50万
+            elif premium_usd >= cfg["premium_tier2"]:   # ≥$50万
                 premium_score = 28
-            elif premium_usd >= cfg["premium_tier3"]: # ≥$10万
+            elif premium_usd >= cfg["premium_tier3"]:   # ≥$10万
                 premium_score = 20
-            elif premium_usd >= 50_000:               # ≥$5万
+            elif premium_usd >= 50_000:                 # ≥$5万
                 premium_score = 12
-            elif premium_usd >= 20_000:               # ≥$2万
+            elif premium_usd >= 10_000:                 # ≥$1万
                 premium_score = 6
             else:
                 premium_score = 2
