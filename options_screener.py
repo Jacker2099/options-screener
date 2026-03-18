@@ -36,6 +36,10 @@ import numpy as np
 import pandas as pd
 import requests
 from longport.openapi import Config, QuoteContext
+try:
+    import yfinance as yf  # type: ignore
+except Exception:
+    yf = None
 
 
 logging.basicConfig(
@@ -102,6 +106,7 @@ class EventRow:
     volume_spike_score: float
     liquidity_score: float
     total_score: float
+    source: str
 
 
 def to_float(v: Any, default: float = 0.0) -> float:
@@ -261,6 +266,79 @@ def _rank_score(rank_value: float, top_n: int) -> float:
     return round((top_n - rank_value + 1) / top_n * 100, 2)
 
 
+def build_events_from_quote_rows(
+    quote_rows: List[Dict[str, Any]],
+    underlying: str,
+    cfg: argparse.Namespace,
+    source_label: str,
+) -> List[EventRow]:
+    if not quote_rows:
+        return []
+
+    df = pd.DataFrame(quote_rows)
+    if df.empty:
+        return []
+
+    # 两类异动口径:
+    # 1) 大单异动: 按成交额 turnover 排名
+    # 2) 成交量异动: 按 volume 与 volume/OI 组合排名
+    df["vol_oi_ratio"] = df["volume"] / (df["oi"] + 1)
+    df["turnover_rank"] = df["turnover"].rank(method="min", ascending=False)
+    df["volume_rank"] = df["volume"].rank(method="min", ascending=False)
+    df["voloi_rank"] = df["vol_oi_ratio"].rank(method="min", ascending=False)
+    df["volume_combo_rank"] = df["volume_rank"] * 0.7 + df["voloi_rank"] * 0.3
+
+    total_n = len(df)
+    big_top_n = max(1, int(math.ceil(total_n * cfg.big_order_top_pct)))
+    volume_top_n = max(1, int(math.ceil(total_n * cfg.volume_spike_top_pct)))
+
+    result: List[EventRow] = []
+    underlying_name = NAME_MAP.get(underlying, underlying)
+
+    for _, row in df.iterrows():
+        big_order_flag = bool(float(row["turnover"]) > 0 and float(row["turnover_rank"]) <= big_top_n)
+        volume_spike_flag = bool(float(row["volume"]) > 0 and float(row["volume_combo_rank"]) <= volume_top_n)
+        if not big_order_flag and not volume_spike_flag:
+            continue
+
+        big_order_score = _rank_score(float(row["turnover_rank"]), big_top_n) if big_order_flag else 0.0
+        volume_spike_score = (
+            _rank_score(float(row["volume_combo_rank"]), volume_top_n) if volume_spike_flag else 0.0
+        )
+        total_score = round(big_order_score * 0.55 + volume_spike_score * 0.45, 2)
+        vol_oi_ratio = round(int(row["volume"]) / (int(row["oi"]) + 1), 3)
+
+        result.append(
+            EventRow(
+                symbol=str(row["symbol"]),
+                underlying=underlying,
+                underlying_name=underlying_name,
+                side=str(row["side"]),
+                expiry=str(row["expiry"]),
+                dte=int(row["dte"]),
+                strike=round(float(row["strike"]), 2),
+                underlying_price=round(float(row["underlying_price"]), 2),
+                moneyness_pct=round(float(row["moneyness_pct"]), 2),
+                last=round(float(row["last"]), 4),
+                volume=int(row["volume"]),
+                open_interest=int(row["oi"]),
+                vol_oi_ratio=vol_oi_ratio,
+                turnover=round(float(row["turnover"]), 2),
+                implied_volatility_pct=round(float(row["iv_pct"]), 2),
+                big_order_flag=big_order_flag,
+                volume_spike_flag=volume_spike_flag,
+                big_order_score=big_order_score,
+                volume_spike_score=volume_spike_score,
+                liquidity_score=0.0,
+                total_score=total_score,
+                source=source_label,
+            )
+        )
+
+    result.sort(key=lambda x: x.total_score, reverse=True)
+    return result[: cfg.max_events_per_underlying]
+
+
 def scan_underlying(
     ctx: QuoteContext,
     underlying: str,
@@ -343,82 +421,101 @@ def scan_underlying(
             dte_pass,
         )
         return []
-
-    df = pd.DataFrame(quote_rows)
-    if df.empty:
-        return []
-
-    # 只做两类异动口径:
-    # 1) 大单异动: 按成交额 turnover 排名
-    # 2) 成交量异动: 按 volume 与 volume/OI 组合排名
-    df["vol_oi_ratio"] = df["volume"] / (df["oi"] + 1)
-    df["turnover_rank"] = df["turnover"].rank(method="min", ascending=False)
-    df["volume_rank"] = df["volume"].rank(method="min", ascending=False)
-    df["voloi_rank"] = df["vol_oi_ratio"].rank(method="min", ascending=False)
-    df["volume_combo_rank"] = df["volume_rank"] * 0.7 + df["voloi_rank"] * 0.3
-
-    total_n = len(df)
-    big_top_n = max(1, int(math.ceil(total_n * cfg.big_order_top_pct)))
-    volume_top_n = max(1, int(math.ceil(total_n * cfg.volume_spike_top_pct)))
-
-    result: List[EventRow] = []
-    underlying_name = NAME_MAP.get(underlying, underlying)
-
-    threshold_pass = 0
-    for _, row in df.iterrows():
-        big_order_flag = bool(float(row["turnover"]) > 0 and float(row["turnover_rank"]) <= big_top_n)
-        volume_spike_flag = bool(float(row["volume"]) > 0 and float(row["volume_combo_rank"]) <= volume_top_n)
-
-        if not big_order_flag and not volume_spike_flag:
-            continue
-        threshold_pass += 1
-
-        big_order_score = _rank_score(float(row["turnover_rank"]), big_top_n) if big_order_flag else 0.0
-        volume_spike_score = (
-            _rank_score(float(row["volume_combo_rank"]), volume_top_n) if volume_spike_flag else 0.0
-        )
-        liquidity_score = 0.0
-        total_score = round(big_order_score * 0.55 + volume_spike_score * 0.45, 2)
-
-        vol_oi_ratio = round(int(row["volume"]) / (int(row["oi"]) + 1), 3)
-        result.append(
-            EventRow(
-                symbol=str(row["symbol"]),
-                underlying=underlying,
-                underlying_name=underlying_name,
-                side=str(row["side"]),
-                expiry=str(row["expiry"]),
-                dte=int(row["dte"]),
-                strike=round(float(row["strike"]), 2),
-                underlying_price=round(float(row["underlying_price"]), 2),
-                moneyness_pct=round(float(row["moneyness_pct"]), 2),
-                last=round(float(row["last"]), 4),
-                volume=int(row["volume"]),
-                open_interest=int(row["oi"]),
-                vol_oi_ratio=vol_oi_ratio,
-                turnover=round(float(row["turnover"]), 2),
-                implied_volatility_pct=round(float(row["iv_pct"]), 2),
-                big_order_flag=big_order_flag,
-                volume_spike_flag=volume_spike_flag,
-                big_order_score=big_order_score,
-                volume_spike_score=volume_spike_score,
-                liquidity_score=liquidity_score,
-                total_score=total_score,
-            )
-        )
-
-    # 单标的只保留高分前 N 条，减少噪声
-    result.sort(key=lambda x: x.total_score, reverse=True)
+    result = build_events_from_quote_rows(quote_rows, underlying, cfg, source_label="longbridge")
     log.info(
         "%s 漏斗: 总报价=%d, 结构可读=%d, DTE通过=%d, 双口径命中=%d, 输出=%d",
         underlying,
         total_quotes,
         parsed_ok,
         dte_pass,
-        threshold_pass,
-        len(result[: cfg.max_events_per_underlying]),
+        len(result),
+        len(result),
     )
-    return result[: cfg.max_events_per_underlying]
+    return result
+
+
+def scan_underlying_yf(
+    underlying: str,
+    cfg: argparse.Namespace,
+) -> List[EventRow]:
+    """
+    当长桥拉取不到有效事件时，用 yfinance 兜底，避免单标的全空。
+    """
+    if yf is None:
+        return []
+
+    ticker = underlying.replace(".US", "")
+    tk = yf.Ticker(ticker)
+    quote_rows: List[Dict[str, Any]] = []
+
+    try:
+        hist = tk.history(period="5d", interval="1d", auto_adjust=True)
+        underlying_price = float(hist["Close"].iloc[-1]) if not hist.empty else 0.0
+    except Exception:
+        underlying_price = 0.0
+
+    try:
+        expiries = list(tk.options or [])
+    except Exception:
+        expiries = []
+
+    for exp in expiries:
+        try:
+            dte = dte_from_yyyymmdd(str(exp))
+        except Exception:
+            continue
+        if dte < cfg.min_dte or dte > cfg.max_dte:
+            continue
+
+        try:
+            chain = tk.option_chain(exp)
+            calls = chain.calls.copy()
+            puts = chain.puts.copy()
+        except Exception:
+            continue
+
+        for side, df in [("C", calls), ("P", puts)]:
+            if df is None or df.empty:
+                continue
+
+            for _, row in df.fillna(0).iterrows():
+                symbol = str(row.get("contractSymbol", "") or "")
+                strike = to_float(row.get("strike", 0), 0.0)
+                last = to_float(row.get("lastPrice", 0), 0.0)
+                volume = to_int(row.get("volume", 0), 0)
+                oi = to_int(row.get("openInterest", 0), 0)
+                iv = to_float(row.get("impliedVolatility", 0.0), 0.0) * 100
+
+                if not symbol:
+                    symbol = f"{ticker}_{side}_{str(exp)}_{strike:.2f}"
+
+                turnover = last * max(volume, 0) * 100
+                moneyness_pct = 0.0
+                if underlying_price > 0 and strike > 0:
+                    moneyness_pct = (strike - underlying_price) / underlying_price * 100
+
+                quote_rows.append(
+                    {
+                        "symbol": symbol,
+                        "underlying": underlying,
+                        "side": side,
+                        "expiry": str(exp),
+                        "dte": int(dte),
+                        "strike": strike,
+                        "underlying_price": underlying_price,
+                        "moneyness_pct": moneyness_pct,
+                        "last": last,
+                        "volume": volume,
+                        "oi": oi,
+                        "turnover": turnover,
+                        "iv_pct": iv,
+                    }
+                )
+
+    if not quote_rows:
+        return []
+
+    return build_events_from_quote_rows(quote_rows, underlying, cfg, source_label="yfinance")
 
 
 def build_summary(events: List[EventRow]) -> pd.DataFrame:
@@ -542,44 +639,57 @@ def send_to_telegram(
         for _, row in summary_df.iterrows():
             name = html.escape(str(row["名称"]))
             code = html.escape(str(row["标的"]))
-            ug = events_df[events_df["underlying"] == row["标的"]].sort_values(
-                "total_score", ascending=False
+            ug = events_df[events_df["underlying"] == row["标的"]].copy()
+            if ug.empty:
+                continue
+            ug = ug.sort_values("total_score", ascending=False)
+
+            grouped = (
+                ug.groupby(["side", "expiry", "dte"], as_index=False)
+                .agg(
+                    total_score=("total_score", "sum"),
+                    turnover=("turnover", "sum"),
+                    volume=("volume", "sum"),
+                    open_interest=("open_interest", "sum"),
+                    contract_cnt=("symbol", "count"),
+                    big_cnt=("big_order_flag", "sum"),
+                    vol_cnt=("volume_spike_flag", "sum"),
+                )
+                .sort_values("total_score", ascending=False)
             )
-            top_rows = ug.head(3)
-            contract_lines: List[str] = []
-            for _, c in top_rows.iterrows():
-                tags = []
-                if bool(c["big_order_flag"]):
-                    tags.append("大单异动")
-                if bool(c["volume_spike_flag"]):
-                    tags.append("成交量异动")
-                tag_str = "/".join(tags) if tags else "异动"
 
-                explain_parts = []
-                if bool(c["big_order_flag"]):
-                    explain_parts.append(f"成交额${float(c['turnover']):,.0f}")
-                if bool(c["volume_spike_flag"]):
-                    explain_parts.append(
-                        f"量/OI={float(c['vol_oi_ratio']):.2f} (量={int(c['volume'])}, OI={int(c['open_interest'])})"
-                    )
-                explain = "；".join(explain_parts)
-
-                contract_lines.append(
-                    "• "
-                    f"<code>{html.escape(str(c['symbol']))}</code>  "
-                    f"{c['side']}{float(c['strike']):.2f}  "
-                    f"到期{html.escape(str(c['expiry']))}({int(c['dte'])}天)  "
-                    f"评分{float(c['total_score']):.1f}\n"
-                    f"  触发: {tag_str}；{explain}"
+            block_lines: List[str] = []
+            for _, g in grouped.head(4).iterrows():
+                subset = ug[(ug["side"] == g["side"]) & (ug["expiry"] == g["expiry"])].copy()
+                strikes = sorted({round(float(x), 2) for x in subset["strike"].tolist()})
+                if len(strikes) <= 5:
+                    strike_text = "/".join(f"{s:.2f}" for s in strikes)
+                else:
+                    strike_text = "/".join(f"{s:.2f}" for s in strikes[:5]) + f"...(+{len(strikes)-5})"
+                trig = []
+                if int(g["big_cnt"]) > 0:
+                    trig.append(f"大单{int(g['big_cnt'])}")
+                if int(g["vol_cnt"]) > 0:
+                    trig.append(f"量能{int(g['vol_cnt'])}")
+                trig_text = "、".join(trig) if trig else "异动"
+                block_lines.append(
+                    f"• {g['side']} {html.escape(str(g['expiry']))}({int(g['dte'])}天) "
+                    f"合约{int(g['contract_cnt'])}个  评分{float(g['total_score']):.1f}\n"
+                    f"  行权价: {strike_text}\n"
+                    f"  触发: {trig_text}  成交额${float(g['turnover']):,.0f}  量{int(g['volume'])}"
                 )
 
-            contract_block = "\n".join(contract_lines) if contract_lines else "• 暂无合约明细"
+            source_set = sorted({str(x) for x in ug["source"].dropna().tolist()})
+            source_text = "/".join(source_set) if source_set else "unknown"
+            contract_block = "\n".join(block_lines) if block_lines else "• 暂无到期分组明细"
             msg = (
                 f"🔹 <b>{name}</b> ({code})\n"
                 f"异动合约: {int(row['异动合约数'])} | 大单: {int(row['大单异动数'])} | 量能: {int(row['成交量异动数'])}\n"
                 f"看涨强度: {row['看涨强度']:.1f} | 看跌强度: {row['看跌强度']:.1f}\n"
                 f"净强度: <b>{row['净强度']:+.1f}</b> | 方向: <b>{html.escape(str(row['方向判断']))}</b>\n"
-                f"重点合约:\n{contract_block}"
+                f"数据源: {html.escape(source_text)}\n"
+                f"同到期合并分析:\n{contract_block}\n"
+                "说明: 多空基于 Call/Put 异动强度差，不代表真实逐笔买卖方向。"
             )
             _tg_send(token, chat_id, msg)
             time.sleep(0.2)
@@ -596,6 +706,7 @@ def run(cfg: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame]:
     print(f"DTE范围 : {cfg.min_dte}~{cfg.max_dte}")
     print(f"大单异动口径: 前{cfg.big_order_top_pct*100:.1f}% (按成交额)")
     print(f"量能异动口径: 前{cfg.volume_spike_top_pct*100:.1f}% (按成交量+量/OI)")
+    print(f"yfinance兜底: {'开启' if cfg.enable_yf_fallback else '关闭'}")
     print()
 
     ctx = QuoteContext(Config.from_env())
@@ -605,6 +716,11 @@ def run(cfg: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame]:
         log.info("扫描 %s ...", u)
         try:
             rows = scan_underlying(ctx, u, cfg)
+            if not rows and cfg.enable_yf_fallback:
+                fb_rows = scan_underlying_yf(u, cfg)
+                if fb_rows:
+                    log.info("  %s 长桥无有效信号，已使用 yfinance 兜底 %d 条", u, len(fb_rows))
+                    rows = fb_rows
             all_events.extend(rows)
             log.info("  %s 命中 %d 条异动", u, len(rows))
         except Exception as e:
@@ -686,6 +802,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-events-per-underlying", type=int, default=6)
     p.add_argument("--delay-per-underlying", type=float, default=0.1)
     p.add_argument("--output-dir", type=str, default="results")
+    p.add_argument(
+        "--enable-yf-fallback",
+        action="store_true",
+        default=True,
+        help="长桥无有效信号时启用 yfinance 兜底",
+    )
+    p.add_argument(
+        "--disable-yf-fallback",
+        action="store_true",
+        help="关闭 yfinance 兜底",
+    )
     p.add_argument("--tg-token", type=str, default=os.environ.get("TELEGRAM_TOKEN", ""))
     p.add_argument("--tg-chat", type=str, default=os.environ.get("TELEGRAM_CHAT_ID", ""))
     args = p.parse_args()
@@ -693,6 +820,8 @@ def parse_args() -> argparse.Namespace:
     args.underlyings = [x.strip().upper() for x in args.underlyings.split(",") if x.strip()]
     args.big_order_top_pct = min(max(float(args.big_order_top_pct), 0.01), 1.0)
     args.volume_spike_top_pct = min(max(float(args.volume_spike_top_pct), 0.01), 1.0)
+    if args.disable_yf_fallback:
+        args.enable_yf_fallback = False
     return args
 
 
