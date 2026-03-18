@@ -50,11 +50,10 @@ jobs:
           mkdir -p results
           python options_screener.py \
             --output-dir results \
-            --min-dte 7 \
-            --max-dte 45 \
-            --min-big-order-notional 200000 \
-            --min-volume 50 \
-            --min-oi 100 \
+            --min-dte 1 \
+            --max-dte 60 \
+            --big-order-top-pct 0.08 \
+            --volume-spike-top-pct 0.12 \
             --max-events-per-underlying 6
 
       - name: Upload CSV artifact
