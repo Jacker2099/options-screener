@@ -2,11 +2,17 @@ name: Daily Options Scan
 
 on:
   schedule:
-    - cron: '0 22 * * 1-5'
+    # GitHub Actions cron is UTC，按需调整为你希望的盘后时间
+    - cron: "0 22 * * 1-5"
   workflow_dispatch:
 
+concurrency:
+  group: daily-options-scan
+  cancel-in-progress: false
+
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   scan:
@@ -14,40 +20,58 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install yfinance pandas numpy requests tqdm lxml longport
+        run: pip install longport pandas numpy requests
 
       - name: Run screener
+        id: run_screener
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           LONGPORT_APP_KEY: ${{ secrets.LONGPORT_APP_KEY }}
           LONGPORT_APP_SECRET: ${{ secrets.LONGPORT_APP_SECRET }}
           LONGPORT_ACCESS_TOKEN: ${{ secrets.LONGPORT_ACCESS_TOKEN }}
-        # 默认用 yfinance，稳定后可加 --use-longport 启用长桥
-        run: python options_screener.py --top 20 --workers 6
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          mkdir -p results
+          python options_screener.py \
+            --output-dir results \
+            --min-dte 7 \
+            --max-dte 45 \
+            --min-big-order-notional 200000 \
+            --min-volume 50 \
+            --min-oi 100 \
+            --max-events-per-underlying 6
 
       - name: Upload CSV artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: signals-${{ github.run_number }}
-          path: results/signals_*.csv
+          name: options-unusual-${{ github.run_number }}
+          path: |
+            results/*.csv
           retention-days: 30
+          if-no-files-found: warn
 
-      - name: Commit results and snapshots
+      - name: Commit results
+        if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add results/ oi_snapshot.json oi_history.json vol_history.json iv_history.json 2>/dev/null || true
-          git diff --staged --quiet || git commit -m "scan $(date +'%Y-%m-%d')"
+          git add results/*.csv || true
+          git diff --staged --quiet || git commit -m "scan $(date -u +'%Y-%m-%d')"
           git push
