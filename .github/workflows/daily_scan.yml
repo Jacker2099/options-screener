@@ -25,12 +25,15 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install yfinance pandas numpy requests tqdm lxml
+        run: pip install yfinance pandas numpy requests tqdm lxml longport
 
       - name: Run screener
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LONGPORT_APP_KEY: ${{ secrets.LONGPORT_APP_KEY }}
+          LONGPORT_APP_SECRET: ${{ secrets.LONGPORT_APP_SECRET }}
+          LONGPORT_ACCESS_TOKEN: ${{ secrets.LONGPORT_ACCESS_TOKEN }}
         run: python options_screener.py --top 20 --workers 6
 
       - name: Upload CSV artifact
@@ -44,6 +47,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add results/ oi_snapshot.json iv_history.json 2>/dev/null || true
+          git add results/ oi_snapshot.json oi_history.json vol_history.json iv_history.json 2>/dev/null || true
           git diff --staged --quiet || git commit -m "scan $(date +'%Y-%m-%d')"
           git push
