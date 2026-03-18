@@ -578,7 +578,9 @@ def calc_prefilter_metrics(
     spy_ret20: float,
     cfg: argparse.Namespace,
 ) -> Optional[Dict[str, Any]]:
-    close = _series(hist, "Close") or _series(hist, "Adj Close")
+    close = _series(hist, "Close")
+    if close is None:
+        close = _series(hist, "Adj Close")
     high = _series(hist, "High")
     low = _series(hist, "Low")
     volume = _series(hist, "Volume")
