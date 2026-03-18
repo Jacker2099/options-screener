@@ -34,6 +34,7 @@ jobs:
           LONGPORT_APP_KEY: ${{ secrets.LONGPORT_APP_KEY }}
           LONGPORT_APP_SECRET: ${{ secrets.LONGPORT_APP_SECRET }}
           LONGPORT_ACCESS_TOKEN: ${{ secrets.LONGPORT_ACCESS_TOKEN }}
+        # 默认用 yfinance，稳定后可加 --use-longport 启用长桥
         run: python options_screener.py --top 20 --workers 6
 
       - name: Upload CSV artifact
