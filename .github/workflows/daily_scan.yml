@@ -61,7 +61,7 @@ jobs:
             --news-lookback-days 10 \
             --max-news-items-per-ticker 18 \
             --catalyst-weight 0.50 \
-            2>&1 | tee results/scan_console.log
+            2>&1 | tee results/scan_console.log || true
 
       - name: Upload CSV artifact
         if: always()
