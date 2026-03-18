@@ -1907,6 +1907,7 @@ def send_to_telegram(
         f"🕒 {run_dt}\n"
         f"🌐 股票池 {stats.get('universe_size', 0)} 只  |  预筛 {stats.get('prefilter_size', 0)} 只  |  期权深扫 {stats.get('option_scan_size', 0)} 只\n"
         f"🧭 大盘: <b>{html.escape(str(regime.get('label', '中性')))}</b>  分数 {float(regime.get('score', 0.0)):+.1f}  VIX {float(regime.get('vix', 0.0)):.1f}\n"
+        f"⚙️ 本次筛选模式: {html.escape(str(stats.get('selection_mode', '严格')))}\n"
         f"📌 模式: {'多空双向' if stats.get('allow_bearish') else '仅看多'} | "
         f"{'仅催化' if stats.get('require_catalyst') else '含无催化'} | "
         f"最小催化分 {float(stats.get('min_catalyst_score', 0.0)):.1f}\n"
@@ -2045,11 +2046,13 @@ def run(cfg: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFra
         log.info("期权深扫 %s: %d 条异动", ticker, len(rows))
         time.sleep(cfg.delay_per_underlying)
 
-    # 5) 元数据（行业/财报）
-    meta_tickers = [tk for tk, evs in events_map.items() if len(evs) >= cfg.min_option_events]
-    if not meta_tickers:
-        # 兜底: 若期权全空，至少给预筛前若干票做元数据
-        meta_tickers = scan_df["ticker"].head(min(20, len(scan_df))).tolist() if not scan_df.empty else []
+    def _cfg_with(overrides: Dict[str, Any]) -> argparse.Namespace:
+        d = dict(vars(cfg))
+        d.update(overrides)
+        return argparse.Namespace(**d)
+
+    # 5) 元数据（行业/财报）: 对全部深扫票抓取，避免“仅20只元数据”导致催化漏检
+    meta_tickers = scan_df["ticker"].tolist() if not scan_df.empty else []
 
     meta_map = fetch_metadata_for_tickers(
         meta_tickers,
@@ -2058,7 +2061,7 @@ def run(cfg: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFra
         max_news_items=cfg.max_news_items_per_ticker,
     )
 
-    # 6) 综合评分与Top10
+    # 6) 综合评分与Top10（分层放宽，避免全空）
     direction_df = build_direction_table(
         prefilter_df=scan_df,
         events_map=events_map,
@@ -2066,6 +2069,66 @@ def run(cfg: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFra
         regime=regime,
         cfg=cfg,
     )
+    selection_mode = "严格"
+
+    if direction_df.empty and not scan_df.empty:
+        log.warning("严格模式无信号，启动一级放宽（保留催化）")
+        cfg_l1 = _cfg_with(
+            {
+                "min_option_events": 0,
+                "min_catalyst_score": max(0.8, float(cfg.min_catalyst_score) - 0.7),
+                "min_confidence": max(22.0, float(cfg.min_confidence) - 10.0),
+                "require_catalyst": True,
+            }
+        )
+        direction_df = build_direction_table(
+            prefilter_df=scan_df,
+            events_map=events_map,
+            meta_map=meta_map,
+            regime=regime,
+            cfg=cfg_l1,
+        )
+        selection_mode = "一级放宽(保留催化)"
+
+    if direction_df.empty and not scan_df.empty:
+        log.warning("一级放宽仍无信号，启动二级放宽（允许无催化）")
+        cfg_l2 = _cfg_with(
+            {
+                "min_option_events": 0,
+                "require_catalyst": False,
+                "min_confidence": max(20.0, float(cfg.min_confidence) - 15.0),
+            }
+        )
+        direction_df = build_direction_table(
+            prefilter_df=scan_df,
+            events_map=events_map,
+            meta_map=meta_map,
+            regime=regime,
+            cfg=cfg_l2,
+        )
+        selection_mode = "二级放宽(允许无催化)"
+
+    if direction_df.empty and not scan_df.empty and not cfg.allow_bearish:
+        log.warning("二级放宽仍无信号，启动三级放宽（允许偏空）")
+        cfg_l3 = _cfg_with(
+            {
+                "allow_bearish": True,
+                "min_option_events": 0,
+                "require_catalyst": False,
+                "min_confidence": 15.0,
+            }
+        )
+        direction_df = build_direction_table(
+            prefilter_df=scan_df,
+            events_map=events_map,
+            meta_map=meta_map,
+            regime=regime,
+            cfg=cfg_l3,
+        )
+        selection_mode = "三级放宽(允许偏空)"
+
+    if not direction_df.empty:
+        direction_df["筛选模式"] = selection_mode
 
     top_df = direction_df.head(cfg.top).copy() if not direction_df.empty else pd.DataFrame()
 
@@ -2118,6 +2181,7 @@ def run(cfg: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFra
                 "催化标签",
                 "催化新闻数",
                 "催化摘要",
+                "筛选模式",
                 "理由",
             ]
         ).to_csv(full_csv, index=False, encoding="utf-8-sig")
@@ -2129,6 +2193,7 @@ def run(cfg: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFra
     print(f"大盘环境: {regime['label']}  score={float(regime['score']):+.1f}  VIX={float(regime['vix']):.1f}")
     print(f"股票池: {len(universe)}  预筛: {len(prefilter_df)}  深扫: {len(scan_df)}")
     print(f"期权事件: {len(all_events)}  方向信号: {len(direction_df)}  Top: {len(top_df)}")
+    print(f"筛选模式: {selection_mode if not direction_df.empty else '无结果'}")
     print(f"文件输出: {events_csv}")
     print(f"文件输出: {full_csv}")
     print(f"文件输出: {top_csv}")
@@ -2141,6 +2206,7 @@ def run(cfg: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFra
         "allow_bearish": bool(cfg.allow_bearish),
         "require_catalyst": bool(cfg.require_catalyst),
         "min_catalyst_score": float(cfg.min_catalyst_score),
+        "selection_mode": selection_mode if not direction_df.empty else "无结果",
     }
     send_to_telegram(
         top_df=top_df,
@@ -2242,8 +2308,8 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="允许输出无明确催化的标的",
     )
-    p.add_argument("--min-catalyst-score", type=float, default=1.5, help="最低催化剂分阈值")
-    p.add_argument("--min-confidence", type=float, default=35.0, help="最低置信度阈值")
+    p.add_argument("--min-catalyst-score", type=float, default=1.0, help="最低催化剂分阈值")
+    p.add_argument("--min-confidence", type=float, default=30.0, help="最低置信度阈值")
 
     p.add_argument("--output-dir", type=str, default="results")
     p.add_argument("--tg-token", type=str, default=os.environ.get("TELEGRAM_TOKEN", ""))
