@@ -5,11 +5,11 @@ LongBridge 期权异动整合分析器
 目标:
 1) 只分析指定 13 只美股/ETF
 2) 盘后整合「期权大单异动」与「成交量异动」
-3) 输出 CSV 汇总 + 逐合约明细
-4) 发送结果到 Telegram Bot
+3) 输出 CSV（审计留档）+ 个股方向汇总
+4) 发送结果到 Telegram Bot（仅个股方向，不推合约）
 
 依赖:
-    pip install longport pandas numpy requests
+    pip install longport pandas requests
 
 环境变量:
     LONGPORT_APP_KEY
@@ -32,7 +32,6 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 import requests
 from longport.openapi import Config, QuoteContext
@@ -161,6 +160,95 @@ def safe_quote_last(ctx: QuoteContext, underlying: str) -> float:
     except Exception:
         pass
     return 0.0
+
+
+def _normalize_change_pct(raw_change_rate: Any, last: float, prev_close: float) -> float:
+    if prev_close > 0 and last > 0:
+        return (last / prev_close - 1) * 100
+    v = to_float(raw_change_rate, 0.0)
+    if abs(v) <= 1:
+        return v * 100
+    return v
+
+
+def get_underlying_context(ctx: QuoteContext, underlying: str, enable_yf_fallback: bool = True) -> Dict[str, Any]:
+    """
+    读取个股层面的成交额与涨跌，作为方向分析的第二支柱。
+    """
+    out = {
+        "underlying": underlying,
+        "price": 0.0,
+        "day_chg_pct": 0.0,
+        "turnover_today": 0.0,
+        "avg_turnover_20d": 0.0,
+        "turnover_ratio_20d": 0.0,
+        "flow_tag": "常规",
+        "source": "longbridge",
+    }
+
+    # 1) LongBridge 当日行情
+    try:
+        qs = ctx.quote([underlying])
+        if qs:
+            q = qs[0]
+            last = to_float(getattr(q, "last_done", None), 0.0)
+            prev_close = to_float(getattr(q, "prev_close", None), 0.0)
+            vol = to_float(getattr(q, "volume", None), 0.0)
+            turnover = to_float(getattr(q, "turnover", None), 0.0)
+            if turnover <= 0 and last > 0 and vol > 0:
+                turnover = last * vol
+
+            out["price"] = last
+            out["turnover_today"] = turnover
+            out["day_chg_pct"] = _normalize_change_pct(getattr(q, "change_rate", None), last, prev_close)
+    except Exception:
+        pass
+
+    # 2) yfinance 获取 20日均成交额（及兜底当日信息）
+    if enable_yf_fallback and yf is not None:
+        tk = underlying.replace(".US", "")
+        try:
+            hist = yf.Ticker(tk).history(period="3mo", interval="1d", auto_adjust=False)
+            if not hist.empty and "Close" in hist.columns and "Volume" in hist.columns:
+                dollar = hist["Close"] * hist["Volume"]
+                if len(dollar) >= 21:
+                    avg20 = float(dollar.iloc[-21:-1].mean())
+                else:
+                    avg20 = float(dollar.mean())
+                today_turnover_yf = float(dollar.iloc[-1])
+
+                if out["turnover_today"] <= 0:
+                    out["turnover_today"] = today_turnover_yf
+                    out["source"] = "yfinance"
+                out["avg_turnover_20d"] = avg20
+
+                if out["price"] <= 0:
+                    out["price"] = float(hist["Close"].iloc[-1])
+                    if len(hist) >= 2:
+                        prev = float(hist["Close"].iloc[-2])
+                        if prev > 0:
+                            out["day_chg_pct"] = (out["price"] / prev - 1) * 100
+                    out["source"] = "yfinance"
+        except Exception:
+            pass
+
+    avg = float(out["avg_turnover_20d"])
+    today = float(out["turnover_today"])
+    ratio = today / (avg + 1) if avg > 0 else 0.0
+    out["turnover_ratio_20d"] = ratio
+
+    # 个股大额资金代理标签
+    chg = float(out["day_chg_pct"])
+    if ratio >= 2.0 and chg >= 0:
+        out["flow_tag"] = "大额净流入"
+    elif ratio >= 2.0 and chg < 0:
+        out["flow_tag"] = "大额净流出"
+    elif ratio >= 1.2:
+        out["flow_tag"] = "放量活跃"
+    else:
+        out["flow_tag"] = "常规"
+
+    return out
 
 
 def collect_option_symbols(
@@ -518,39 +606,133 @@ def scan_underlying_yf(
     return build_events_from_quote_rows(quote_rows, underlying, cfg, source_label="yfinance")
 
 
-def build_summary(events: List[EventRow]) -> pd.DataFrame:
-    if not events:
-        return pd.DataFrame()
+def _direction_label(score: float) -> str:
+    if score >= 25:
+        return "强多"
+    if score >= 8:
+        return "偏多"
+    if score <= -25:
+        return "强空"
+    if score <= -8:
+        return "偏空"
+    return "中性"
 
+
+def build_summary(
+    events: List[EventRow],
+    underlyings: List[str],
+    stock_ctx: Dict[str, Dict[str, Any]],
+) -> pd.DataFrame:
+    df = pd.DataFrame([e.__dict__ for e in events]) if events else pd.DataFrame()
     rows = []
-    df = pd.DataFrame([e.__dict__ for e in events])
-    for underlying, g in df.groupby("underlying"):
-        call_score = float(g[g["side"] == "C"]["total_score"].sum())
-        put_score = float(g[g["side"] == "P"]["total_score"].sum())
-        net_score = call_score - put_score
-        if net_score > 15:
-            bias = "偏多"
-        elif net_score < -15:
-            bias = "偏空"
+
+    for underlying in underlyings:
+        g = df[df["underlying"] == underlying].copy() if not df.empty else pd.DataFrame()
+        ctx = stock_ctx.get(underlying, {})
+
+        call_turnover = float(g[g["side"] == "C"]["turnover"].sum()) if not g.empty else 0.0
+        put_turnover = float(g[g["side"] == "P"]["turnover"].sum()) if not g.empty else 0.0
+        call_volume = float(g[g["side"] == "C"]["volume"].sum()) if not g.empty else 0.0
+        put_volume = float(g[g["side"] == "P"]["volume"].sum()) if not g.empty else 0.0
+        call_score = float(g[g["side"] == "C"]["total_score"].sum()) if not g.empty else 0.0
+        put_score = float(g[g["side"] == "P"]["total_score"].sum()) if not g.empty else 0.0
+
+        cp_turnover_ratio = call_turnover / (put_turnover + 1.0)
+        cp_volume_ratio = call_volume / (put_volume + 1.0)
+
+        # 期权端方向: 用成交额+成交量+异动强度综合
+        turnover_bias = (call_turnover - put_turnover) / (call_turnover + put_turnover + 1.0) * 100
+        volume_bias = (call_volume - put_volume) / (call_volume + put_volume + 1.0) * 100
+        score_bias = (call_score - put_score) / (call_score + put_score + 1.0) * 100
+        option_bias = turnover_bias * 0.60 + volume_bias * 0.25 + score_bias * 0.15
+
+        turnover_ratio = float(ctx.get("turnover_ratio_20d", 0.0))
+        day_chg = float(ctx.get("day_chg_pct", 0.0))
+
+        # 个股端方向: 当日成交额相对20日均值 + 当日涨跌
+        if turnover_ratio >= 2.0:
+            flow_mag = 26
+        elif turnover_ratio >= 1.5:
+            flow_mag = 16
+        elif turnover_ratio >= 1.2:
+            flow_mag = 10
         else:
-            bias = "中性"
+            flow_mag = 2
+        if day_chg > 0.2:
+            flow_score = flow_mag
+        elif day_chg < -0.2:
+            flow_score = -flow_mag
+        else:
+            flow_score = 0.0
+
+        combined = option_bias * 0.7 + flow_score * 0.3
+        direction = _direction_label(combined)
+
+        # 置信度: 期权偏向强度 + 有效事件数量 + 个股放量程度
+        event_cnt = int(len(g)) if not g.empty else 0
+        confidence = min(
+            100.0,
+            abs(option_bias) * 0.5 + min(event_cnt * 6, 30) + min(max(turnover_ratio - 1, 0) * 20, 25),
+        )
+
+        reasons: List[str] = []
+        if cp_turnover_ratio >= 1.5:
+            reasons.append("Call成交额明显高于Put")
+        elif cp_turnover_ratio <= 0.67:
+            reasons.append("Put成交额明显高于Call")
+        else:
+            reasons.append("Call/Put成交额相对均衡")
+
+        if cp_volume_ratio >= 1.4:
+            reasons.append("Call成交量占优")
+        elif cp_volume_ratio <= 0.72:
+            reasons.append("Put成交量占优")
+        else:
+            reasons.append("Call/Put成交量接近")
+
+        if turnover_ratio >= 2.0:
+            if day_chg >= 0:
+                reasons.append("个股成交额较20日显著放大并收涨")
+            else:
+                reasons.append("个股成交额较20日显著放大但收跌")
+        elif turnover_ratio >= 1.2:
+            reasons.append("个股成交额温和放大")
+        else:
+            reasons.append("个股成交额接近20日常态")
+
+        if event_cnt == 0:
+            reasons.append("期权端有效异动较少")
+        elif event_cnt >= 5:
+            reasons.append("期权端异动密集")
+
+        reason_text = "；".join(reasons)
 
         rows.append(
             {
                 "标的": underlying,
                 "名称": NAME_MAP.get(underlying, underlying),
-                "异动合约数": int(len(g)),
-                "大单异动数": int(g["big_order_flag"].sum()),
-                "成交量异动数": int(g["volume_spike_flag"].sum()),
+                "方向判断": direction,
+                "综合方向分": round(combined, 2),
+                "置信度": round(confidence, 1),
+                "期权事件数": event_cnt,
+                "Call事件数": int((g["side"] == "C").sum()) if not g.empty else 0,
+                "Put事件数": int((g["side"] == "P").sum()) if not g.empty else 0,
+                "Call成交额M": round(call_turnover / 1e6, 2),
+                "Put成交额M": round(put_turnover / 1e6, 2),
+                "C/P成交额比": round(cp_turnover_ratio, 2),
+                "C/P成交量比": round(cp_volume_ratio, 2),
                 "看涨强度": round(call_score, 2),
                 "看跌强度": round(put_score, 2),
-                "净强度": round(net_score, 2),
-                "方向判断": bias,
-                "最高分合约": str(g.sort_values("total_score", ascending=False).iloc[0]["symbol"]),
+                "个股成交额M": round(float(ctx.get("turnover_today", 0.0)) / 1e6, 2),
+                "个股额比20日": round(turnover_ratio, 2),
+                "个股当日涨跌%": round(day_chg, 2),
+                "个股大额资金信号": str(ctx.get("flow_tag", "常规")),
+                "结论说明": reason_text,
+                "数据源": str(ctx.get("source", "longbridge")),
             }
         )
 
-    out = pd.DataFrame(rows).sort_values("净强度", ascending=False).reset_index(drop=True)
+    out = pd.DataFrame(rows).sort_values("综合方向分", ascending=False).reset_index(drop=True)
     out.index += 1
     return out
 
@@ -607,10 +789,11 @@ def send_to_telegram(
 
     run_dt = datetime.now().strftime("%Y-%m-%d %H:%M")
     header = (
-        "📊 <b>盘后期权异动整合分析（长桥）</b>\n"
+        "📊 <b>盘后个股多空方向分析</b>\n"
         f"🕒 {run_dt}\n"
         f"🎯 标的数量: <b>{underlying_count}</b>\n"
-        f"⚡ 异动合约: <b>{len(events_df)}</b>\n"
+        f"⚡ 识别到期权异动事件: <b>{len(events_df)}</b>\n"
+        "📌 仅输出个股方向结论，不推合约细节\n"
         "━━━━━━━━━━━━━━━━━━━━"
     )
     _tg_send(token, chat_id, header)
@@ -619,80 +802,44 @@ def send_to_telegram(
     if summary_df.empty:
         _tg_send(token, chat_id, "📭 本次未拉取到可用的期权异动数据。")
     else:
-        top_global = events_df.sort_values("total_score", ascending=False).head(5)
-        if not top_global.empty:
-            lines = []
-            for i, (_, r) in enumerate(top_global.iterrows(), start=1):
-                lines.append(
-                    f"{i}. {html.escape(str(r['underlying_name']))} "
-                    f"<code>{html.escape(str(r['symbol']))}</code> "
-                    f"评分{float(r['total_score']):.1f} "
-                    f"(额${float(r['turnover']):,.0f}, 量{int(r['volume'])})"
-                )
-            _tg_send(
-                token,
-                chat_id,
-                "🏆 <b>今日最强异动合约 Top5</b>\n" + "\n".join(lines),
-            )
-            time.sleep(0.2)
+        dir_counts = summary_df["方向判断"].value_counts().to_dict()
+        dist_msg = (
+            f"强多:{dir_counts.get('强多',0)}  偏多:{dir_counts.get('偏多',0)}  "
+            f"中性:{dir_counts.get('中性',0)}  偏空:{dir_counts.get('偏空',0)}  强空:{dir_counts.get('强空',0)}"
+        )
+        _tg_send(token, chat_id, f"📌 <b>方向分布</b>\n{dist_msg}")
+        time.sleep(0.2)
 
+        lines: List[str] = []
+        dir_icon = {"强多": "🟢", "偏多": "🟩", "中性": "🟨", "偏空": "🟧", "强空": "🔴"}
         for _, row in summary_df.iterrows():
-            name = html.escape(str(row["名称"]))
-            code = html.escape(str(row["标的"]))
-            ug = events_df[events_df["underlying"] == row["标的"]].copy()
-            if ug.empty:
-                continue
-            ug = ug.sort_values("total_score", ascending=False)
-
-            grouped = (
-                ug.groupby(["side", "expiry", "dte"], as_index=False)
-                .agg(
-                    total_score=("total_score", "sum"),
-                    turnover=("turnover", "sum"),
-                    volume=("volume", "sum"),
-                    open_interest=("open_interest", "sum"),
-                    contract_cnt=("symbol", "count"),
-                    big_cnt=("big_order_flag", "sum"),
-                    vol_cnt=("volume_spike_flag", "sum"),
-                )
-                .sort_values("total_score", ascending=False)
+            icon = dir_icon.get(str(row["方向判断"]), "⚪")
+            lines.append(
+                f"{icon} <b>{html.escape(str(row['名称']))}</b> ({html.escape(str(row['标的']))}) "
+                f"<b>{html.escape(str(row['方向判断']))}</b> "
+                f"分数{float(row['综合方向分']):+,.1f}  置信度{float(row['置信度']):.0f}\n"
+                f"  C/P额比 {float(row['C/P成交额比']):.2f}x  C/P量比 {float(row['C/P成交量比']):.2f}x  "
+                f"个股额比20日 {float(row['个股额比20日']):.2f}x  当日{float(row['个股当日涨跌%']):+.2f}%  "
+                f"{html.escape(str(row['个股大额资金信号']))}\n"
+                f"  理由: {html.escape(str(row['结论说明']))}"
             )
 
-            block_lines: List[str] = []
-            for _, g in grouped.head(4).iterrows():
-                subset = ug[(ug["side"] == g["side"]) & (ug["expiry"] == g["expiry"])].copy()
-                strikes = sorted({round(float(x), 2) for x in subset["strike"].tolist()})
-                if len(strikes) <= 5:
-                    strike_text = "/".join(f"{s:.2f}" for s in strikes)
-                else:
-                    strike_text = "/".join(f"{s:.2f}" for s in strikes[:5]) + f"...(+{len(strikes)-5})"
-                trig = []
-                if int(g["big_cnt"]) > 0:
-                    trig.append(f"大单{int(g['big_cnt'])}")
-                if int(g["vol_cnt"]) > 0:
-                    trig.append(f"量能{int(g['vol_cnt'])}")
-                trig_text = "、".join(trig) if trig else "异动"
-                block_lines.append(
-                    f"• {g['side']} {html.escape(str(g['expiry']))}({int(g['dte'])}天) "
-                    f"合约{int(g['contract_cnt'])}个  评分{float(g['total_score']):.1f}\n"
-                    f"  行权价: {strike_text}\n"
-                    f"  触发: {trig_text}  成交额${float(g['turnover']):,.0f}  量{int(g['volume'])}"
-                )
-
-            source_set = sorted({str(x) for x in ug["source"].dropna().tolist()})
-            source_text = "/".join(source_set) if source_set else "unknown"
-            contract_block = "\n".join(block_lines) if block_lines else "• 暂无到期分组明细"
-            msg = (
-                f"🔹 <b>{name}</b> ({code})\n"
-                f"异动合约: {int(row['异动合约数'])} | 大单: {int(row['大单异动数'])} | 量能: {int(row['成交量异动数'])}\n"
-                f"看涨强度: {row['看涨强度']:.1f} | 看跌强度: {row['看跌强度']:.1f}\n"
-                f"净强度: <b>{row['净强度']:+.1f}</b> | 方向: <b>{html.escape(str(row['方向判断']))}</b>\n"
-                f"数据源: {html.escape(source_text)}\n"
-                f"同到期合并分析:\n{contract_block}\n"
-                "说明: 多空基于 Call/Put 异动强度差，不代表真实逐笔买卖方向。"
-            )
-            _tg_send(token, chat_id, msg)
+        chunk = "🧭 <b>个股方向结论</b>\n"
+        for line in lines:
+            if len(chunk) + len(line) + 1 > 3800:
+                _tg_send(token, chat_id, chunk)
+                time.sleep(0.2)
+                chunk = "🧭 <b>个股方向结论(续)</b>\n"
+            chunk += line + "\n"
+        if chunk.strip():
+            _tg_send(token, chat_id, chunk)
             time.sleep(0.2)
+
+        _tg_send(
+            token,
+            chat_id,
+            "说明: 方向由 Call/Put 成交额与成交量偏向 + 个股成交额相对20日均值 + 当日涨跌联合估计，仅供参考。",
+        )
 
 
 def run(cfg: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -711,10 +858,12 @@ def run(cfg: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
     ctx = QuoteContext(Config.from_env())
     all_events: List[EventRow] = []
+    stock_ctx: Dict[str, Dict[str, Any]] = {}
 
     for u in cfg.underlyings:
         log.info("扫描 %s ...", u)
         try:
+            stock_ctx[u] = get_underlying_context(ctx, u, enable_yf_fallback=cfg.enable_yf_fallback)
             rows = scan_underlying(ctx, u, cfg)
             if not rows and cfg.enable_yf_fallback:
                 fb_rows = scan_underlying_yf(u, cfg)
@@ -725,10 +874,11 @@ def run(cfg: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame]:
             log.info("  %s 命中 %d 条异动", u, len(rows))
         except Exception as e:
             log.warning("%s 扫描失败: %s", u, e)
+            stock_ctx[u] = stock_ctx.get(u, {})
         time.sleep(cfg.delay_per_underlying)
 
     events_df = pd.DataFrame([r.__dict__ for r in all_events])
-    summary_df = build_summary(all_events)
+    summary_df = build_summary(all_events, cfg.underlyings, stock_ctx)
 
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -737,28 +887,41 @@ def run(cfg: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame]:
     summary_csv = str(output_dir / f"options_unusual_summary_{ts}.csv")
 
     if events_df.empty:
-        # 写空文件头，便于 workflow 固定上传
+        # 写空明细头，便于 workflow 固定上传
         pd.DataFrame(columns=[f.name for f in EventRow.__dataclass_fields__.values()]).to_csv(
             events_csv, index=False, encoding="utf-8-sig"
         )
-        pd.DataFrame(
-            columns=[
-                "标的",
-                "名称",
-                "异动合约数",
-                "大单异动数",
-                "成交量异动数",
-                "看涨强度",
-                "看跌强度",
-                "净强度",
-                "方向判断",
-                "最高分合约",
-            ]
-        ).to_csv(summary_csv, index=False, encoding="utf-8-sig")
     else:
         events_df = events_df.sort_values("total_score", ascending=False).reset_index(drop=True)
         events_df.index += 1
         events_df.to_csv(events_csv, index=True, encoding="utf-8-sig")
+
+    if summary_df.empty:
+        pd.DataFrame(
+            columns=[
+                "标的",
+                "名称",
+                "方向判断",
+                "综合方向分",
+                "置信度",
+                "期权事件数",
+                "Call事件数",
+                "Put事件数",
+                "Call成交额M",
+                "Put成交额M",
+                "C/P成交额比",
+                "C/P成交量比",
+                "看涨强度",
+                "看跌强度",
+                "个股成交额M",
+                "个股额比20日",
+                "个股当日涨跌%",
+                "个股大额资金信号",
+                "结论说明",
+                "数据源",
+            ]
+        ).to_csv(summary_csv, index=False, encoding="utf-8-sig")
+    else:
         summary_df.to_csv(summary_csv, index=True, encoding="utf-8-sig")
 
     print(f"明细已保存: {events_csv}")
