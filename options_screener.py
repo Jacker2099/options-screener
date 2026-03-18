@@ -252,7 +252,7 @@ CONFIG = {
     "otm_max":               0.12,   # 最大虚值12%，排除深虚值投机末日单
 
     # 数据源 (优先使用长桥API，失败时回退 yfinance)
-    "use_longport":          True,   # 是否启用长桥API（需配置 Secrets）
+    "use_longport":          False,  # 默认用yfinance，设为True且配置Secrets后启用长桥
 
     # OI 净变化 (核心信号)
     "oi_snapshot_file":      "oi_snapshot.json",
@@ -2101,7 +2101,9 @@ def main():
     p.add_argument("--max-iv-pct",       type=float, default=CONFIG["max_iv_percentile"],
                    help="IV百分位上限，超过此值跳过")
     p.add_argument("--no-market-filter", action="store_true",
-                   help="关闭大盘环境提示(大盘不再用于过滤，此参数仅关闭提示)")
+                   help="关闭大盘环境提示")
+    p.add_argument("--use-longport",     action="store_true",
+                   help="启用长桥API数据源（需在Secrets中配置三个LONGPORT_*变量）")
     p.add_argument("--output",           type=str,   default=CONFIG["output_csv"])
     args = p.parse_args()
 
@@ -2118,6 +2120,7 @@ def main():
         "otm_max":           args.otm_max,
         "max_iv_percentile": args.max_iv_pct,
         "market_filter":     not args.no_market_filter,
+        "use_longport":      args.use_longport,
         "output_csv":        args.output,
     })
 
