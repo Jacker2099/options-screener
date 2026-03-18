@@ -62,8 +62,8 @@ jobs:
             --news-lookback-days 10 \
             --max-news-items-per-ticker 18 \
             --catalyst-weight 0.50 \
-            --min-catalyst-score 1.5 \
-            --min-confidence 35 \
+            --min-catalyst-score 1.0 \
+            --min-confidence 30 \
             2>&1 | tee results/scan_console.log || true
 
       - name: Upload CSV artifact
