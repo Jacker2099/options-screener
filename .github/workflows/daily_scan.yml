@@ -1,4 +1,4 @@
-name: Daily Options Scan
+name: Daily Blackhorse Scan
 
 on:
   schedule:
@@ -17,7 +17,7 @@ env:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     permissions:
       contents: write
     env:
@@ -36,7 +36,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install longport yfinance pandas requests
+        run: pip install longport yfinance pandas requests lxml
 
       - name: Run screener
         id: run_screener
@@ -50,11 +50,17 @@ jobs:
           mkdir -p results
           python options_screener.py \
             --output-dir results \
-            --min-dte 1 \
+            --top 10 \
+            --prefilter-top 180 \
+            --option-scan-top 80 \
+            --min-dte 7 \
             --max-dte 60 \
             --big-order-top-pct 0.08 \
             --volume-spike-top-pct 0.12 \
-            --max-events-per-underlying 6
+            --max-events-per-underlying 8 \
+            --news-lookback-days 10 \
+            --max-news-items-per-ticker 18 \
+            --catalyst-weight 0.50
 
       - name: Upload CSV artifact
         if: always()
