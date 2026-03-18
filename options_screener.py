@@ -1496,6 +1496,9 @@ def scan_options_by_strike(tk, price: float, cfg: dict,
 # 模块11: 单只股票分析
 # ══════════════════════════════════════════════════════════════
 
+# 调试计数器（全局）
+_debug_counts = {"total":0,"no_hist":0,"liquidity":0,"momentum":0,"no_opt":0,"pass":0}
+
 def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
             oi_snapshot: dict, oi_history: dict, vol_history: dict,
             iv_history: dict, persistent_signals: set,
@@ -1506,7 +1509,10 @@ def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
         hist = tk.history(period=f"{cfg['support_window']}d",
                           interval="1d", auto_adjust=True)
 
+        _debug_counts["total"] += 1
+
         if hist.empty or len(hist) < 20:
+            _debug_counts["no_hist"] += 1
             return None
 
         price   = float(hist["Close"].iloc[-1])
@@ -1515,6 +1521,7 @@ def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
                          hist["Close"].iloc[-2] - 1) * 100, 2)
 
         if price < cfg["min_price"] or avg_vol < cfg["min_avg_volume"]:
+            _debug_counts["liquidity"] += 1
             return None
 
         # 相对强弱 (仅作评分参考，不过滤)
@@ -1529,6 +1536,7 @@ def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
         # 技术指标 + 动量过滤
         tech = calc_technicals(hist)
         if cfg["min_momentum_5d"] is not None and tech["momentum_5d"] < cfg["min_momentum_5d"]:
+            _debug_counts["momentum"] += 1
             return None
 
         # 财报日
@@ -1538,7 +1546,10 @@ def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
         opt = scan_options_by_strike(tk, price, cfg, oi_snapshot,
                                      oi_history, vol_history, iv_history, ticker, lock)
         if opt is None:
+            _debug_counts["no_opt"] += 1
             return None
+
+        _debug_counts["pass"] += 1
 
         # 财报窗口标注
         in_earnings_window = earnings_in_window(earnings_date, opt["expiry"])
@@ -2062,6 +2073,14 @@ def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
     save_oi_history(oi_history, cfg["oi_history_file"])
     save_vol_history(vol_history, cfg["vol_history_file"])
     save_iv_history(iv_history, cfg["iv_history_file"])
+
+    # 打印调试统计
+    dc = _debug_counts
+    log.info(f"调试统计: 总计={dc['total']} 无历史={dc['no_hist']} "
+             f"流动性不足={dc['liquidity']} 动量过滤={dc['momentum']} "
+             f"期权无结果={dc['no_opt']} 通过={dc['pass']}")
+    print(f"  调试: 总{dc['total']} | 无历史{dc['no_hist']} | 流动性{dc['liquidity']} "
+          f"| 动量{dc['momentum']} | 无期权{dc['no_opt']} | 通过{dc['pass']}")
 
     if not signals:
         print("\n  未找到符合条件的标的，建议尝试:")
