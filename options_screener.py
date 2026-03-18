@@ -28,6 +28,7 @@ import math
 import os
 import re
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -2031,7 +2032,27 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     cfg = parse_args()
-    run(cfg)
+    try:
+        run(cfg)
+    except Exception as e:
+        # 兜底：避免 workflow 因单点异常直接失败，保留错误日志并通知 Telegram
+        log.error("扫描运行失败: %s", e)
+        log.error(traceback.format_exc())
+
+        out_dir = Path(getattr(cfg, "output_dir", "results"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        err_file = out_dir / f"scan_error_{ts}.log"
+        err_file.write_text(traceback.format_exc(), encoding="utf-8")
+
+        if getattr(cfg, "tg_token", "") and getattr(cfg, "tg_chat", ""):
+            msg = (
+                "⚠️ <b>黑马扫描运行异常</b>\n"
+                f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"错误: {html.escape(str(e))}\n"
+                f"已写入错误日志: {err_file.name}"
+            )
+            _tg_send(cfg.tg_token, cfg.tg_chat, msg)
 
 
 if __name__ == "__main__":
