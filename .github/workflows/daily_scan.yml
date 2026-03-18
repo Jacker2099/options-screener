@@ -36,7 +36,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install longport pandas numpy requests
+        run: pip install longport yfinance pandas numpy requests lxml
 
       - name: Run screener
         id: run_screener
