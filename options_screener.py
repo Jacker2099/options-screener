@@ -23,17 +23,21 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import logging
 import math
 import os
 import re
 import time
 import traceback
+from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+import xml.etree.ElementTree as ET
 
 import pandas as pd
 import requests
@@ -213,6 +217,13 @@ BIO_SECTOR_HINTS = [
 ]
 
 
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+
 @dataclass
 class EventRow:
     symbol: str
@@ -309,6 +320,16 @@ def display_name(ticker: str) -> str:
     return NAME_OVERRIDES.get(ticker, ticker)
 
 
+def _fetch_text(url: str, timeout: int = 20) -> str:
+    try:
+        r = requests.get(url, headers=HTTP_HEADERS, timeout=timeout)
+        if r.status_code == 200:
+            return r.text
+    except Exception:
+        return ""
+    return ""
+
+
 # ══════════════════════════════════════════════════════════════
 # 模块1: 全市场股票池
 # ══════════════════════════════════════════════════════════════
@@ -316,7 +337,10 @@ def display_name(ticker: str) -> str:
 def _wiki_tickers(url: str, preferred_cols: List[str], label: str) -> List[str]:
     out: List[str] = []
     try:
-        tables = pd.read_html(url)
+        html_text = _fetch_text(url)
+        if not html_text:
+            raise RuntimeError("empty response")
+        tables = pd.read_html(StringIO(html_text))
     except Exception as e:
         log.warning("%s 获取失败: %s", label, e)
         return out
@@ -350,11 +374,67 @@ def _wiki_tickers(url: str, preferred_cols: List[str], label: str) -> List[str]:
     return uniq
 
 
-def build_broad_universe(limit: int) -> List[str]:
+def _nasdaq_trader_tickers() -> List[str]:
+    urls = [
+        "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+        "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+    ]
+    out: List[str] = []
+    for url in urls:
+        txt = _fetch_text(url)
+        if not txt or "|" not in txt:
+            continue
+        try:
+            df = pd.read_csv(StringIO(txt), sep="|")
+        except Exception:
+            continue
+        for col in ["Symbol", "ACT Symbol", "NASDAQ Symbol", "Ticker"]:
+            if col not in df.columns:
+                continue
+            vals = [normalize_yf_ticker(x) for x in df[col].dropna().tolist()]
+            vals = [x for x in vals if x and x != "FILE CREATION TIME"]
+            out.extend(vals)
+    return sorted(set(out))
+
+
+def _sec_company_tickers(limit: int = 12000) -> List[str]:
+    url = "https://www.sec.gov/files/company_tickers.json"
+    txt = _fetch_text(url)
+    if not txt:
+        return []
+    try:
+        data = json.loads(txt)
+    except Exception:
+        return []
+
+    out: List[str] = []
+    if isinstance(data, dict):
+        for _, row in data.items():
+            if not isinstance(row, dict):
+                continue
+            t = normalize_yf_ticker(row.get("ticker", ""))
+            if t:
+                out.append(t)
+            if len(out) >= limit:
+                break
+    return sorted(set(out))
+
+
+def build_broad_universe(limit: int, min_expected: int) -> List[str]:
     tickers = set(SEED_TICKERS)
     log.info("构建全市场股票池...")
     for url, cols, label in UNIVERSE_SOURCES:
         tickers.update(_wiki_tickers(url, cols, label))
+
+    if len(tickers) < min_expected:
+        ndaq = _nasdaq_trader_tickers()
+        tickers.update(ndaq)
+        log.info("  NasdaqTrader 补充: %d", len(ndaq))
+
+    if len(tickers) < min_expected:
+        sec = _sec_company_tickers()
+        tickers.update(sec)
+        log.info("  SEC Ticker 补充: %d", len(sec))
 
     # 去掉明显不适配期权扫描的符号
     clean = []
@@ -367,6 +447,9 @@ def build_broad_universe(limit: int) -> List[str]:
 
     if limit > 0:
         clean = clean[:limit]
+
+    if len(clean) < min_expected:
+        log.warning("股票池低于预期: %d < %d，可能存在数据源访问异常", len(clean), min_expected)
 
     log.info("  股票池合计: %d\n", len(clean))
     return clean
@@ -1227,6 +1310,53 @@ def _extract_news_fields(item: Dict[str, Any]) -> Tuple[str, str, str, Optional[
     return title.strip(), summary.strip(), url.strip(), pub_dt
 
 
+def fetch_yahoo_rss_news(ticker: str, max_items: int) -> List[Dict[str, Any]]:
+    """
+    yfinance tk.news 为空时，使用 Yahoo RSS 做兜底新闻源。
+    """
+    url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
+    txt = _fetch_text(url, timeout=15)
+    if not txt:
+        return []
+
+    try:
+        root = ET.fromstring(txt)
+    except Exception:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for item in root.findall(".//item"):
+        title = (item.findtext("title") or "").strip()
+        summary = (item.findtext("description") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        pub = (item.findtext("pubDate") or "").strip()
+        if not title and not summary:
+            continue
+
+        pub_iso = ""
+        if pub:
+            try:
+                dt = parsedate_to_datetime(pub)
+                if dt is not None:
+                    pub_iso = dt.isoformat()
+            except Exception:
+                pub_iso = ""
+
+        out.append(
+            {
+                "title": title,
+                "summary": summary,
+                "link": link,
+                "published": pub_iso,
+            }
+        )
+
+        if len(out) >= max_items:
+            break
+
+    return out
+
+
 def _short_text(s: str, n: int = 90) -> str:
     t = " ".join(str(s).split())
     if len(t) <= n:
@@ -1383,8 +1513,26 @@ def fetch_ticker_metadata(ticker: str, lookback_days: int, max_news_items: int) 
     # 新闻催化
     try:
         news_items = tk.news or []
+        if not isinstance(news_items, list):
+            news_items = []
+        if len(news_items) < 2:
+            rss_items = fetch_yahoo_rss_news(ticker, max_news_items)
+            if rss_items:
+                news_items.extend(rss_items)
+
+        # 去重（按标题）
+        uniq_news: List[Dict[str, Any]] = []
+        seen_titles = set()
+        for it in news_items:
+            t, _, _, _ = _extract_news_fields(it if isinstance(it, dict) else {})
+            key = t.lower().strip()
+            if not key or key in seen_titles:
+                continue
+            seen_titles.add(key)
+            uniq_news.append(it if isinstance(it, dict) else {})
+
         cat = score_news_catalysts(
-            news_items=news_items if isinstance(news_items, list) else [],
+            news_items=uniq_news,
             is_bio=bool(out["is_bio"]),
             lookback_days=lookback_days,
             max_items=max_news_items,
@@ -1565,6 +1713,15 @@ def build_direction_table(
             confidence -= 8
         confidence = clip(confidence, 15, 99)
 
+        direction = _direction_label(score)
+        if not cfg.allow_bearish and score <= 0:
+            continue
+        if confidence < cfg.min_confidence:
+            continue
+        if cfg.require_catalyst:
+            if catalyst_tags == "无" or catalyst_score < cfg.min_catalyst_score:
+                continue
+
         reasons: List[str] = []
         if agg["cp_turnover_ratio"] >= 1.5:
             reasons.append("Call成交额显著占优")
@@ -1596,7 +1753,7 @@ def build_direction_table(
             {
                 "代码": ticker,
                 "名称": str(r["name"]),
-                "方向": _direction_label(score),
+                "方向": direction,
                 "综合分": round(score, 2),
                 "置信度": round(confidence, 1),
                 "期权异动数": int(agg["events"]),
@@ -1750,6 +1907,9 @@ def send_to_telegram(
         f"🕒 {run_dt}\n"
         f"🌐 股票池 {stats.get('universe_size', 0)} 只  |  预筛 {stats.get('prefilter_size', 0)} 只  |  期权深扫 {stats.get('option_scan_size', 0)} 只\n"
         f"🧭 大盘: <b>{html.escape(str(regime.get('label', '中性')))}</b>  分数 {float(regime.get('score', 0.0)):+.1f}  VIX {float(regime.get('vix', 0.0)):.1f}\n"
+        f"📌 模式: {'多空双向' if stats.get('allow_bearish') else '仅看多'} | "
+        f"{'仅催化' if stats.get('require_catalyst') else '含无催化'} | "
+        f"最小催化分 {float(stats.get('min_catalyst_score', 0.0)):.1f}\n"
         "📌 输出前10个高置信方向，不含合约明细\n"
         "━━━━━━━━━━━━━━━━━━━━"
     )
@@ -1821,6 +1981,11 @@ def run(cfg: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFra
     print(
         f"新闻催化: 回看{cfg.news_lookback_days}天  单票最多{cfg.max_news_items_per_ticker}条  权重={cfg.catalyst_weight:.2f}"
     )
+    print(
+        f"输出模式: {'多空双向' if cfg.allow_bearish else '仅看多'} | "
+        f"{'仅催化' if cfg.require_catalyst else '含无催化'} | "
+        f"最小催化分={cfg.min_catalyst_score:.1f} | 最小置信度={cfg.min_confidence:.1f}"
+    )
     print()
 
     if yf is None:
@@ -1831,7 +1996,7 @@ def run(cfg: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFra
         universe = sorted(set(cfg.underlyings))
         log.info("使用自定义股票池: %d 只", len(universe))
     else:
-        universe = build_broad_universe(cfg.universe_limit)
+        universe = build_broad_universe(cfg.universe_limit, cfg.min_universe_expected)
 
     # 2) 大盘环境
     regime = get_market_regime()
@@ -1973,6 +2138,9 @@ def run(cfg: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFra
         "universe_size": len(universe),
         "prefilter_size": len(prefilter_df),
         "option_scan_size": len(scan_df),
+        "allow_bearish": bool(cfg.allow_bearish),
+        "require_catalyst": bool(cfg.require_catalyst),
+        "min_catalyst_score": float(cfg.min_catalyst_score),
     }
     send_to_telegram(
         top_df=top_df,
@@ -2002,6 +2170,7 @@ def parse_args() -> argparse.Namespace:
         help="可选，自定义标的(逗号分隔，如 TSLA,NVDA,AAPL)。留空则自动构建全市场池",
     )
     p.add_argument("--universe-limit", type=int, default=3200, help="全市场池上限")
+    p.add_argument("--min-universe-expected", type=int, default=800, help="全市场池期望下限（低于则自动补源）")
 
     p.add_argument("--prefilter-period", type=str, default="6mo")
     p.add_argument("--yf-chunk-size", type=int, default=120)
@@ -2059,6 +2228,22 @@ def parse_args() -> argparse.Namespace:
         default=0.50,
         help="新闻催化分在综合分中的权重(0~1建议)",
     )
+    p.add_argument("--allow-bearish", action="store_true", help="允许输出偏空/强空方向（默认仅看多黑马）")
+    p.add_argument(
+        "--require-catalyst",
+        dest="require_catalyst",
+        action="store_true",
+        default=True,
+        help="仅输出有明确催化新闻的标的",
+    )
+    p.add_argument(
+        "--allow-no-catalyst",
+        dest="require_catalyst",
+        action="store_false",
+        help="允许输出无明确催化的标的",
+    )
+    p.add_argument("--min-catalyst-score", type=float, default=1.5, help="最低催化剂分阈值")
+    p.add_argument("--min-confidence", type=float, default=35.0, help="最低置信度阈值")
 
     p.add_argument("--output-dir", type=str, default="results")
     p.add_argument("--tg-token", type=str, default=os.environ.get("TELEGRAM_TOKEN", ""))
@@ -2088,6 +2273,9 @@ def parse_args() -> argparse.Namespace:
     args.top = max(1, int(args.top))
     args.news_lookback_days = max(1, int(args.news_lookback_days))
     args.max_news_items_per_ticker = max(5, int(args.max_news_items_per_ticker))
+    args.min_universe_expected = max(100, int(args.min_universe_expected))
+    args.min_catalyst_score = max(0.0, float(args.min_catalyst_score))
+    args.min_confidence = max(0.0, float(args.min_confidence))
 
     return args
 
