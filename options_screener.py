@@ -239,7 +239,7 @@ def get_option_chain_longport(ctx, ticker: str, price: float,
 CONFIG = {
     # 支撑位
     "support_window":        60,
-    "support_tolerance":     0.03,
+    "support_tolerance":     0.05,  # 放宽到5%，确保在下跌市场中能找到足够信号
     "local_min_window":      5,
     "min_support_touches":   1,      # 支撑位最少被验证次数(1=不过滤，让评分区分强弱)
 
@@ -291,7 +291,7 @@ CONFIG = {
     "min_price":             5.0,
 
     # 动量过滤
-    "min_momentum_5d":       -15.0,  # 近5日跌幅不超过15%，抄底策略放宽此限制
+    "min_momentum_5d":       -20.0,  # 放宽到-20%，大盘下跌时避免误杀
 
     # 并发
     "workers":               5,
@@ -953,15 +953,12 @@ def calc_rs(ticker_hist: pd.DataFrame, spy_hist: pd.DataFrame,
 
 
 # ══════════════════════════════════════════════════════════════
-# 模块8: 支撑位 (增加验证次数)
+# 模块8: 支撑位分析（仅评分，不硬过滤）
 # ══════════════════════════════════════════════════════════════
 
 def find_supports_with_strength(close: pd.Series,
                                  window: int = 5) -> list:
-    """
-    识别支撑位并统计每个支撑位被验证的次数。
-    返回: [(价格, 验证次数), ...]
-    """
+    """识别历史低点支撑位，返回 [(价格, 验证次数), ...]"""
     prices = close.values
     raw = []
     for i in range(window, len(prices) - window):
@@ -970,15 +967,12 @@ def find_supports_with_strength(close: pd.Series,
             raw.append(float(prices[i]))
     if not raw:
         return []
-
-    # 合并相近支撑位并统计次数
     sorted_raw = sorted(raw)
     merged = []
     for p in sorted_raw:
         found = False
         for i, (mp, cnt) in enumerate(merged):
             if abs(p - mp) / mp <= 0.02:
-                # 合并：更新为均值，次数+1
                 merged[i] = (round((mp * cnt + p) / (cnt + 1), 2), cnt + 1)
                 found = True
                 break
@@ -987,25 +981,87 @@ def find_supports_with_strength(close: pd.Series,
     return merged
 
 
-def check_support_strength(price: float,
-                            supports: list,
-                            tol: float,
-                            min_touches: int) -> tuple:
+def calc_volume_support(hist: pd.DataFrame) -> float:
     """
-    判断价格是否在有效支撑位附近（支撑强度达标）。
-    返回: (命中, 最近支撑价, 距离%, 验证次数)
+    计算成交量密集区（VPA）：过去60天哪个价格区间成交量最大。
+    这是比历史低点更可靠的支撑位，因为代表大量筹码换手的区域。
+    返回：成交量最密集的价格（VPoc，Volume Point of Control）
+    """
+    if hist.empty or len(hist) < 10:
+        return 0.0
+    close  = hist["Close"].values
+    volume = hist["Volume"].values
+    lo, hi = close.min(), close.max()
+    if hi == lo:
+        return float(lo)
+    # 把价格区间分成20个档位，统计每个档位的成交量
+    bins = 20
+    step = (hi - lo) / bins
+    vol_by_price = [0.0] * bins
+    for c, v in zip(close, volume):
+        idx = min(int((c - lo) / step), bins - 1)
+        vol_by_price[idx] += v
+    max_idx = vol_by_price.index(max(vol_by_price))
+    vpoc = lo + (max_idx + 0.5) * step
+    return round(float(vpoc), 2)
+
+
+def calc_support_score(price: float, supports: list,
+                       vpoc: float) -> tuple:
+    """
+    计算支撑位评分（0~20分），不再硬过滤。
+
+    评分逻辑：
+      - 价格在支撑位/VPoc上方0~5%：满分，即将从支撑反弹
+      - 价格在支撑位/VPoc附近±5%：高分，在历史记忆区域
+      - 价格跌破支撑5~15%：中分，可能在寻找下一支撑
+      - 价格远离所有支撑：低分，但期权信号强仍可入选
+
+    返回: (评分0~20, 最近支撑价, 距离%, 验证次数, 位置描述)
     """
     if not supports:
-        return False, 0.0, 99.0, 0
+        nearest, touches = vpoc, 0
+    else:
+        dists = [(abs(price - p) / p, p, cnt) for p, cnt in supports]
+        _, nearest_low, touches = min(dists, key=lambda x: x[0])
+        # 综合低点支撑和VPoc，取更近的那个
+        if vpoc > 0 and abs(price - vpoc) / price < abs(price - nearest_low) / price:
+            nearest = vpoc
+            touches = max(touches, 1)
+        else:
+            nearest = nearest_low
 
-    valid = [(p, cnt) for p, cnt in supports if cnt >= min_touches]
-    # 如果没有足够强的支撑，降级使用所有支撑位
-    candidates = valid if valid else supports
+    if nearest == 0:
+        return 5, 0.0, 99.0, 0, "无支撑数据"
 
-    dists = [(abs(price - p) / p, p, cnt) for p, cnt in candidates]
-    min_dist, nearest, touches = min(dists, key=lambda x: x[0])
-    hit = (min_dist <= tol) and (price >= nearest * 0.99)
-    return hit, round(nearest, 2), round(min_dist * 100, 2), touches
+    dist_pct = (price - nearest) / nearest * 100  # 正=在支撑上方，负=跌破支撑
+
+    if 0 <= dist_pct <= 3:
+        score = 20
+        desc = f"紧贴支撑位上方{dist_pct:.1f}%"
+    elif 3 < dist_pct <= 8:
+        score = 15
+        desc = f"支撑位上方{dist_pct:.1f}%"
+    elif -3 <= dist_pct < 0:
+        score = 14
+        desc = f"轻微跌破支撑{abs(dist_pct):.1f}%"
+    elif 8 < dist_pct <= 15:
+        score = 10
+        desc = f"支撑位上方{dist_pct:.1f}%"
+    elif -8 <= dist_pct < -3:
+        score = 8
+        desc = f"跌破支撑{abs(dist_pct):.1f}%"
+    elif -15 <= dist_pct < -8:
+        score = 5
+        desc = f"深度跌破支撑{abs(dist_pct):.1f}%"
+    else:
+        score = 2
+        desc = f"远离支撑位{dist_pct:.1f}%"
+
+    # 验证次数加分
+    score = min(score + min(touches - 1, 3), 20)
+
+    return score, round(nearest, 2), round(abs(dist_pct), 2), touches, desc
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1464,12 +1520,11 @@ def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
         # 相对强弱 (仅作评分参考，不过滤)
         rs = calc_rs(hist, spy_hist, cfg["rs_window"])
 
-        # 支撑位 (含强度验证)
+        # 支撑位（纯评分，不硬过滤）
         supports = find_supports_with_strength(hist["Close"], cfg["local_min_window"])
-        hit, nearest_sup, dist_pct, sup_touches = check_support_strength(
-            price, supports, cfg["support_tolerance"], cfg["min_support_touches"])
-        if not hit:
-            return None
+        vpoc = calc_volume_support(hist)
+        sup_score_val, nearest_sup, dist_pct, sup_touches, sup_desc = calc_support_score(
+            price, supports, vpoc)
 
         # 技术指标 + 动量过滤
         tech = calc_technicals(hist)
@@ -1494,9 +1549,8 @@ def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
         # 板块
         sector = STOCK_SECTOR.get(ticker, "其他")
 
-        # 综合评分
-        sup_score  = ((cfg["support_tolerance"] * 100 - dist_pct)
-                      / (cfg["support_tolerance"] * 100) * 20)
+        # 综合评分（支撑位分直接用 calc_support_score 返回值）
+        sup_score  = sup_score_val
         mom_score  = (min(tech["vol_trend"], 2) / 2 * 6
                       + (4 if tech["above_ma20"] else 0))
         pos_score  = max(0, (50 - tech["week52_pos"]) / 50 * 5)
@@ -1521,7 +1575,9 @@ def analyze(ticker: str, cfg: dict, spy_hist: pd.DataFrame,
             "日均成交量M":    round(avg_vol / 1e6, 2),
             "相对强弱RS":     rs,
             "最近支撑位":     nearest_sup,
+            "成交密集区VPoc": vpoc,
             "距支撑%":        dist_pct,
+            "支撑状态":       sup_desc,
             "支撑验证次数":   sup_touches,
             "5日动量%":       tech["momentum_5d"],
             "量能趋势":       tech["vol_trend"],
@@ -1569,11 +1625,9 @@ def generate_interpretation(row: pd.Series) -> str:
     parts = []
 
     # 支撑位
-    touch_str = f"(已验证{row['支撑验证次数']}次)"
-    if row["距支撑%"] < 0.5:
-        parts.append(f"股价紧贴支撑位${row['最近支撑位']}{touch_str}")
-    else:
-        parts.append(f"股价距支撑位{row['距支撑%']:.1f}%{touch_str}")
+    sup_desc = row.get("支撑状态", "")
+    vpoc_str = f"，成交密集区${row.get('成交密集区VPoc', 0):.2f}" if row.get("成交密集区VPoc", 0) > 0 else ""
+    parts.append(f"{sup_desc}(支撑${row['最近支撑位']}{vpoc_str})")
 
     # 技术面
     signals = []
@@ -1866,7 +1920,7 @@ def send_to_telegram(df: pd.DataFrame, total_scanned: int,
             f"🔑 {oi_chg_str}\n"
             f"📊 {oi_str}  {pc_str}\n"
             f"💰 股价 <b>${row['股价']:.2f}</b>  当日{row['当日涨跌%']:+.2f}%\n"
-            f"🛡 支撑 ${row['最近支撑位']:.2f}  距离{row['距支撑%']:.1f}%  验证{row['支撑验证次数']}次\n"
+            f"🛡 {row.get('支撑状态', '')}  支撑${row['最近支撑位']:.2f}  VPoc${row.get('成交密集区VPoc', 0):.2f}\n"
             f"🎯 关注 <b>{row['行权价']}C</b>  到期{row['到期日']}({row['剩余天数']}天)\n"
             f"💵 参考价{mid_str}  {iv_pct_str}  虚值{row['虚值幅度%']:.1f}%\n"
             f"{mom_icon} 动量{row['5日动量%']:+.1f}%  量能{row['量能趋势']:.2f}x  {above_str}  RS={row['相对强弱RS']:.2f}\n"
@@ -2040,7 +2094,7 @@ def run(cfg: dict, tg_token: str = "", tg_chat: str = "") -> pd.DataFrame:
     print(f"{'='*70}\n")
 
     data_cols = [
-        "代码","板块","股价","当日涨跌%","相对强弱RS","最近支撑位","距支撑%","支撑验证次数",
+        "代码","板块","股价","当日涨跌%","相对强弱RS","最近支撑位","成交密集区VPoc","距支撑%","支撑状态","支撑验证次数",
         "5日动量%","量能趋势","在均线上方","52周位置%",
         "财报日","财报在窗口内","连续信号",
         "到期日","剩余天数","行权价","虚值幅度%","期权参考价","隐含波动率%","IV百分位",
