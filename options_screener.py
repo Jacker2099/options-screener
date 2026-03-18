@@ -333,36 +333,81 @@ STOCK_SECTOR = {
 # 模块1: 股票池
 # ══════════════════════════════════════════════════════════════
 
-def _wiki_tickers(url: str, col: str, label: str) -> list:
-    try:
-        for t in pd.read_html(url):
-            if col in t.columns:
-                result = [str(s).strip().replace(".", "-")
-                          for s in t[col].dropna()]
-                log.info(f"  {label}: {len(result)} 只")
-                return result
-    except Exception as e:
-        log.warning(f"  {label} 获取失败: {e}")
-    return []
+# S&P 500 完整列表（内置，不依赖网络抓取）
+_SP500 = [
+    "A","AAL","AAPL","ABBV","ABNB","ABT","ACGL","ACI","ACN","ADBE","ADI","ADM",
+    "ADP","ADSK","AEE","AEP","AES","AFL","AIG","AIZ","AJG","AKAM","ALB","ALGN",
+    "ALL","ALLE","AMAT","AMCR","AMD","AME","AMGN","AMP","AMT","AMZN","ANET",
+    "ANSS","AON","AOS","APA","APD","APH","APTV","ARE","ATO","AVB","AVGO","AVY",
+    "AWK","AXON","AXP","AZO","BA","BAC","BALL","BAX","BBWI","BBY","BDX","BEN",
+    "BF-B","BG","BIIB","BIO","BK","BKNG","BKR","BLDR","BLK","BMY","BR","BRK-B",
+    "BRO","BSX","BWA","BX","BXP","C","CAG","CAH","CARR","CAT","CB","CBOE","CBRE",
+    "CCI","CCL","CDNS","CDW","CE","CEG","CF","CFG","CHD","CHRW","CHTR","CI",
+    "CINF","CL","CLX","CMA","CMCSA","CME","CMG","CMI","CMS","CNC","CNP","COF",
+    "COO","COP","COR","COST","CPAY","CPB","CPRT","CPT","CRL","CRM","CSCO","CSGP",
+    "CSX","CTAS","CTLT","CTRA","CTSH","CTVA","CVS","CVX","CZR","D","DAL","DAY",
+    "DD","DE","DECK","DFS","DG","DGX","DHI","DHR","DIS","DLR","DLTR","DOC","DOV",
+    "DOW","DPZ","DRI","DTE","DUK","DVA","DVN","DXCM","EA","EBAY","ECL","ED",
+    "EFX","EG","EIX","EL","ELV","EMN","EMR","ENPH","EOG","EPAM","EQIX","EQR",
+    "EQT","ES","ESS","ETN","ETR","EVRG","EW","EXC","EXPD","EXPE","EXR","F","FANG",
+    "FAST","FCX","FDS","FDX","FE","FFIV","FI","FICO","FIS","FITB","FMC","FOX",
+    "FOXA","FRT","FSLR","FTNT","FTV","GD","GDDY","GE","GEHC","GEN","GEV","GILD",
+    "GIS","GL","GLW","GM","GNRC","GOOG","GOOGL","GPC","GPN","GRMN","GS","GWW",
+    "HAL","HAS","HBAN","HCA","HD","HES","HIG","HII","HLT","HOLX","HON","HPE",
+    "HPQ","HRL","HSIC","HST","HSY","HUBB","HUM","HWM","IBM","ICE","IDXX","IEX",
+    "IFF","INCY","INTC","INTU","INVH","IP","IPG","IQV","IR","IRM","ISRG","IT",
+    "ITW","IVZ","J","JBHT","JBL","JCI","JKHY","JNJ","JNPR","JPM","K","KDP","KEY",
+    "KEYS","KHC","KIM","KKR","KLAC","KMB","KMI","KMX","KO","KR","KVUE","L","LDOS",
+    "LEN","LH","LHX","LIN","LKQ","LLY","LMT","LNT","LOW","LRCX","LULU","LUV",
+    "LVS","LW","LYB","LYV","MA","MAA","MAR","MAS","MCD","MCHP","MCK","MCO","MDLZ",
+    "MDT","MET","META","MGM","MHK","MKC","MKTX","MLM","MMC","MMM","MNST","MO",
+    "MOH","MOS","MPC","MPWR","MRK","MRNA","MRO","MS","MSCI","MSFT","MSI","MTB",
+    "MTCH","MTD","MU","NCLH","NDAQ","NEE","NEM","NFLX","NI","NKE","NOC","NOW",
+    "NRG","NSC","NTAP","NTRS","NUE","NVDA","NVR","NWS","NWSA","NXPI","O","ODFL",
+    "OKE","OMC","ON","ORCL","ORLY","OTIS","OXY","PANW","PARA","PAYC","PAYX","PCAR",
+    "PCG","PEG","PEP","PFE","PFG","PG","PGR","PH","PHM","PKG","PLD","PM","PNC",
+    "PNR","PNW","PODD","POOL","PPG","PPL","PRU","PSA","PSX","PTC","PWR","PYPL",
+    "QCOM","QRVO","RCL","REG","REGN","RF","RJF","RL","RMD","ROK","ROL","ROP",
+    "ROST","RSG","RTX","RVTY","SBAC","SBUX","SCHW","SHW","SJM","SLB","SMCI",
+    "SNA","SNPS","SO","SPG","SPGI","SRE","STE","STLD","STT","STX","STZ","SW",
+    "SWK","SWKS","SYF","SYK","SYY","T","TAP","TDG","TDY","TECH","TEL","TER",
+    "TFC","TFX","TGT","TJX","TMO","TMUS","TPR","TRGP","TRMB","TROW","TRV","TSCO",
+    "TSLA","TSN","TT","TTWO","TXN","TXT","TYL","UAL","UBER","UDR","UHS","ULTA",
+    "UNH","UNP","UPS","URI","USB","V","VICI","VLO","VLTO","VMC","VRSK","VRSN",
+    "VRTX","VST","VTR","VTRS","VZ","WAB","WAT","WBA","WBD","WDC","WELL","WFC",
+    "WHR","WM","WMB","WMT","WRB","WST","WTW","WY","WYNN","XEL","XOM","XYL",
+    "YUM","ZBH","ZBRA","ZTS",
+]
+
+# 纳斯达克 100 核心成分（覆盖与 S&P500 重叠部分）
+_NDX100 = [
+    "ADBE","ADI","ADP","ADSK","AEP","AMAT","AMD","AMGN","AMZN","ANSS","ARM",
+    "ASML","AVGO","AXON","BIIB","BKR","CCEP","CDNS","CDW","CEG","CHTR","CMCSA",
+    "COST","CPRT","CRWD","CSCO","CSX","CTAS","CTSH","DDOG","DLTR","DXCM","EA",
+    "EXC","FANG","FAST","FTNT","GEHC","GFS","GILD","GOOG","GOOGL","HON","IDXX",
+    "ILMN","INTC","INTU","ISRG","KDP","KHC","KLAC","LRCX","LULU","MAR","MCHP",
+    "MDB","MDLZ","META","MNST","MRNA","MRVL","MSFT","MU","NFLX","NVDA","NXPI",
+    "ODFL","ON","ORLY","PANW","PAYX","PCAR","PDD","PEP","PLTR","PYPL","QCOM",
+    "REGN","ROP","ROST","SBUX","SIRI","SNPS","TEAM","TMUS","TSLA","TTD","TTWO",
+    "TXN","VRSK","VRTX","WBD","WDAY","XEL","ZS",
+]
+
+# 热门期权标的补充
+_HOT = [
+    "MSTR","COIN","HOOD","SOFI","RIVN","LCID","NIO","XPEV","BABA","JD","RBLX",
+    "SNAP","LYFT","ABNB","DASH","DKNG","NET","SNOW","OKTA","ZS","MDB","SMCI",
+    "ARM","ARKK","SPY","QQQ","IWM","GLD","TLT","XLF","XLE","XLK","GDX","SQQQ",
+    "TQQQ","MARA","RIOT","CLSK","HUT","CIFR",
+]
 
 
 def get_universe() -> list:
+    """
+    构建股票池（完全内置，不依赖网络抓取，解决 GitHub Actions 访问 Wikipedia 被封问题）。
+    覆盖: S&P500 + 纳斯达克100 + 热门期权标的，共约 600 只。
+    """
     log.info("构建股票池...")
-    tickers = set()
-    tickers.update(_wiki_tickers(
-        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-        "Symbol", "S&P 500"))
-    tickers.update(_wiki_tickers(
-        "https://en.wikipedia.org/wiki/Nasdaq-100",
-        "Ticker", "Nasdaq 100"))
-    tickers.update([
-        "TSLA","NVDA","AMD","MSTR","COIN","PLTR","SOFI","RIVN",
-        "LCID","NIO","BABA","JD","PDD","XPEV","DKNG","HOOD",
-        "RBLX","SNAP","UBER","LYFT","ABNB","DASH","NET","DDOG",
-        "SNOW","CRWD","OKTA","ZS","MDB","SMCI","ARM","AVGO",
-        "AAPL","MSFT","AMZN","GOOGL","META","NFLX","INTC",
-        "SPY","QQQ","IWM","GLD","TLT","XLF","XLE","XLK","ARKK",
-    ])
+    tickers = set(_SP500) | set(_NDX100) | set(_HOT)
     result = sorted(tickers)
     log.info(f"  股票池合计: {len(result)} 只\n")
     return result
@@ -424,21 +469,21 @@ def check_market_environment(cfg: dict) -> dict:
 
         if vix > 40:
             result["risk_level"]    = "RED"
-            result["score_penalty"] = -15
+            result["score_penalty"] = 0   # 不扣分，仅提示
             result["warning_msg"]   = (
                 f"🔴 市场极度恐慌 VIX={vix:.1f}，信号仅供参考，"
                 f"建议轻仓或等VIX回落30以下再操作"
             )
         elif vix > cfg["max_vix"] or (not spy_above and not qqq_above):
             result["risk_level"]    = "YELLOW"
-            result["score_penalty"] = -5
+            result["score_penalty"] = 0   # 不扣分，仅提示
             result["warning_msg"]   = (
                 f"🟡 大盘偏弱 VIX={vix:.1f} SPY距均线{spy_pct:+.1f}%，"
-                f"信号已降权，此时也可能是底部抄底机会，请结合个股判断"
+                f"此时可能是底部抄底机会，请结合个股判断"
             )
         elif not spy_above or not qqq_above:
             result["risk_level"]    = "YELLOW"
-            result["score_penalty"] = -3
+            result["score_penalty"] = 0   # 不扣分，仅提示
             result["warning_msg"]   = (
                 f"🟡 SPY距均线{spy_pct:+.1f}%，大盘略偏弱，"
                 f"支撑位信号可关注潜在底部机会"
@@ -450,8 +495,7 @@ def check_market_environment(cfg: dict) -> dict:
         log.info(f"  大盘环境: [{result['risk_level']}] VIX={vix:.1f} "
                  f"SPY均线{spy_pct:+.1f}% "
                  f"SPY{'✅' if spy_above else '⚠️'} "
-                 f"QQQ{'✅' if qqq_above else '⚠️'} "
-                 f"评分惩罚={result['score_penalty']}")
+                 f"QQQ{'✅' if qqq_above else '⚠️'}")
 
     except Exception as e:
         log.warning(f"  大盘环境检查失败: {e}，继续运行")
