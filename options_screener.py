@@ -395,19 +395,66 @@ def _download_single_history(ticker: str, period: str = "6mo") -> pd.DataFrame:
     return df.dropna(how="all")
 
 
+def _as_numeric_series(obj: Any) -> Optional[pd.Series]:
+    """
+    将任意输入稳定转换为 1 维数值序列，兼容 yfinance 多层列结构。
+    """
+    if obj is None:
+        return None
+
+    if isinstance(obj, pd.Series):
+        s = pd.to_numeric(obj, errors="coerce").dropna()
+        return s if not s.empty else None
+
+    if isinstance(obj, pd.DataFrame):
+        if obj.empty:
+            return None
+        for col in obj.columns:
+            try:
+                s = pd.to_numeric(obj[col], errors="coerce").dropna()
+            except Exception:
+                continue
+            if not s.empty:
+                return s
+        return None
+
+    try:
+        s = pd.to_numeric(pd.Series(obj), errors="coerce").dropna()
+    except Exception:
+        return None
+    return s if not s.empty else None
+
+
 def _close_series(hist: pd.DataFrame) -> Optional[pd.Series]:
     if hist is None or hist.empty:
         return None
-    if "Close" in hist.columns:
-        s = pd.to_numeric(hist["Close"], errors="coerce")
-    elif "Adj Close" in hist.columns:
-        s = pd.to_numeric(hist["Adj Close"], errors="coerce")
-    else:
-        return None
-    s = s.dropna()
-    if s.empty:
-        return None
-    return s
+
+    # MultiIndex 情况先按 level 取列
+    if isinstance(hist.columns, pd.MultiIndex):
+        for key in ("Close", "Adj Close"):
+            for lv in (0, 1):
+                try:
+                    sub = hist.xs(key, axis=1, level=lv, drop_level=True)
+                except Exception:
+                    continue
+                s = _as_numeric_series(sub)
+                if s is not None:
+                    return s
+
+    for key in ("Close", "Adj Close"):
+        if key in hist.columns:
+            s = _as_numeric_series(hist[key])
+            if s is not None:
+                return s
+
+    # 兜底：按列名模糊匹配
+    for c in hist.columns:
+        cs = str(c).lower()
+        if "close" in cs:
+            s = _as_numeric_series(hist[c])
+            if s is not None:
+                return s
+    return None
 
 
 def get_market_regime() -> Dict[str, Any]:
@@ -563,13 +610,28 @@ def download_history_for_universe(
 
 
 def _series(df: pd.DataFrame, key: str) -> Optional[pd.Series]:
+    if df is None or df.empty:
+        return None
+
+    if isinstance(df.columns, pd.MultiIndex):
+        for lv in (0, 1):
+            try:
+                sub = df.xs(key, axis=1, level=lv, drop_level=True)
+            except Exception:
+                continue
+            s = _as_numeric_series(sub)
+            if s is not None:
+                return s
+
     if key in df.columns:
-        s = pd.to_numeric(df[key], errors="coerce")
-        return s.dropna()
+        s = _as_numeric_series(df[key])
+        if s is not None:
+            return s
     for c in df.columns:
         if str(c).lower() == key.lower():
-            s = pd.to_numeric(df[c], errors="coerce")
-            return s.dropna()
+            s = _as_numeric_series(df[c])
+            if s is not None:
+                return s
     return None
 
 
