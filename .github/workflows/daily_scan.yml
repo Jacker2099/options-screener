@@ -46,7 +46,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p data/options_snapshots reports/daily reports/weekly
-          python options_screener.py --mode auto --enforce-premarket-window 2>&1 | tee reports/last_run.log
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            python options_screener.py --mode daily 2>&1 | tee reports/last_run.log
+          else
+            python options_screener.py --mode auto --enforce-premarket-window 2>&1 | tee reports/last_run.log
+          fi
 
       - name: Upload Artifacts
         if: always()
