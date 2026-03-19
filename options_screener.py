@@ -1495,6 +1495,7 @@ def save_daily_outputs(
     band_df: pd.DataFrame,
     signal_df: pd.DataFrame,
     validation_df: pd.DataFrame,
+    cfg: argparse.Namespace,
     summaries: Dict[str, Dict[str, str]],
 ) -> None:
     ensure_dir(snapshot_dir)
@@ -1646,6 +1647,7 @@ def daily_pipeline(cfg: argparse.Namespace) -> None:
         band_df=band_df,
         signal_df=signal_df,
         validation_df=validation_df,
+        cfg=cfg,
         summaries=summaries,
     )
     send_daily_telegram(
