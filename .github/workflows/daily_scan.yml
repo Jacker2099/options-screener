@@ -1,11 +1,11 @@
-name: NVDA TSLA Premarket Options Radar
+name: NVDA TSLA Post-Close Options Radar
 
 on:
   schedule:
-    # 11:30 UTC = 07:30 ET during US daylight time
-    - cron: "30 11 * * 1-5"
-    # 12:30 UTC = 07:30 ET during US standard time
-    - cron: "30 12 * * 1-5"
+    # 00:15 UTC = 20:15 ET during US daylight time, for Mon-Fri US sessions
+    - cron: "15 0 * * 2-6"
+    # 01:15 UTC = 20:15 ET during US standard time, for Mon-Fri US sessions
+    - cron: "15 1 * * 2-6"
     - cron: "30 12 * * 0"
   workflow_dispatch:
 
@@ -49,7 +49,7 @@ jobs:
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             python options_screener.py --mode daily 2>&1 | tee reports/last_run.log
           else
-            python options_screener.py --mode auto --enforce-premarket-window 2>&1 | tee reports/last_run.log
+            python options_screener.py --mode auto --enforce-postclose-window 2>&1 | tee reports/last_run.log
           fi
 
       - name: Upload Artifacts
