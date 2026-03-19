@@ -1,9 +1,12 @@
-name: NVDA TSLA Options Radar
+name: NVDA TSLA Premarket Options Radar
 
 on:
   schedule:
-    - cron: "15 11 * * 2-6"
-    - cron: "30 11 * * 0"
+    # 11:30 UTC = 07:30 ET during US daylight time
+    - cron: "30 11 * * 1-5"
+    # 12:30 UTC = 07:30 ET during US standard time
+    - cron: "30 12 * * 1-5"
+    - cron: "30 12 * * 0"
   workflow_dispatch:
 
 concurrency:
@@ -43,7 +46,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p data/options_snapshots reports/daily reports/weekly
-          python options_screener.py --mode auto 2>&1 | tee reports/last_run.log
+          python options_screener.py --mode auto --enforce-premarket-window 2>&1 | tee reports/last_run.log
 
       - name: Upload Artifacts
         if: always()
