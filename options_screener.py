@@ -1,52 +1,37 @@
 #!/usr/bin/env python3
 """
-全市场美股期权资金方向扫描器
-==========================================================
-目标:
-1) 覆盖全市场股票池（指数成分合并，近似全市场）
-2) 先做价格/成交/相对强弱预筛，再做期权异动深扫
-3) 综合财报、行业共振、盘面资金与大盘环境，筛选前10个“即将变盘”标的
-4) Telegram 仅推送个股方向结论（不推合约细节）
+NVDA / TSLA 盘后期权雷达
 
-依赖:
-    pip install longport yfinance pandas requests lxml
+设计原则:
+1. 放弃全市场扫描，只跟踪 NVDA 与 TSLA
+2. 日常只输出 4 块: 单合约异动榜 / 到期日强度榜 / Strike 带状联动榜 / 文字摘要
+3. 依赖前一日快照计算 OI 增量，连续运行后会越来越有价值
+4. 周末自动汇总本周连续布局与主战区域
 
-环境变量:
-    LONGPORT_APP_KEY
-    LONGPORT_APP_SECRET
-    LONGPORT_ACCESS_TOKEN
-    TELEGRAM_TOKEN
-    TELEGRAM_CHAT_ID
+数据源选择:
+- 第一版使用 yfinance
+- 原因: 对本项目最关键的字段 bid/ask/iv/volume/openInterest/lastTradeDate 都能一次拿到
+- OCC 更适合后续替换成“官方 OI 源”，但第一版会显著增加接入复杂度
+
+运行:
+    python options_screener.py --mode daily
+    python options_screener.py --mode weekly
 """
 
 from __future__ import annotations
 
 import argparse
 import html
-import json
 import logging
 import math
 import os
-import re
 import time
-import traceback
-from email.utils import parsedate_to_datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from io import StringIO
+from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-import xml.etree.ElementTree as ET
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 import requests
-
-try:
-    from longport.openapi import Config, QuoteContext
-except Exception:
-    Config = None
-    QuoteContext = None
 
 try:
     import yfinance as yf  # type: ignore
@@ -62,2313 +47,1101 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# 近似全市场的可维护股票池来源（免费、稳定）
-UNIVERSE_SOURCES: List[Tuple[str, List[str], str]] = [
-    (
-        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-        ["Symbol"],
-        "S&P 500",
-    ),
-    (
-        "https://en.wikipedia.org/wiki/Nasdaq-100",
-        ["Ticker", "Ticker symbol"],
-        "Nasdaq-100",
-    ),
-    (
-        "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies",
-        ["Symbol"],
-        "S&P 400",
-    ),
-    (
-        "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies",
-        ["Symbol"],
-        "S&P 600",
-    ),
-    (
-        "https://en.wikipedia.org/wiki/Russell_2000_Index",
-        ["Ticker symbol", "Ticker", "Symbol"],
-        "Russell 2000",
-    ),
-]
+DEFAULT_TICKERS = ["NVDA", "TSLA"]
 
-SEED_TICKERS = [
-    "AAPL",
-    "MSFT",
-    "NVDA",
-    "AMZN",
-    "META",
-    "GOOGL",
-    "TSLA",
-    "AMD",
-    "AVGO",
-    "QCOM",
-    "MU",
-    "TSM",
-    "ORCL",
-    "SPY",
-    "QQQ",
-]
-
-NAME_OVERRIDES = {
-    "TSLA": "特斯拉",
-    "NVDA": "英伟达",
-    "SPY": "SPY",
-    "QQQ": "QQQ",
-    "AMD": "AMD",
-    "MU": "美光科技",
-    "META": "Meta",
-    "ORCL": "甲骨文",
-    "MSFT": "微软",
-    "AAPL": "苹果",
-    "AVGO": "博通",
-    "QCOM": "高通",
-    "TSM": "台积电",
-}
-
-VALID_TICKER_RE = re.compile(r"^[A-Z][A-Z0-9\.-]{0,9}$")
-
-# 新闻催化关键词（英文为主，适配主流美股新闻流）
-MNA_KEYWORDS = [
-    "acquisition",
-    "acquire",
-    "merger",
-    "merge",
-    "buyout",
-    "takeover",
-    "deal talks",
-    "strategic alternatives",
-    "exploring sale",
-    "go-private",
-]
-
-INVEST_KEYWORDS = [
-    "investment",
-    "invests",
-    "stake",
-    "strategic investment",
-    "backed by",
-    "joint venture",
-    "partnership",
-    "collaboration",
-    "licensing deal",
-    "license agreement",
-]
-
-BIO_CATALYST_KEYWORDS = [
-    "fda",
-    "pdufa",
-    "nda",
-    "bla",
-    "adcom",
-    "phase 2",
-    "phase 3",
-    "clinical trial",
-    "topline",
-    "primary endpoint",
-    "breakthrough therapy",
-    "priority review",
-    "approval",
-    "launch",
-    "commercial launch",
-]
-
-POSITIVE_CATALYST_KEYWORDS = [
-    "major contract",
-    "wins contract",
-    "new order",
-    "supply agreement",
-    "exclusive",
-    "authorization",
-]
-
-NEGATIVE_CATALYST_KEYWORDS = [
-    "secondary offering",
-    "public offering",
-    "dilution",
-    "delay",
-    "trial halt",
-    "safety concern",
-    "complete response letter",
-    "crl",
-    "reject",
-    "denied",
-    "missed endpoint",
-    "guidance cut",
-    "downgrade",
-]
-
-SPECULATIVE_KEYWORDS = [
-    "rumor",
-    "reportedly",
-    "people familiar",
-    "according to sources",
-    "said to be",
-    "in talks",
-]
-
-BIO_SECTOR_HINTS = [
-    "biotech",
-    "biotechnology",
-    "pharmaceutical",
-    "drug",
-    "life sciences",
-    "healthcare",
-    "medical",
+DAILY_FIELDS = [
+    "trade_date",
+    "ticker",
+    "expiration",
+    "dte",
+    "option_type",
+    "contract_symbol",
+    "strike",
+    "last_price",
+    "bid",
+    "ask",
+    "mid",
+    "volume",
+    "open_interest",
+    "implied_volatility",
+    "last_trade_date",
+    "underlying_close",
+    "underlying_change_pct",
+    "spread_pct",
+    "distance_pct",
+    "prev_open_interest",
+    "oi_change",
+    "oi_change_pct",
+    "volume_oi_ratio",
+    "oi_score",
+    "flow_score",
+    "liquidity_score",
+    "location_score",
+    "structure_score",
+    "continuity_days",
+    "continuity_score",
+    "band_id",
+    "band_label",
+    "total_score",
 ]
 
 
-HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
-
-
-@dataclass
-class EventRow:
-    symbol: str
-    underlying: str
-    underlying_name: str
-    side: str
-    expiry: str
-    dte: int
-    strike: float
-    underlying_price: float
-    moneyness_pct: float
-    last: float
-    volume: int
-    open_interest: int
-    vol_oi_ratio: float
-    turnover: float
-    implied_volatility_pct: float
-    big_order_flag: bool
-    volume_spike_flag: bool
-    big_order_score: float
-    volume_spike_score: float
-    liquidity_score: float
-    total_score: float
-    source: str
-
-
-def to_float(v: Any, default: float = 0.0) -> float:
-    if v is None:
+def safe_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
         return default
     try:
-        return float(v)
+        return float(value)
     except Exception:
         return default
 
 
-def to_int(v: Any, default: int = 0) -> int:
-    if v is None:
+def safe_int(value: Any, default: int = 0) -> int:
+    if value is None:
         return default
     try:
-        return int(v)
+        return int(value)
     except Exception:
         return default
 
 
-def clip(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
+def clip(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
 
 
-def parse_expiry_date(exp: Any) -> date:
-    s = str(exp).strip()
-    if not s:
-        raise ValueError("empty expiry")
-    for fmt in ("%Y%m%d", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except Exception:
-            pass
-    return pd.to_datetime(s).date()
-
-
-def dte_from_yyyymmdd(exp: str) -> int:
-    return (parse_expiry_date(exp) - date.today()).days
-
-
-def chunks(items: List[str], size: int) -> Iterable[List[str]]:
-    for i in range(0, len(items), size):
-        yield items[i : i + size]
-
-
-def normalize_yf_ticker(raw: Any) -> str:
-    t = str(raw).strip().upper().replace(" ", "")
-    if not t:
+def fmt_strike(value: float) -> str:
+    if pd.isna(value):
         return ""
-    t = t.replace("/", "-").replace("_", "-")
-    # yfinance 对美股类股一般使用 '-'，如 BRK-B
-    t = t.replace(".", "-")
-    if not VALID_TICKER_RE.match(t):
+    if abs(value - round(value)) < 1e-9:
+        return str(int(round(value)))
+    return f"{value:.1f}".rstrip("0").rstrip(".")
+
+
+def fmt_pct(value: float, digits: int = 1) -> str:
+    if pd.isna(value):
         return ""
-    if t.startswith("^"):
+    return f"{value * 100:.{digits}f}%"
+
+
+def fmt_num(value: float, digits: int = 1) -> str:
+    if pd.isna(value):
         return ""
-    return t
+    return f"{value:.{digits}f}"
 
 
-def to_longbridge_symbol(yf_ticker: str) -> str:
-    # LongBridge 通常使用 '.' 作为类股分隔，如 BRK.B.US
-    return f"{yf_ticker.replace('-', '.')}.US"
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
 
 
-def from_underlying_to_yf(underlying: str) -> str:
-    return underlying.replace(".US", "").replace(".", "-")
-
-
-def display_name(ticker: str) -> str:
-    return NAME_OVERRIDES.get(ticker, ticker)
-
-
-def _fetch_text(url: str, timeout: int = 20) -> str:
+def parse_csv_date_from_name(path: Path) -> Optional[date]:
+    stem = path.stem
+    parts = stem.split("_")
+    if not parts:
+        return None
     try:
-        r = requests.get(url, headers=HTTP_HEADERS, timeout=timeout)
-        if r.status_code == 200:
-            return r.text
+        return datetime.strptime(parts[-1], "%Y-%m-%d").date()
     except Exception:
-        return ""
-    return ""
+        return None
 
 
-# ══════════════════════════════════════════════════════════════
-# 模块1: 全市场股票池
-# ══════════════════════════════════════════════════════════════
-
-def _wiki_tickers(url: str, preferred_cols: List[str], label: str) -> List[str]:
-    out: List[str] = []
-    try:
-        html_text = _fetch_text(url)
-        if not html_text:
-            raise RuntimeError("empty response")
-        tables = pd.read_html(StringIO(html_text))
-    except Exception as e:
-        log.warning("%s 获取失败: %s", label, e)
-        return out
-
-    for tb in tables:
-        hit_col = None
-        for c in preferred_cols:
-            if c in tb.columns:
-                hit_col = c
-                break
-
-        if hit_col is None:
-            # 兜底: 找包含 symbol/ticker 的列名
-            for c in tb.columns:
-                cs = str(c).lower()
-                if "symbol" in cs or "ticker" in cs:
-                    hit_col = c
-                    break
-
-        if hit_col is None:
-            continue
-
-        values = [normalize_yf_ticker(x) for x in tb[hit_col].dropna().tolist()]
-        values = [x for x in values if x]
-        if values:
-            out.extend(values)
-            break
-
-    uniq = sorted(set(out))
-    log.info("  %s: %d", label, len(uniq))
-    return uniq
-
-
-def _nasdaq_trader_tickers() -> List[str]:
-    urls = [
-        "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
-        "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
-    ]
-    out: List[str] = []
-    for url in urls:
-        txt = _fetch_text(url)
-        if not txt or "|" not in txt:
-            continue
-        try:
-            df = pd.read_csv(StringIO(txt), sep="|")
-        except Exception:
-            continue
-        for col in ["Symbol", "ACT Symbol", "NASDAQ Symbol", "Ticker"]:
-            if col not in df.columns:
-                continue
-            vals = [normalize_yf_ticker(x) for x in df[col].dropna().tolist()]
-            vals = [x for x in vals if x and x != "FILE CREATION TIME"]
-            out.extend(vals)
-    return sorted(set(out))
-
-
-def _sec_company_tickers(limit: int = 12000) -> List[str]:
-    url = "https://www.sec.gov/files/company_tickers.json"
-    txt = _fetch_text(url)
-    if not txt:
+def list_snapshot_files(snapshot_dir: Path) -> List[Path]:
+    if not snapshot_dir.exists():
         return []
-    try:
-        data = json.loads(txt)
-    except Exception:
-        return []
-
-    out: List[str] = []
-    if isinstance(data, dict):
-        for _, row in data.items():
-            if not isinstance(row, dict):
-                continue
-            t = normalize_yf_ticker(row.get("ticker", ""))
-            if t:
-                out.append(t)
-            if len(out) >= limit:
-                break
-    return sorted(set(out))
+    files = [p for p in snapshot_dir.glob("options_*.csv") if p.is_file()]
+    return sorted(files)
 
 
-def build_broad_universe(limit: int, min_expected: int) -> List[str]:
-    tickers = set(SEED_TICKERS)
-    log.info("构建全市场股票池...")
-    for url, cols, label in UNIVERSE_SOURCES:
-        tickers.update(_wiki_tickers(url, cols, label))
-
-    if len(tickers) < min_expected:
-        ndaq = _nasdaq_trader_tickers()
-        tickers.update(ndaq)
-        log.info("  NasdaqTrader 补充: %d", len(ndaq))
-
-    if len(tickers) < min_expected:
-        sec = _sec_company_tickers()
-        tickers.update(sec)
-        log.info("  SEC Ticker 补充: %d", len(sec))
-
-    # 去掉明显不适配期权扫描的符号
-    clean = []
-    for t in sorted(tickers):
-        if len(t) > 7:
+def latest_snapshot_before(snapshot_dir: Path, trade_date: date) -> Optional[Path]:
+    candidates: List[Tuple[date, Path]] = []
+    for path in list_snapshot_files(snapshot_dir):
+        d = parse_csv_date_from_name(path)
+        if d is None or d >= trade_date:
             continue
-        if t in {"N/A", "NONE"}:
-            continue
-        clean.append(t)
-
-    if limit > 0:
-        clean = clean[:limit]
-
-    if len(clean) < min_expected:
-        log.warning("股票池低于预期: %d < %d，可能存在数据源访问异常", len(clean), min_expected)
-
-    log.info("  股票池合计: %d\n", len(clean))
-    return clean
-
-
-# ══════════════════════════════════════════════════════════════
-# 模块2: 大盘环境
-# ══════════════════════════════════════════════════════════════
-
-def _download_single_history(ticker: str, period: str = "6mo") -> pd.DataFrame:
-    if yf is None:
-        return pd.DataFrame()
-    try:
-        df = yf.download(
-            ticker,
-            period=period,
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-        )
-    except Exception:
-        return pd.DataFrame()
-    if df is None or df.empty:
-        return pd.DataFrame()
-    return df.dropna(how="all")
-
-
-def _as_numeric_series(obj: Any) -> Optional[pd.Series]:
-    """
-    将任意输入稳定转换为 1 维数值序列，兼容 yfinance 多层列结构。
-    """
-    if obj is None:
-        return None
-
-    if isinstance(obj, pd.Series):
-        s = pd.to_numeric(obj, errors="coerce").dropna()
-        return s if not s.empty else None
-
-    if isinstance(obj, pd.DataFrame):
-        if obj.empty:
-            return None
-        for col in obj.columns:
-            try:
-                s = pd.to_numeric(obj[col], errors="coerce").dropna()
-            except Exception:
-                continue
-            if not s.empty:
-                return s
-        return None
-
-    try:
-        s = pd.to_numeric(pd.Series(obj), errors="coerce").dropna()
-    except Exception:
-        return None
-    return s if not s.empty else None
-
-
-def _close_series(hist: pd.DataFrame) -> Optional[pd.Series]:
-    if hist is None or hist.empty:
-        return None
-
-    # MultiIndex 情况先按 level 取列
-    if isinstance(hist.columns, pd.MultiIndex):
-        for key in ("Close", "Adj Close"):
-            for lv in (0, 1):
-                try:
-                    sub = hist.xs(key, axis=1, level=lv, drop_level=True)
-                except Exception:
-                    continue
-                s = _as_numeric_series(sub)
-                if s is not None:
-                    return s
-
-    for key in ("Close", "Adj Close"):
-        if key in hist.columns:
-            s = _as_numeric_series(hist[key])
-            if s is not None:
-                return s
-
-    # 兜底：按列名模糊匹配
-    for c in hist.columns:
-        cs = str(c).lower()
-        if "close" in cs:
-            s = _as_numeric_series(hist[c])
-            if s is not None:
-                return s
-    return None
-
-
-def get_market_regime() -> Dict[str, Any]:
-    out = {
-        "score": 0.0,
-        "label": "中性",
-        "vix": 0.0,
-        "spy_ret20": 0.0,
-        "spy_above_ma20": False,
-        "qqq_above_ma20": False,
-    }
-
-    spy = _download_single_history("SPY", period="6mo")
-    qqq = _download_single_history("QQQ", period="6mo")
-    vix = _download_single_history("^VIX", period="3mo")
-
-    spy_close = _close_series(spy)
-    qqq_close = _close_series(qqq)
-    vix_close = _close_series(vix)
-
-    if spy_close is None or qqq_close is None:
-        return out
-
-    if len(spy_close) >= 21:
-        out["spy_ret20"] = float((spy_close.iloc[-1] / spy_close.iloc[-21] - 1) * 100)
-
-    score = 0.0
-
-    def _trend_score(close: pd.Series) -> Tuple[float, bool]:
-        if len(close) < 65:
-            return 0.0, False
-        ma20 = close.rolling(20).mean()
-        ma60 = close.rolling(60).mean()
-        ma20_last = to_float(ma20.iloc[-1], 0.0)
-        ma20_prev = to_float(ma20.iloc[-5], ma20_last)
-        ma60_last = to_float(ma60.iloc[-1], 0.0)
-        c = to_float(close.iloc[-1], 0.0)
-
-        s = 0.0
-        above20 = c >= ma20_last if ma20_last > 0 else False
-        if above20:
-            s += 8
-        else:
-            s -= 8
-
-        if ma20_last >= ma60_last and ma60_last > 0:
-            s += 6
-        else:
-            s -= 6
-
-        slope20 = (ma20_last / (ma20_prev + 1e-9) - 1) * 100
-        if slope20 >= 0:
-            s += 4
-        else:
-            s -= 4
-
-        return s, above20
-
-    spy_s, spy_above = _trend_score(spy_close)
-    qqq_s, qqq_above = _trend_score(qqq_close)
-    score += spy_s + qqq_s
-
-    out["spy_above_ma20"] = spy_above
-    out["qqq_above_ma20"] = qqq_above
-
-    if vix_close is not None and not vix_close.empty:
-        v = to_float(vix_close.iloc[-1], 0.0)
-        out["vix"] = v
-        if v >= 30:
-            score -= 20
-        elif v >= 24:
-            score -= 10
-        elif v <= 16:
-            score += 5
-
-    score = clip(score, -45, 45)
-    out["score"] = round(score, 2)
-    if score >= 12:
-        out["label"] = "风险偏好(偏多)"
-    elif score <= -12:
-        out["label"] = "风险规避(偏空)"
-    else:
-        out["label"] = "中性震荡"
-
-    return out
-
-
-# ══════════════════════════════════════════════════════════════
-# 模块3: 全市场预筛
-# ══════════════════════════════════════════════════════════════
-
-def _extract_hist_from_batch(batch_df: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    if batch_df is None or batch_df.empty:
-        return pd.DataFrame()
-
-    if not isinstance(batch_df.columns, pd.MultiIndex):
-        return batch_df.copy().dropna(how="all")
-
-    cols = batch_df.columns
-    lv0 = set(cols.get_level_values(0))
-    lv1 = set(cols.get_level_values(1))
-
-    try:
-        if ticker in lv0:
-            return batch_df[ticker].copy().dropna(how="all")
-        if ticker in lv1:
-            return batch_df.xs(ticker, axis=1, level=1, drop_level=True).copy().dropna(how="all")
-    except Exception:
-        return pd.DataFrame()
-
-    return pd.DataFrame()
-
-
-def download_history_for_universe(
-    tickers: List[str],
-    period: str,
-    chunk_size: int,
-) -> Dict[str, pd.DataFrame]:
-    out: Dict[str, pd.DataFrame] = {}
-    if yf is None:
-        return out
-
-    for batch in chunks(tickers, chunk_size):
-        try:
-            data = yf.download(
-                tickers=batch,
-                period=period,
-                interval="1d",
-                auto_adjust=False,
-                progress=False,
-                threads=True,
-                group_by="ticker",
-            )
-        except Exception as e:
-            log.warning("历史数据批量下载失败(%d只): %s", len(batch), e)
-            continue
-
-        if data is None or data.empty:
-            continue
-
-        if len(batch) == 1:
-            out[batch[0]] = data.copy().dropna(how="all")
-            continue
-
-        for tk in batch:
-            h = _extract_hist_from_batch(data, tk)
-            if not h.empty:
-                out[tk] = h
-
-        time.sleep(0.05)
-
-    return out
-
-
-def _series(df: pd.DataFrame, key: str) -> Optional[pd.Series]:
-    if df is None or df.empty:
-        return None
-
-    if isinstance(df.columns, pd.MultiIndex):
-        for lv in (0, 1):
-            try:
-                sub = df.xs(key, axis=1, level=lv, drop_level=True)
-            except Exception:
-                continue
-            s = _as_numeric_series(sub)
-            if s is not None:
-                return s
-
-    if key in df.columns:
-        s = _as_numeric_series(df[key])
-        if s is not None:
-            return s
-    for c in df.columns:
-        if str(c).lower() == key.lower():
-            s = _as_numeric_series(df[c])
-            if s is not None:
-                return s
-    return None
-
-
-def calc_prefilter_metrics(
-    ticker: str,
-    hist: pd.DataFrame,
-    spy_ret20: float,
-    cfg: argparse.Namespace,
-) -> Optional[Dict[str, Any]]:
-    close = _series(hist, "Close")
-    if close is None:
-        close = _series(hist, "Adj Close")
-    high = _series(hist, "High")
-    low = _series(hist, "Low")
-    volume = _series(hist, "Volume")
-
-    if close is None or volume is None:
-        return None
-    if len(close) < 70 or len(volume) < 70:
-        return None
-
-    # 对齐索引
-    idx = close.index.intersection(volume.index)
-    if high is not None:
-        idx = idx.intersection(high.index)
-    if low is not None:
-        idx = idx.intersection(low.index)
-
-    close = close.loc[idx]
-    volume = volume.loc[idx]
-    high = high.loc[idx] if high is not None else close
-    low = low.loc[idx] if low is not None else close
-
-    if len(close) < 70:
-        return None
-
-    price = to_float(close.iloc[-1], 0.0)
-    if price < cfg.min_price:
-        return None
-
-    avg_vol20 = float(volume.iloc[-20:].mean())
-    if avg_vol20 < cfg.min_avg_volume:
-        return None
-
-    dollar = close * volume
-    if len(dollar) >= 21:
-        avg_turnover20 = float(dollar.iloc[-21:-1].mean())
-    else:
-        avg_turnover20 = float(dollar.iloc[-20:].mean())
-
-    if avg_turnover20 < cfg.min_avg_turnover_m * 1e6:
-        return None
-
-    today_turnover = float(dollar.iloc[-1])
-    turnover_ratio_20d = today_turnover / (avg_turnover20 + 1)
-
-    day_chg_pct = float((close.iloc[-1] / close.iloc[-2] - 1) * 100)
-    ret20 = float((close.iloc[-1] / close.iloc[-21] - 1) * 100)
-    rs20_pct = ret20 - spy_ret20
-
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            (high - low).abs(),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-
-    atr14 = tr.rolling(14).mean()
-    atr_ratio = (atr14 / (close + 1e-9)).dropna()
-    if atr_ratio.empty:
-        return None
-
-    atr_now = float(atr_ratio.iloc[-1])
-    atr_ref = float(atr_ratio.iloc[-61:-1].median()) if len(atr_ratio) >= 62 else float(atr_ratio.median())
-    compression = max(0.0, (atr_ref - atr_now) / (atr_ref + 1e-9))
-    compression_score = min(compression * 120, 20)
-
-    hi20 = float(close.iloc[-20:].max())
-    lo20 = float(close.iloc[-20:].min())
-    range_pos = (price - lo20) / (hi20 - lo20 + 1e-9)
-
-    hi_today = float(high.iloc[-1])
-    lo_today = float(low.iloc[-1])
-    if hi_today > lo_today:
-        clv = ((price - lo_today) - (hi_today - price)) / (hi_today - lo_today)
-    else:
-        clv = 0.0
-
-    activity_score = min(max(turnover_ratio_20d - 1.0, 0.0) * 14, 20)
-    tension_score = min(abs(range_pos - 0.5) * 24, 12)
-    rs_abs_score = min(abs(rs20_pct) * 1.2, 12)
-
-    technical_bias = (range_pos - 0.5) * 18 + clip(rs20_pct, -8, 8) * 0.6 + clv * 6
-    technical_bias = clip(technical_bias, -15, 15)
-
-    prefilter_score = (
-        compression_score * 0.35
-        + activity_score * 0.35
-        + tension_score * 0.20
-        + rs_abs_score * 0.10
-    )
-
-    return {
-        "ticker": ticker,
-        "name": display_name(ticker),
-        "underlying": to_longbridge_symbol(ticker),
-        "price": round(price, 2),
-        "day_chg_pct": round(day_chg_pct, 2),
-        "avg_turnover20_m": round(avg_turnover20 / 1e6, 2),
-        "today_turnover_m": round(today_turnover / 1e6, 2),
-        "turnover_ratio_20d": round(turnover_ratio_20d, 2),
-        "rs20_pct": round(rs20_pct, 2),
-        "compression_score": round(compression_score, 2),
-        "technical_bias": round(technical_bias, 2),
-        "clv": round(clv, 3),
-        "prefilter_score": round(prefilter_score, 2),
-    }
-
-
-def prefilter_universe(
-    tickers: List[str],
-    spy_ret20: float,
-    cfg: argparse.Namespace,
-) -> pd.DataFrame:
-    if not tickers:
-        return pd.DataFrame()
-
-    hist_map = download_history_for_universe(
-        tickers=tickers,
-        period=cfg.prefilter_period,
-        chunk_size=cfg.yf_chunk_size,
-    )
-
-    rows: List[Dict[str, Any]] = []
-    for tk, hist in hist_map.items():
-        try:
-            row = calc_prefilter_metrics(tk, hist, spy_ret20, cfg)
-            if row:
-                rows.append(row)
-        except Exception:
-            continue
-
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows).sort_values("prefilter_score", ascending=False).reset_index(drop=True)
-    return df.head(cfg.prefilter_top)
-
-
-# ══════════════════════════════════════════════════════════════
-# 模块4: 期权异动（长桥+兜底）
-# ══════════════════════════════════════════════════════════════
-
-def safe_quote_last(ctx: QuoteContext, underlying: str) -> float:
-    try:
-        quotes = ctx.quote([underlying])
-        if quotes:
-            return to_float(getattr(quotes[0], "last_done", None), 0.0)
-    except Exception:
-        pass
-    return 0.0
-
-
-def collect_option_symbols(
-    ctx: QuoteContext,
-    underlying: str,
-    min_dte: int,
-    max_dte: int,
-) -> List[Tuple[str, str]]:
-    out: List[Tuple[str, str]] = []
-    try:
-        expiries = ctx.option_chain_expiry_date_list(underlying)
-    except Exception as e:
-        log.warning("%s 到期日列表读取失败: %s", underlying, e)
-        return out
-
-    for exp in expiries:
-        exp_str = str(exp)
-        try:
-            dte = dte_from_yyyymmdd(exp_str)
-        except Exception:
-            continue
-        if dte < min_dte or dte > max_dte:
-            continue
-
-        try:
-            chain = ctx.option_chain_info_by_date(underlying, parse_expiry_date(exp_str))
-        except Exception:
-            continue
-
-        for row in chain:
-            cs = getattr(row, "call_symbol", None)
-            ps = getattr(row, "put_symbol", None)
-            if cs:
-                out.append((str(cs), exp_str))
-            if ps:
-                out.append((str(ps), exp_str))
-
-    return out
-
-
-def side_from_symbol(opt_symbol: str) -> str:
-    s = opt_symbol.upper()
-    tail = s[-15:]
-    if "C" in tail:
-        return "C"
-    if "P" in tail:
-        return "P"
-    return "?"
-
-
-def _extract_option_fields(q: Any) -> Optional[Dict[str, Any]]:
-    symbol = str(getattr(q, "symbol", "") or "")
-    if not symbol:
-        return None
-
-    oi_direct = getattr(q, "open_interest", None)
-    iv_direct = getattr(q, "implied_volatility", None)
-    strike_direct = getattr(q, "strike_price", None)
-    expiry_direct = getattr(q, "expiry_date", None)
-    direction_direct = getattr(q, "direction", None)
-
-    if any(v is not None for v in [oi_direct, iv_direct, strike_direct, expiry_direct]):
-        side = side_from_symbol(symbol)
-        if direction_direct is not None:
-            d = str(direction_direct).lower()
-            if "call" in d:
-                side = "C"
-            elif "put" in d:
-                side = "P"
-        return {
-            "symbol": symbol,
-            "last": to_float(getattr(q, "last_done", None), 0.0),
-            "volume": to_int(getattr(q, "volume", None), 0),
-            "oi": to_int(oi_direct, 0),
-            "iv_pct": to_float(iv_direct, 0.0) * 100,
-            "strike": to_float(strike_direct, 0.0),
-            "expiry": str(expiry_direct or ""),
-            "turnover": to_float(getattr(q, "turnover", None), 0.0),
-            "side": side,
-        }
-
-    ext = getattr(q, "option_extend", None)
-    if ext is None:
-        return None
-
-    return {
-        "symbol": symbol,
-        "last": to_float(getattr(q, "last_done", None), 0.0),
-        "volume": to_int(getattr(q, "volume", None), 0) or to_int(getattr(ext, "volume", None), 0),
-        "oi": to_int(getattr(ext, "open_interest", None), 0),
-        "iv_pct": to_float(getattr(ext, "implied_volatility", None), 0.0) * 100,
-        "strike": to_float(getattr(ext, "strike_price", None), 0.0),
-        "expiry": str(getattr(ext, "expiry_date", "") or ""),
-        "turnover": to_float(getattr(q, "turnover", None), 0.0),
-        "side": side_from_symbol(symbol),
-    }
-
-
-def _rank_score(rank_value: float, top_n: int) -> float:
-    if top_n <= 0 or rank_value > top_n:
-        return 0.0
-    return round((top_n - rank_value + 1) / top_n * 100, 2)
-
-
-def build_events_from_quote_rows(
-    quote_rows: List[Dict[str, Any]],
-    ticker: str,
-    underlying: str,
-    cfg: argparse.Namespace,
-    source_label: str,
-) -> List[EventRow]:
-    if not quote_rows:
-        return []
-
-    df = pd.DataFrame(quote_rows)
-    if df.empty:
-        return []
-
-    df["vol_oi_ratio"] = df["volume"] / (df["oi"] + 1)
-    df["turnover_rank"] = df["turnover"].rank(method="min", ascending=False)
-    df["volume_rank"] = df["volume"].rank(method="min", ascending=False)
-    df["voloi_rank"] = df["vol_oi_ratio"].rank(method="min", ascending=False)
-    df["volume_combo_rank"] = df["volume_rank"] * 0.7 + df["voloi_rank"] * 0.3
-
-    total_n = len(df)
-    big_top_n = max(1, int(math.ceil(total_n * cfg.big_order_top_pct)))
-    volume_top_n = max(1, int(math.ceil(total_n * cfg.volume_spike_top_pct)))
-
-    result: List[EventRow] = []
-    name = display_name(ticker)
-
-    for _, row in df.iterrows():
-        big_flag = bool(float(row["turnover"]) > 0 and float(row["turnover_rank"]) <= big_top_n)
-        vol_flag = bool(float(row["volume"]) > 0 and float(row["volume_combo_rank"]) <= volume_top_n)
-        if not big_flag and not vol_flag:
-            continue
-
-        big_score = _rank_score(float(row["turnover_rank"]), big_top_n) if big_flag else 0.0
-        vol_score = _rank_score(float(row["volume_combo_rank"]), volume_top_n) if vol_flag else 0.0
-
-        total_score = round(big_score * 0.55 + vol_score * 0.45, 2)
-        vol_oi_ratio = round(int(row["volume"]) / (int(row["oi"]) + 1), 3)
-
-        result.append(
-            EventRow(
-                symbol=str(row["symbol"]),
-                underlying=underlying,
-                underlying_name=name,
-                side=str(row["side"]),
-                expiry=str(row["expiry"]),
-                dte=int(row["dte"]),
-                strike=round(float(row["strike"]), 2),
-                underlying_price=round(float(row["underlying_price"]), 2),
-                moneyness_pct=round(float(row["moneyness_pct"]), 2),
-                last=round(float(row["last"]), 4),
-                volume=int(row["volume"]),
-                open_interest=int(row["oi"]),
-                vol_oi_ratio=vol_oi_ratio,
-                turnover=round(float(row["turnover"]), 2),
-                implied_volatility_pct=round(float(row["iv_pct"]), 2),
-                big_order_flag=big_flag,
-                volume_spike_flag=vol_flag,
-                big_order_score=big_score,
-                volume_spike_score=vol_score,
-                liquidity_score=0.0,
-                total_score=total_score,
-                source=source_label,
-            )
-        )
-
-    result.sort(key=lambda x: x.total_score, reverse=True)
-    return result[: cfg.max_events_per_underlying]
-
-
-def scan_underlying_longbridge(
-    ctx: QuoteContext,
-    ticker: str,
-    underlying: str,
-    cfg: argparse.Namespace,
-) -> List[EventRow]:
-    underlying_price = safe_quote_last(ctx, underlying)
-    symbols_with_exp = collect_option_symbols(ctx, underlying, cfg.min_dte, cfg.max_dte)
-    if not symbols_with_exp:
-        return []
-
-    exp_map = {s: exp for s, exp in symbols_with_exp}
-    symbols = [s for s, _ in symbols_with_exp]
-
-    quote_rows: List[Dict[str, Any]] = []
-
-    for batch in chunks(symbols, 500):
-        try:
-            quotes = ctx.option_quote(batch)
-        except Exception:
-            continue
-
-        for q in quotes:
-            row = _extract_option_fields(q)
-            if row is None:
-                continue
-
-            symbol = row["symbol"]
-            expiry = str(row["expiry"] or exp_map.get(symbol, ""))
-            if not expiry:
-                continue
-
-            try:
-                dte = dte_from_yyyymmdd(expiry)
-            except Exception:
-                continue
-            if dte < cfg.min_dte or dte > cfg.max_dte:
-                continue
-
-            strike = to_float(row["strike"], 0.0)
-            last = to_float(row["last"], 0.0)
-            volume = to_int(row["volume"], 0)
-            oi = to_int(row["oi"], 0)
-            iv = to_float(row["iv_pct"], 0.0)
-            side = str(row["side"])
-
-            turnover = to_float(row["turnover"], 0.0)
-            if turnover <= 0 and last > 0 and volume > 0:
-                turnover = last * volume * 100
-
-            moneyness_pct = 0.0
-            if underlying_price > 0 and strike > 0:
-                moneyness_pct = (strike - underlying_price) / underlying_price * 100
-
-            quote_rows.append(
-                {
-                    "symbol": symbol,
-                    "side": side,
-                    "expiry": expiry,
-                    "dte": dte,
-                    "strike": strike,
-                    "underlying_price": underlying_price,
-                    "moneyness_pct": moneyness_pct,
-                    "last": last,
-                    "volume": volume,
-                    "oi": oi,
-                    "turnover": turnover,
-                    "iv_pct": iv,
-                }
-            )
-
-    if not quote_rows:
-        return []
-
-    return build_events_from_quote_rows(
-        quote_rows=quote_rows,
-        ticker=ticker,
-        underlying=underlying,
-        cfg=cfg,
-        source_label="longbridge",
-    )
-
-
-def scan_underlying_yf(
-    ticker: str,
-    underlying: str,
-    cfg: argparse.Namespace,
-) -> List[EventRow]:
-    if yf is None:
-        return []
-
-    tk = yf.Ticker(ticker)
-    quote_rows: List[Dict[str, Any]] = []
-
-    try:
-        hist = tk.history(period="5d", interval="1d", auto_adjust=True)
-        underlying_price = float(hist["Close"].iloc[-1]) if not hist.empty else 0.0
-    except Exception:
-        underlying_price = 0.0
-
-    try:
-        expiries = list(tk.options or [])
-    except Exception:
-        expiries = []
-
-    for exp in expiries:
-        try:
-            dte = dte_from_yyyymmdd(str(exp))
-        except Exception:
-            continue
-        if dte < cfg.min_dte or dte > cfg.max_dte:
-            continue
-
-        try:
-            chain = tk.option_chain(exp)
-            calls = chain.calls.copy().fillna(0)
-            puts = chain.puts.copy().fillna(0)
-        except Exception:
-            continue
-
-        for side, df in [("C", calls), ("P", puts)]:
-            if df is None or df.empty:
-                continue
-            for _, row in df.iterrows():
-                symbol = str(row.get("contractSymbol", "") or "")
-                strike = to_float(row.get("strike", 0), 0.0)
-                last = to_float(row.get("lastPrice", 0), 0.0)
-                volume = to_int(row.get("volume", 0), 0)
-                oi = to_int(row.get("openInterest", 0), 0)
-                iv = to_float(row.get("impliedVolatility", 0.0), 0.0) * 100
-
-                if not symbol:
-                    symbol = f"{ticker}_{side}_{exp}_{strike:.2f}"
-
-                turnover = last * max(volume, 0) * 100
-                moneyness_pct = 0.0
-                if underlying_price > 0 and strike > 0:
-                    moneyness_pct = (strike - underlying_price) / underlying_price * 100
-
-                quote_rows.append(
-                    {
-                        "symbol": symbol,
-                        "side": side,
-                        "expiry": str(exp),
-                        "dte": int(dte),
-                        "strike": strike,
-                        "underlying_price": underlying_price,
-                        "moneyness_pct": moneyness_pct,
-                        "last": last,
-                        "volume": volume,
-                        "oi": oi,
-                        "turnover": turnover,
-                        "iv_pct": iv,
-                    }
-                )
-
-    if not quote_rows:
-        return []
-
-    return build_events_from_quote_rows(
-        quote_rows=quote_rows,
-        ticker=ticker,
-        underlying=underlying,
-        cfg=cfg,
-        source_label="yfinance",
-    )
-
-
-# ══════════════════════════════════════════════════════════════
-# 模块5: 财报/行业元数据
-# ══════════════════════════════════════════════════════════════
-
-def _parse_next_earnings_from_calendar(cal: Any) -> Optional[date]:
-    today = date.today()
-    candidates: List[date] = []
-
-    try:
-        if isinstance(cal, pd.DataFrame):
-            values = cal.to_numpy().flatten().tolist()
-        elif isinstance(cal, pd.Series):
-            values = cal.to_list()
-        elif isinstance(cal, dict):
-            values = list(cal.values())
-        else:
-            values = []
-
-        for v in values:
-            dt = pd.to_datetime(v, errors="coerce")
-            if pd.isna(dt):
-                continue
-            d = dt.date()
-            if d >= today:
-                candidates.append(d)
-    except Exception:
-        pass
-
+        candidates.append((d, path))
     if not candidates:
         return None
-    return min(candidates)
+    candidates.sort(key=lambda x: x[0])
+    return candidates[-1][1]
 
 
-def _contains_any(text: str, keywords: List[str]) -> bool:
-    return any(k in text for k in keywords)
+def latest_n_snapshots_before(snapshot_dir: Path, trade_date: date, n: int) -> List[Path]:
+    candidates: List[Tuple[date, Path]] = []
+    for path in list_snapshot_files(snapshot_dir):
+        d = parse_csv_date_from_name(path)
+        if d is None or d >= trade_date:
+            continue
+        candidates.append((d, path))
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in candidates[:n]]
 
 
-def _is_bio_company(sector: str, industry: str) -> bool:
-    blob = f"{sector} {industry}".lower()
-    return any(k in blob for k in BIO_SECTOR_HINTS)
-
-
-def _extract_news_fields(item: Dict[str, Any]) -> Tuple[str, str, str, Optional[datetime]]:
-    title = ""
-    summary = ""
-    url = ""
-    pub_dt: Optional[datetime] = None
-
-    if not isinstance(item, dict):
-        return title, summary, url, pub_dt
-
-    content = item.get("content")
-    if isinstance(content, dict):
-        title = str(content.get("title") or content.get("headline") or item.get("title") or "")
-        summary = str(content.get("summary") or item.get("summary") or "")
-        canon = content.get("canonicalUrl") or {}
-        if isinstance(canon, dict):
-            url = str(canon.get("url") or "")
-        if not url:
-            url = str(content.get("clickThroughUrl") or item.get("link") or "")
-        raw_date = (
-            content.get("pubDate")
-            or item.get("providerPublishTime")
-            or item.get("pubDate")
-            or item.get("published")
-        )
-    else:
-        title = str(item.get("title") or "")
-        summary = str(item.get("summary") or "")
-        url = str(item.get("link") or item.get("url") or "")
-        raw_date = item.get("providerPublishTime") or item.get("pubDate") or item.get("published")
-
+def load_snapshot(path: Optional[Path]) -> pd.DataFrame:
+    if path is None or not path.exists():
+        return pd.DataFrame()
     try:
-        if raw_date is not None:
-            if isinstance(raw_date, (int, float)):
-                pub_dt = datetime.utcfromtimestamp(float(raw_date))
-            else:
-                ts = pd.to_datetime(raw_date, errors="coerce")
-                if not pd.isna(ts):
-                    if hasattr(ts, "to_pydatetime"):
-                        pub_dt = ts.to_pydatetime()
-                    else:
-                        pub_dt = datetime(ts.year, ts.month, ts.day)
+        df = pd.read_csv(path)
     except Exception:
-        pub_dt = None
+        return pd.DataFrame()
+    return df if df is not None else pd.DataFrame()
 
-    return title.strip(), summary.strip(), url.strip(), pub_dt
 
-
-def fetch_yahoo_rss_news(ticker: str, max_items: int) -> List[Dict[str, Any]]:
-    """
-    yfinance tk.news 为空时，使用 Yahoo RSS 做兜底新闻源。
-    """
-    url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
-    txt = _fetch_text(url, timeout=15)
-    if not txt:
-        return []
-
-    try:
-        root = ET.fromstring(txt)
-    except Exception:
-        return []
-
-    out: List[Dict[str, Any]] = []
-    for item in root.findall(".//item"):
-        title = (item.findtext("title") or "").strip()
-        summary = (item.findtext("description") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        pub = (item.findtext("pubDate") or "").strip()
-        if not title and not summary:
+def load_latest_week_snapshots(snapshot_dir: Path, count: int = 5) -> List[Tuple[date, Path]]:
+    candidates: List[Tuple[date, Path]] = []
+    for path in list_snapshot_files(snapshot_dir):
+        d = parse_csv_date_from_name(path)
+        if d is None:
             continue
-
-        pub_iso = ""
-        if pub:
-            try:
-                dt = parsedate_to_datetime(pub)
-                if dt is not None:
-                    pub_iso = dt.isoformat()
-            except Exception:
-                pub_iso = ""
-
-        out.append(
-            {
-                "title": title,
-                "summary": summary,
-                "link": link,
-                "published": pub_iso,
-            }
-        )
-
-        if len(out) >= max_items:
-            break
-
-    return out
+        candidates.append((d, path))
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return list(reversed(candidates[:count]))
 
 
-def _short_text(s: str, n: int = 90) -> str:
-    t = " ".join(str(s).split())
-    if len(t) <= n:
-        return t
-    return t[: n - 3] + "..."
-
-
-def score_news_catalysts(
-    news_items: List[Dict[str, Any]],
-    is_bio: bool,
-    lookback_days: int,
-    max_items: int,
-) -> Dict[str, Any]:
-    out = {
-        "catalyst_score": 0.0,
-        "catalyst_tags": "无",
-        "catalyst_headline": "近期未检测到明确公开催化",
-        "catalyst_news_count": 0,
-    }
-    if not news_items:
-        return out
-
-    cutoff = datetime.utcnow() - timedelta(days=max(1, lookback_days))
-    total = 0.0
-    tag_weight: Dict[str, float] = {}
-    picked: List[Tuple[float, str]] = []
-    speculative_hits = 0
-    used = 0
-
-    for item in news_items:
-        if used >= max_items:
-            break
-
-        title, summary, _, pub_dt = _extract_news_fields(item)
-        if not title and not summary:
-            continue
-        if pub_dt is not None and pub_dt < cutoff:
-            continue
-
-        used += 1
-        text = f"{title} {summary}".lower()
-        item_score = 0.0
-        item_tags: List[str] = []
-
-        if _contains_any(text, MNA_KEYWORDS):
-            item_score += 5.0
-            item_tags.append("并购重组")
-
-        if _contains_any(text, INVEST_KEYWORDS):
-            item_score += 3.5
-            item_tags.append("战略投资/合作")
-
-        if _contains_any(text, BIO_CATALYST_KEYWORDS):
-            item_score += 4.5 if is_bio else 2.0
-            item_tags.append("生物医药催化")
-
-        if _contains_any(text, POSITIVE_CATALYST_KEYWORDS):
-            item_score += 2.5
-            item_tags.append("业务利好")
-
-        if _contains_any(text, NEGATIVE_CATALYST_KEYWORDS):
-            item_score -= 4.0
-            item_tags.append("风险事件")
-
-        if _contains_any(text, SPECULATIVE_KEYWORDS):
-            speculative_hits += 1
-            item_tags.append("传闻属性")
-
-        if abs(item_score) < 0.5:
-            continue
-
-        total += item_score
-        picked.append((abs(item_score), title))
-        for tg in item_tags:
-            tag_weight[tg] = tag_weight.get(tg, 0.0) + abs(item_score)
-
-    if total > 0 and speculative_hits > 0:
-        total -= min(4.0, speculative_hits * 1.2)
-    elif total < 0 and speculative_hits > 0:
-        total += min(2.0, speculative_hits * 0.6)
-
-    catalyst_score = clip(total, -18.0, 18.0)
-    if abs(catalyst_score) < 0.5:
-        return out
-
-    ordered_tags = sorted(tag_weight.items(), key=lambda x: x[1], reverse=True)
-    tag_text = "、".join([k for k, _ in ordered_tags[:3]]) if ordered_tags else "无"
-
-    if picked:
-        picked.sort(key=lambda x: x[0], reverse=True)
-        headline = _short_text(picked[0][1], 88)
-    else:
-        headline = "近期公开新闻催化信号有限"
-
-    out["catalyst_score"] = round(catalyst_score, 2)
-    out["catalyst_tags"] = tag_text
-    out["catalyst_headline"] = headline
-    out["catalyst_news_count"] = int(used)
-    return out
-
-
-def fetch_ticker_metadata(ticker: str, lookback_days: int, max_news_items: int) -> Dict[str, Any]:
-    out: Dict[str, Any] = {
-        "sector": "未知",
-        "industry": "未知",
-        "earnings_date": None,
-        "is_bio": False,
-        "catalyst_score": 0.0,
-        "catalyst_tags": "无",
-        "catalyst_headline": "近期未检测到明确公开催化",
-        "catalyst_news_count": 0,
-    }
-
+def history_last_trade_info(symbol: str) -> Tuple[date, float, float]:
     if yf is None:
+        raise RuntimeError("yfinance 未安装")
+
+    hist = yf.Ticker(symbol).history(period="10d", interval="1d", auto_adjust=False)
+    if hist is None or hist.empty or len(hist) < 2:
+        raise RuntimeError(f"{symbol} 历史行情不足")
+
+    hist = hist.dropna(subset=["Close"])
+    trade_date = pd.Timestamp(hist.index[-1]).date()
+    close = safe_float(hist["Close"].iloc[-1], 0.0)
+    prev_close = safe_float(hist["Close"].iloc[-2], close)
+    chg_pct = (close / prev_close - 1.0) * 100 if prev_close > 0 else 0.0
+    return trade_date, close, chg_pct
+
+
+def normalize_last_trade_date(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return str(value)
+    return str(ts)
+
+
+def fetch_option_snapshot(symbol: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    if yf is None:
+        raise RuntimeError("yfinance 未安装")
+
+    tk = yf.Ticker(symbol)
+    expirations = list(tk.options or [])
+    trade_date, spot, underlying_change_pct = history_last_trade_info(symbol)
+
+    rows: List[pd.DataFrame] = []
+    for exp in expirations:
+        try:
+            exp_date = pd.Timestamp(exp).date()
+        except Exception:
+            continue
+
+        dte = (exp_date - trade_date).days
+        try:
+            chain = tk.option_chain(exp)
+        except Exception as e:
+            log.warning("%s %s option_chain 失败: %s", symbol, exp, e)
+            continue
+
+        for option_type, raw in [("C", chain.calls), ("P", chain.puts)]:
+            if raw is None or raw.empty:
+                continue
+
+            tmp = raw.copy().fillna(0)
+            tmp["trade_date"] = trade_date.isoformat()
+            tmp["ticker"] = symbol
+            tmp["expiration"] = exp_date.isoformat()
+            tmp["dte"] = dte
+            tmp["option_type"] = option_type
+            tmp["underlying_close"] = spot
+            tmp["underlying_change_pct"] = underlying_change_pct
+
+            tmp["mid"] = (pd.to_numeric(tmp["bid"], errors="coerce") + pd.to_numeric(tmp["ask"], errors="coerce")) / 2.0
+            tmp["spread_pct"] = (pd.to_numeric(tmp["ask"], errors="coerce") - pd.to_numeric(tmp["bid"], errors="coerce")) / tmp["mid"].replace(0, pd.NA)
+            tmp["distance_pct"] = (pd.to_numeric(tmp["strike"], errors="coerce") - spot).abs() / max(spot, 0.01)
+            tmp["last_trade_date"] = tmp.get("lastTradeDate", "").apply(normalize_last_trade_date)
+
+            part = tmp[
+                [
+                    "trade_date",
+                    "ticker",
+                    "expiration",
+                    "dte",
+                    "option_type",
+                    "contractSymbol",
+                    "strike",
+                    "lastPrice",
+                    "bid",
+                    "ask",
+                    "mid",
+                    "volume",
+                    "openInterest",
+                    "impliedVolatility",
+                    "last_trade_date",
+                    "underlying_close",
+                    "underlying_change_pct",
+                    "spread_pct",
+                    "distance_pct",
+                ]
+            ].rename(
+                columns={
+                    "contractSymbol": "contract_symbol",
+                    "lastPrice": "last_price",
+                    "openInterest": "open_interest",
+                    "impliedVolatility": "implied_volatility",
+                }
+            )
+            rows.append(part)
+
+    if not rows:
+        raise RuntimeError(f"{symbol} 期权链为空")
+
+    out = pd.concat(rows, ignore_index=True)
+    numeric_cols = [
+        "dte",
+        "strike",
+        "last_price",
+        "bid",
+        "ask",
+        "mid",
+        "volume",
+        "open_interest",
+        "implied_volatility",
+        "underlying_close",
+        "underlying_change_pct",
+        "spread_pct",
+        "distance_pct",
+    ]
+    for col in numeric_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    meta = {
+        "ticker": symbol,
+        "trade_date": trade_date.isoformat(),
+        "underlying_close": round(spot, 2),
+        "underlying_change_pct": round(underlying_change_pct, 2),
+    }
+    return out, meta
+
+
+def merge_previous_oi(today_df: pd.DataFrame, prev_df: pd.DataFrame) -> Tuple[pd.DataFrame, bool]:
+    key = ["ticker", "expiration", "option_type", "strike"]
+    merged = today_df.copy()
+    bootstrap_mode = prev_df is None or prev_df.empty
+
+    if bootstrap_mode:
+        merged["prev_open_interest"] = merged["open_interest"].fillna(0)
+        merged["oi_change"] = 0.0
+        merged["oi_change_pct"] = 0.0
+    else:
+        prev = prev_df[key + ["open_interest"]].copy().rename(columns={"open_interest": "prev_open_interest"})
+        merged = merged.merge(prev, on=key, how="left")
+        merged["prev_open_interest"] = merged["prev_open_interest"].fillna(0)
+        merged["oi_change"] = merged["open_interest"].fillna(0) - merged["prev_open_interest"].fillna(0)
+        merged["oi_change_pct"] = merged["oi_change"] / merged["prev_open_interest"].replace(0, 1)
+
+    merged["volume_oi_ratio"] = merged["volume"].fillna(0) / merged["open_interest"].replace(0, 1)
+    return merged, bootstrap_mode
+
+
+def apply_filters(df: pd.DataFrame, cfg: argparse.Namespace) -> pd.DataFrame:
+    out = df.copy()
+    out = out[
+        (out["open_interest"] >= cfg.min_oi)
+        & (out["volume"].fillna(0) >= cfg.min_volume)
+        & (out["dte"].between(cfg.min_dte, cfg.max_dte))
+        & (out["bid"] > 0)
+        & (out["ask"] > out["bid"])
+        & (out["spread_pct"] <= cfg.max_spread_pct)
+    ].copy()
+    return out
+
+
+def assign_location_score(distance_pct: float) -> float:
+    if distance_pct <= 0.03:
+        return 100.0
+    if distance_pct <= 0.06:
+        return 80.0
+    if distance_pct <= 0.08:
+        return 60.0
+    if distance_pct <= 0.12:
+        return 35.0
+    return 10.0
+
+
+def group_adjacent_strikes(strikes: Sequence[float]) -> List[List[float]]:
+    vals = sorted(set(float(x) for x in strikes))
+    if len(vals) < 2:
+        return []
+
+    diffs = [round(vals[i] - vals[i - 1], 6) for i in range(1, len(vals)) if vals[i] > vals[i - 1]]
+    if not diffs:
+        return []
+    base_step = pd.Series(diffs).median()
+    gap_limit = max(base_step * 1.51, 1e-6)
+
+    groups: List[List[float]] = []
+    current = [vals[0]]
+    for value in vals[1:]:
+        if value - current[-1] <= gap_limit:
+            current.append(value)
+        else:
+            groups.append(current)
+            current = [value]
+    groups.append(current)
+    return [g for g in groups if len(g) >= 2]
+
+
+def assign_structure(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["structure_score"] = 0.0
+    out["band_id"] = ""
+    out["band_label"] = ""
+
+    candidates = out[
+        (out["oi_change"] > 0)
+        & (out["volume"] >= 200)
+        & (out["open_interest"] >= 500)
+    ].copy()
+
+    if candidates.empty:
         return out
 
-    tk = yf.Ticker(ticker)
+    for (ticker, expiration, option_type), group in candidates.groupby(["ticker", "expiration", "option_type"]):
+        groups = group_adjacent_strikes(group["strike"].tolist())
+        if not groups:
+            continue
 
-    try:
-        info = tk.info or {}
-        out["sector"] = str(info.get("sectorDisp") or info.get("sector") or "未知")
-        out["industry"] = str(info.get("industryDisp") or info.get("industry") or "未知")
-    except Exception:
-        pass
-    out["is_bio"] = _is_bio_company(str(out["sector"]), str(out["industry"]))
+        for band in groups:
+            label = " / ".join([f"{fmt_strike(v)}{option_type}" for v in band])
+            score = 100.0 if len(band) >= 3 else 50.0
+            band_key = f"{ticker}|{expiration}|{option_type}|{band[0]}|{band[-1]}"
+            mask = (
+                (out["ticker"] == ticker)
+                & (out["expiration"] == expiration)
+                & (out["option_type"] == option_type)
+                & (out["strike"].isin(band))
+            )
+            out.loc[mask, "structure_score"] = score
+            out.loc[mask, "band_id"] = band_key
+            out.loc[mask, "band_label"] = label
 
-    # 先用 calendar（成本较低）
-    try:
-        cal = tk.calendar
-        d = _parse_next_earnings_from_calendar(cal)
-        if d is not None:
-            out["earnings_date"] = d
-    except Exception:
-        pass
+    return out
 
-    if out["earnings_date"] is None:
-        # 再兜底 earnings_dates
-        try:
-            ed = tk.get_earnings_dates(limit=8)
-            if isinstance(ed, pd.DataFrame) and not ed.empty:
-                future: List[date] = []
-                for idx in ed.index:
-                    dt = pd.to_datetime(idx, errors="coerce")
-                    if pd.isna(dt):
-                        continue
-                    d = dt.date()
-                    if d >= date.today():
-                        future.append(d)
-                if future:
-                    out["earnings_date"] = min(future)
-        except Exception:
-            pass
 
-    # 新闻催化
-    try:
-        news_items = tk.news or []
-        if not isinstance(news_items, list):
-            news_items = []
-        if len(news_items) < 2:
-            rss_items = fetch_yahoo_rss_news(ticker, max_news_items)
-            if rss_items:
-                news_items.extend(rss_items)
+def assign_continuity(today_df: pd.DataFrame, prior_dfs: List[pd.DataFrame]) -> pd.DataFrame:
+    out = today_df.copy()
+    out["continuity_days"] = 1
+    out["continuity_score"] = 0.0
 
-        # 去重（按标题）
-        uniq_news: List[Dict[str, Any]] = []
-        seen_titles = set()
-        for it in news_items:
-            t, _, _, _ = _extract_news_fields(it if isinstance(it, dict) else {})
-            key = t.lower().strip()
-            if not key or key in seen_titles:
-                continue
-            seen_titles.add(key)
-            uniq_news.append(it if isinstance(it, dict) else {})
+    if out.empty or not prior_dfs:
+        return out
 
-        cat = score_news_catalysts(
-            news_items=uniq_news,
-            is_bio=bool(out["is_bio"]),
-            lookback_days=lookback_days,
-            max_items=max_news_items,
+    key = ["ticker", "expiration", "option_type", "strike"]
+    positive_maps: List[set] = []
+    for df in prior_dfs:
+        if df is None or df.empty or "oi_change" not in df.columns:
+            positive_maps.append(set())
+            continue
+        positive = df[df["oi_change"] > 0]
+        positive_maps.append(set(tuple(row) for row in positive[key].itertuples(index=False, name=None)))
+
+    days_list: List[int] = []
+    score_list: List[float] = []
+    for row in out[key + ["oi_change"]].itertuples(index=False, name=None):
+        row_key = tuple(row[:4])
+        oi_change = safe_float(row[4], 0.0)
+        if oi_change <= 0:
+            days = 0
+        else:
+            days = 1
+            if len(positive_maps) >= 1 and row_key in positive_maps[0]:
+                days = 2
+            if len(positive_maps) >= 2 and row_key in positive_maps[0] and row_key in positive_maps[1]:
+                days = 3
+        score = 40.0 if days >= 3 else (20.0 if days == 2 else 0.0)
+        days_list.append(days)
+        score_list.append(score)
+
+    out["continuity_days"] = days_list
+    out["continuity_score"] = score_list
+    return out
+
+
+def score_contracts(df: pd.DataFrame, bootstrap_mode: bool) -> pd.DataFrame:
+    out = df.copy()
+    out["oi_score"] = (
+        (out["oi_change"].clip(lower=0) / 3000.0).clip(upper=1.0) * 60.0
+        + (out["oi_change_pct"].clip(lower=0) / 0.50).clip(upper=1.0) * 40.0
+    )
+    out["flow_score"] = (
+        (out["volume"] / 2000.0).clip(upper=1.0) * 50.0
+        + (out["volume_oi_ratio"] / 0.80).clip(upper=1.0) * 50.0
+    )
+    out["liquidity_score"] = (
+        (out["open_interest"] / 5000.0).clip(upper=1.0) * 50.0
+        + (1.0 - (out["spread_pct"] / 0.25)).clip(lower=0.0, upper=1.0) * 50.0
+    )
+    out["location_score"] = out["distance_pct"].apply(assign_location_score)
+
+    if bootstrap_mode:
+        base = (
+            out["flow_score"] * 0.40
+            + out["liquidity_score"] * 0.25
+            + out["location_score"] * 0.15
+            + out["structure_score"] * 0.20
         )
-        out.update(cat)
-    except Exception:
-        pass
+    else:
+        base = (
+            out["oi_score"] * 0.35
+            + out["flow_score"] * 0.25
+            + out["liquidity_score"] * 0.15
+            + out["location_score"] * 0.10
+            + out["structure_score"] * 0.15
+        )
 
+    out["total_score"] = (base + out["continuity_score"]).round(2)
     return out
 
 
-def fetch_metadata_for_tickers(
-    tickers: List[str],
-    workers: int,
-    lookback_days: int,
-    max_news_items: int,
-) -> Dict[str, Dict[str, Any]]:
-    if not tickers:
-        return {}
-
-    out: Dict[str, Dict[str, Any]] = {}
-    max_workers = max(1, min(workers, 12))
-
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        fut_map = {
-            pool.submit(fetch_ticker_metadata, tk, lookback_days, max_news_items): tk
-            for tk in tickers
-        }
-        for fut in as_completed(fut_map):
-            tk = fut_map[fut]
-            try:
-                out[tk] = fut.result()
-            except Exception:
-                out[tk] = {
-                    "sector": "未知",
-                    "industry": "未知",
-                    "earnings_date": None,
-                    "is_bio": False,
-                    "catalyst_score": 0.0,
-                    "catalyst_tags": "无",
-                    "catalyst_headline": "近期未检测到明确公开催化",
-                    "catalyst_news_count": 0,
-                }
-
-    return out
+def select_signal_rows(df: pd.DataFrame, bootstrap_mode: bool) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    if bootstrap_mode:
+        return df.copy()
+    return df[df["oi_change"] > 0].copy()
 
 
-# ══════════════════════════════════════════════════════════════
-# 模块6: 综合评分与方向
-# ══════════════════════════════════════════════════════════════
-
-def _direction_label(score: float) -> str:
-    if score >= 24:
-        return "强多"
-    if score >= 8:
-        return "偏多"
-    if score <= -24:
-        return "强空"
-    if score <= -8:
-        return "偏空"
-    return "中性"
+def dominant_side_from_bias(cp_oi_bias: float, cp_vol_bias: float) -> str:
+    combo = cp_oi_bias * 0.65 + cp_vol_bias * 0.35
+    if combo > 0.08:
+        return "Call 偏强"
+    if combo < -0.08:
+        return "Put 偏强"
+    return "均衡"
 
 
-def aggregate_option_events(events: List[EventRow]) -> Dict[str, Any]:
-    call_turnover = sum(e.turnover for e in events if e.side == "C")
-    put_turnover = sum(e.turnover for e in events if e.side == "P")
-    call_volume = sum(e.volume for e in events if e.side == "C")
-    put_volume = sum(e.volume for e in events if e.side == "P")
-    call_events = sum(1 for e in events if e.side == "C")
-    put_events = sum(1 for e in events if e.side == "P")
-
-    cp_turnover_ratio = call_turnover / (put_turnover + 1.0)
-    cp_volume_ratio = call_volume / (put_volume + 1.0)
-
-    turnover_bias = (call_turnover - put_turnover) / (call_turnover + put_turnover + 1.0) * 100
-    volume_bias = (call_volume - put_volume) / (call_volume + put_volume + 1.0) * 100
-    event_bias = (call_events - put_events) / (call_events + put_events + 1.0) * 100
-
-    option_bias = turnover_bias * 0.60 + volume_bias * 0.25 + event_bias * 0.15
-
-    return {
-        "events": len(events),
-        "call_events": call_events,
-        "put_events": put_events,
-        "call_turnover_m": call_turnover / 1e6,
-        "put_turnover_m": put_turnover / 1e6,
-        "cp_turnover_ratio": cp_turnover_ratio,
-        "cp_volume_ratio": cp_volume_ratio,
-        "option_bias": option_bias,
-    }
+def top_zone_text(group: pd.DataFrame, option_type: str, top_n: int = 3) -> str:
+    side_group = group[group["option_type"] == option_type].sort_values("total_score", ascending=False).head(top_n)
+    if side_group.empty:
+        return ""
+    return " / ".join([f"{fmt_strike(v)}{option_type}" for v in side_group["strike"].tolist()])
 
 
-def build_direction_table(
-    prefilter_df: pd.DataFrame,
-    events_map: Dict[str, List[EventRow]],
-    meta_map: Dict[str, Dict[str, Any]],
-    regime: Dict[str, Any],
-    cfg: argparse.Namespace,
-) -> pd.DataFrame:
+def build_expiration_strength(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "ticker",
+                "expiration",
+                "call_oi_change_sum",
+                "put_oi_change_sum",
+                "call_volume_sum",
+                "put_volume_sum",
+                "total_volume",
+                "cp_oi_bias",
+                "cp_vol_bias",
+                "bias_label",
+                "call_put_strength_ratio",
+                "main_zone",
+                "expiration_score",
+            ]
+        )
+
     rows: List[Dict[str, Any]] = []
+    for (ticker, expiration), group in df.groupby(["ticker", "expiration"]):
+        call_oi = safe_float(group.loc[group["option_type"] == "C", "oi_change"].clip(lower=0).sum(), 0.0)
+        put_oi = safe_float(group.loc[group["option_type"] == "P", "oi_change"].clip(lower=0).sum(), 0.0)
+        call_vol = safe_float(group.loc[group["option_type"] == "C", "volume"].sum(), 0.0)
+        put_vol = safe_float(group.loc[group["option_type"] == "P", "volume"].sum(), 0.0)
+        call_score_sum = safe_float(group.loc[group["option_type"] == "C", "total_score"].sum(), 0.0)
+        put_score_sum = safe_float(group.loc[group["option_type"] == "P", "total_score"].sum(), 0.0)
+        total_volume = call_vol + put_vol
 
-    for _, r in prefilter_df.iterrows():
-        ticker = str(r["ticker"])
-        events = events_map.get(ticker, [])
-        agg = aggregate_option_events(events)
-
-        if agg["events"] < cfg.min_option_events:
-            continue
-
-        option_bias = clip(float(agg["option_bias"]), -40, 40)
-        turnover_ratio = float(r["turnover_ratio_20d"])
-        day_chg = float(r["day_chg_pct"])
-        clv = float(r["clv"])
-        rs20 = float(r["rs20_pct"])
-        tech_bias = float(r["technical_bias"])
-
-        flow_strength = min(max(turnover_ratio - 1.0, 0.0) * 12, 18)
-        if day_chg >= 0.15:
-            flow_sign = 1
-        elif day_chg <= -0.15:
-            flow_sign = -1
+        cp_oi_bias = (call_oi - put_oi) / max(abs(call_oi) + abs(put_oi), 1.0)
+        cp_vol_bias = (call_vol - put_vol) / max(call_vol + put_vol, 1.0)
+        bias_label = dominant_side_from_bias(cp_oi_bias, cp_vol_bias)
+        if bias_label == "Put 偏强":
+            dominant_type = "P"
+        elif bias_label == "Call 偏强":
+            dominant_type = "C"
         else:
-            flow_sign = 1 if clv >= 0.1 else (-1 if clv <= -0.1 else 0)
-        flow_score = flow_strength * flow_sign
-
-        rs_score = clip(rs20 * 1.2, -15, 15)
-        tech_score = clip(tech_bias, -12, 12)
-
-        raw_score = option_bias * 0.50 + flow_score * 0.20 + rs_score * 0.18 + tech_score * 0.12
-
-        regime_score = float(regime.get("score", 0.0))
-        align_sign = 1 if raw_score > 0 else (-1 if raw_score < 0 else 0)
-        regime_align = align_sign * regime_score * 0.25
-
-        meta = meta_map.get(
-            ticker,
-            {
-                "sector": "未知",
-                "industry": "未知",
-                "earnings_date": None,
-                "is_bio": False,
-                "catalyst_score": 0.0,
-                "catalyst_tags": "无",
-                "catalyst_headline": "近期未检测到明确公开催化",
-                "catalyst_news_count": 0,
-            },
+            dominant_type = "C" if call_score_sum >= put_score_sum else "P"
+        main_zone = top_zone_text(group, dominant_type, top_n=3)
+        strength_ratio = (call_oi + 1.0) / (put_oi + 1.0)
+        expiration_score = (
+            min((call_oi + put_oi) / 10000.0, 1.0) * 45.0
+            + min(total_volume / 8000.0, 1.0) * 25.0
+            + abs(cp_oi_bias) * 20.0
+            + abs(cp_vol_bias) * 10.0
         )
-        sector = str(meta.get("sector") or "未知")
-        industry = str(meta.get("industry") or "未知")
-        earnings_date = meta.get("earnings_date")
-        is_bio = bool(meta.get("is_bio", False))
-        catalyst_score = float(meta.get("catalyst_score", 0.0))
-        catalyst_tags = str(meta.get("catalyst_tags", "无"))
-        catalyst_headline = str(meta.get("catalyst_headline", "近期未检测到明确公开催化"))
-        catalyst_news_count = int(meta.get("catalyst_news_count", 0))
-
-        days_to_earn: Optional[int] = None
-        near_earnings = False
-        if isinstance(earnings_date, date):
-            days_to_earn = (earnings_date - date.today()).days
-            near_earnings = 0 <= days_to_earn <= cfg.earnings_guard_days
-
-        if near_earnings and cfg.exclude_near_earnings:
-            continue
-
-        earnings_penalty = -8.0 if near_earnings else 0.0
-        catalyst_component = catalyst_score * cfg.catalyst_weight
-        score = raw_score + regime_align + earnings_penalty + catalyst_component
-
-        confidence = (
-            abs(raw_score) * 1.2
-            + min(agg["events"] * 7, 28)
-            + min(max(turnover_ratio - 1.0, 0.0) * 20, 25)
-            + min(abs(rs20) * 1.0, 12)
-            + min(abs(catalyst_score) * 1.6, 12)
-        )
-        if near_earnings:
-            confidence -= 8
-        confidence = clip(confidence, 15, 99)
-
-        direction = _direction_label(score)
-        if not cfg.allow_bearish and score <= 0:
-            continue
-        if confidence < cfg.min_confidence:
-            continue
-        if cfg.require_catalyst:
-            if catalyst_tags == "无" or catalyst_score < cfg.min_catalyst_score:
-                continue
-
-        reasons: List[str] = []
-        if agg["cp_turnover_ratio"] >= 1.5:
-            reasons.append("Call成交额显著占优")
-        elif agg["cp_turnover_ratio"] <= 0.67:
-            reasons.append("Put成交额显著占优")
-        else:
-            reasons.append("Call/Put成交额相对均衡")
-
-        if turnover_ratio >= 2.0:
-            reasons.append("个股成交额较20日明显放大")
-        elif turnover_ratio >= 1.2:
-            reasons.append("个股成交额温和放大")
-        else:
-            reasons.append("个股成交额接近常态")
-
-        if rs20 >= 3:
-            reasons.append("近20日相对SPY明显走强")
-        elif rs20 <= -3:
-            reasons.append("近20日相对SPY明显走弱")
-
-        if near_earnings and isinstance(earnings_date, date):
-            reasons.append(f"财报临近(D+{days_to_earn})")
-        if abs(catalyst_score) >= 1.0:
-            reasons.append(f"新闻催化[{catalyst_tags}]")
-        if is_bio and abs(catalyst_score) >= 2.0:
-            reasons.append("生物医药事件驱动特征")
 
         rows.append(
             {
-                "代码": ticker,
-                "名称": str(r["name"]),
-                "方向": direction,
-                "综合分": round(score, 2),
-                "置信度": round(confidence, 1),
-                "期权异动数": int(agg["events"]),
-                "Call事件数": int(agg["call_events"]),
-                "Put事件数": int(agg["put_events"]),
-                "Call成交额M": round(float(agg["call_turnover_m"]), 2),
-                "Put成交额M": round(float(agg["put_turnover_m"]), 2),
-                "C/P成交额比": round(float(agg["cp_turnover_ratio"]), 2),
-                "C/P成交量比": round(float(agg["cp_volume_ratio"]), 2),
-                "期权方向分": round(option_bias, 2),
-                "个股额比20日": round(turnover_ratio, 2),
-                "个股当日涨跌%": round(day_chg, 2),
-                "相对SPY20日%": round(rs20, 2),
-                "变盘压缩分": round(float(r["compression_score"]), 2),
-                "行业": sector,
-                "子行业": industry,
-                "生物医药": "是" if is_bio else "否",
-                "财报日": earnings_date.strftime("%Y-%m-%d") if isinstance(earnings_date, date) else "未知",
-                "财报剩余天": days_to_earn if days_to_earn is not None else "NA",
-                "催化剂分": round(catalyst_score, 2),
-                "催化贡献分": round(catalyst_component, 2),
-                "催化标签": catalyst_tags,
-                "催化新闻数": catalyst_news_count,
-                "催化摘要": catalyst_headline,
-                "理由": "；".join(reasons),
+                "ticker": ticker,
+                "expiration": expiration,
+                "call_oi_change_sum": round(call_oi, 0),
+                "put_oi_change_sum": round(put_oi, 0),
+                "call_volume_sum": round(call_vol, 0),
+                "put_volume_sum": round(put_vol, 0),
+                "total_volume": round(total_volume, 0),
+                "cp_oi_bias": round(cp_oi_bias, 3),
+                "cp_vol_bias": round(cp_vol_bias, 3),
+                "bias_label": bias_label,
+                "call_put_strength_ratio": round(strength_ratio, 2),
+                "main_zone": main_zone,
+                "expiration_score": round(expiration_score, 2),
             }
         )
 
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-
-    # 行业共振: 同一行业同方向信号数量越多，分数越高
-    direction_sign: List[int] = []
-    for s in df["综合分"].tolist():
-        if s >= 8:
-            direction_sign.append(1)
-        elif s <= -8:
-            direction_sign.append(-1)
-        else:
-            direction_sign.append(0)
-
-    df["_dir_sign"] = direction_sign
-
-    sector_count: Dict[Tuple[str, int], int] = {}
-    for _, row in df.iterrows():
-        sign = int(row["_dir_sign"])
-        if sign == 0:
-            continue
-        key = (str(row["行业"]), sign)
-        sector_count[key] = sector_count.get(key, 0) + 1
-
-    bonus_list: List[float] = []
-    resonance_list: List[str] = []
-
-    for _, row in df.iterrows():
-        sign = int(row["_dir_sign"])
-        sector = str(row["行业"])
-        if sign == 0:
-            bonus = 0.0
-            resonance = "无"
-        else:
-            cnt = sector_count.get((sector, sign), 1)
-            bonus_mag = min(max(cnt - 1, 0) * 2.0, 6.0)
-            bonus = bonus_mag if sign > 0 else -bonus_mag
-            resonance = f"{sector}{'多头' if sign > 0 else '空头'}共振{cnt}" if cnt >= 2 else "无"
-
-        bonus_list.append(round(bonus, 2))
-        resonance_list.append(resonance)
-
-    df["行业共振分"] = bonus_list
-    df["行业共振"] = resonance_list
-    df["综合分"] = (df["综合分"] + df["行业共振分"]).round(2)
-    df["方向"] = df["综合分"].apply(_direction_label)
-
-    # 机会评分: 方向强度 + 置信度
-    df["机会评分"] = (df["综合分"].abs() * (0.55 + df["置信度"] / 200)).round(2)
-
-    # 优先展示有方向的机会
-    directional = df[df["方向"] != "中性"].copy()
-    if not directional.empty:
-        df = directional
-
-    df = df.drop(columns=["_dir_sign"], errors="ignore")
-    df = df.sort_values(["机会评分", "置信度"], ascending=False).reset_index(drop=True)
-    return df
+    out = pd.DataFrame(rows)
+    return out.sort_values(["ticker", "expiration_score"], ascending=[True, False]).reset_index(drop=True)
 
 
-# ══════════════════════════════════════════════════════════════
-# 模块7: Telegram 推送（仅方向结论）
-# ══════════════════════════════════════════════════════════════
+def build_band_summary(df: pd.DataFrame) -> pd.DataFrame:
+    base = df[df["structure_score"] > 0].copy()
+    if base.empty:
+        return pd.DataFrame(
+            columns=[
+                "ticker",
+                "expiration",
+                "option_type",
+                "band_id",
+                "band_label",
+                "band_size",
+                "band_oi_change_sum",
+                "band_volume_sum",
+                "band_score",
+                "band_continuity_days",
+            ]
+        )
 
-def _tg_send(token: str, chat_id: str, text: str, retries: int = 3) -> bool:
-    if not token or not chat_id:
-        return False
+    rows: List[Dict[str, Any]] = []
+    for (ticker, expiration, option_type, band_id), group in base.groupby(
+        ["ticker", "expiration", "option_type", "band_id"]
+    ):
+        strikes = sorted(group["strike"].tolist())
+        cont_days = 1
+        if (group["continuity_days"] >= 3).sum() >= 2:
+            cont_days = 3
+        elif (group["continuity_days"] >= 2).sum() >= 2:
+            cont_days = 2
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    if len(text) > 4096:
-        text = text[:4090] + "\n..."
+        band_score = group["total_score"].mean() + min(len(strikes), 3) * 3.0 + (cont_days - 1) * 8.0
+        rows.append(
+            {
+                "ticker": ticker,
+                "expiration": expiration,
+                "option_type": option_type,
+                "band_id": band_id,
+                "band_label": group["band_label"].iloc[0],
+                "band_size": len(strikes),
+                "band_oi_change_sum": round(group["oi_change"].clip(lower=0).sum(), 0),
+                "band_volume_sum": round(group["volume"].sum(), 0),
+                "band_score": round(band_score, 2),
+                "band_continuity_days": cont_days,
+            }
+        )
 
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
+    out = pd.DataFrame(rows)
+    return out.sort_values(["ticker", "band_score"], ascending=[True, False]).reset_index(drop=True)
+
+
+def strongest_opposite_zone(df: pd.DataFrame, main_side: str) -> str:
+    opposite = "P" if main_side == "C" else "C"
+    opp_df = df[df["option_type"] == opposite].sort_values("total_score", ascending=False)
+    if opp_df.empty:
+        return ""
+
+    top_band = opp_df[opp_df["band_label"] != ""].head(1)
+    if not top_band.empty:
+        return top_band["band_label"].iloc[0]
+    first = opp_df.iloc[0]
+    return f"{fmt_strike(first['strike'])}{opposite}"
+
+
+def build_daily_summary(
+    ticker: str,
+    meta: Dict[str, Any],
+    contracts_df: pd.DataFrame,
+    expiration_df: pd.DataFrame,
+    band_df: pd.DataFrame,
+    bootstrap_mode: bool,
+) -> Dict[str, str]:
+    if contracts_df.empty:
+        text = (
+            f"{ticker} 盘后期权雷达\n"
+            f"标的收盘价：{meta['underlying_close']:.2f} ({meta['underlying_change_pct']:+.2f}%)\n"
+            "今日未发现满足规则的新增仓信号。"
+        )
+        return {
+            "main_expiration": "",
+            "bias_label": "无明显方向",
+            "main_band": "",
+            "strongest_contract": "",
+            "continuity_text": "无",
+            "next_watch": "无",
+            "summary_text": text,
+        }
+
+    top_contract = contracts_df.sort_values("total_score", ascending=False).iloc[0]
+    main_exp_row = expiration_df[expiration_df["ticker"] == ticker].head(1)
+    main_band_row = band_df[band_df["ticker"] == ticker].head(1)
+
+    main_exp = top_contract["expiration"]
+    bias_label = "均衡"
+    main_zone = ""
+    main_side = top_contract["option_type"]
+    if not main_exp_row.empty:
+        main_exp = main_exp_row.iloc[0]["expiration"]
+        bias_label = main_exp_row.iloc[0]["bias_label"]
+        main_zone = main_exp_row.iloc[0]["main_zone"]
+        if bias_label == "Put 偏强":
+            main_side = "P"
+        elif bias_label == "Call 偏强":
+            main_side = "C"
+
+    if not main_band_row.empty:
+        main_band = main_band_row.iloc[0]["band_label"]
+        band_days = int(main_band_row.iloc[0]["band_continuity_days"])
+    else:
+        main_band = main_zone or f"{fmt_strike(top_contract['strike'])}{top_contract['option_type']}"
+        band_days = int(top_contract["continuity_days"])
+
+    strongest_contract = (
+        f"{top_contract['expiration']} {fmt_strike(top_contract['strike'])}{top_contract['option_type']}"
+    )
+    top_contract_days = int(top_contract["continuity_days"])
+    if main_band and band_days >= 2:
+        continuity_text = f"{main_band}（{max(band_days, 1)}日）" if band_days >= 2 else "无明确连续布局"
+    elif top_contract_days >= 2:
+        continuity_text = (
+            f"{fmt_strike(top_contract['strike'])}{top_contract['option_type']}（{top_contract_days}日）"
+        )
+    else:
+        continuity_text = "无明确连续布局"
+
+    opposite_zone = strongest_opposite_zone(contracts_df, main_side)
+    watch_items = [x for x in [main_band or main_zone, opposite_zone] if x]
+    next_watch = " / ".join(watch_items) if watch_items else strongest_contract
+
+    bootstrap_note = "初始化模式：缺少前一日快照，OI增量与连续布局为预热状态。\n" if bootstrap_mode else ""
+    text = (
+        f"{ticker} 盘后期权雷达\n"
+        f"标的收盘价：{meta['underlying_close']:.2f} ({meta['underlying_change_pct']:+.2f}%)\n"
+        f"今日主战到期日：{main_exp}\n"
+        f"Call / Put 偏向：{bias_label}\n"
+        f"最强 strike 带：{main_band or main_zone or '无'}\n"
+        f"最强单合约：{strongest_contract}\n"
+        f"疑似连续布局：{continuity_text}\n"
+        f"次日重点观察：{next_watch}\n"
+        f"{bootstrap_note}".rstrip()
+    )
+    return {
+        "main_expiration": str(main_exp),
+        "bias_label": str(bias_label),
+        "main_band": str(main_band or main_zone),
+        "strongest_contract": str(strongest_contract),
+        "continuity_text": str(continuity_text),
+        "next_watch": str(next_watch),
+        "summary_text": text,
     }
 
-    for i in range(retries):
-        try:
-            resp = requests.post(url, json=payload, timeout=15)
-            if resp.status_code == 200:
-                return True
 
-            if resp.status_code == 429:
-                retry_after = 1
-                try:
-                    retry_after = int(resp.json().get("parameters", {}).get("retry_after", 1))
-                except Exception:
-                    retry_after = 1
-                time.sleep(min(max(retry_after, 1), 10))
-                continue
+def render_contract_table(df: pd.DataFrame, limit: int) -> str:
+    table = df.head(limit).copy()
+    if table.empty:
+        return "无"
 
-            if 500 <= resp.status_code < 600 and i < retries - 1:
-                time.sleep(1.2 * (i + 1))
-                continue
-            return False
-        except Exception:
-            if i < retries - 1:
-                time.sleep(1.2 * (i + 1))
-                continue
-            return False
-
-    return False
+    render = pd.DataFrame(
+        {
+            "Exp": table["expiration"].str[5:],
+            "Strk": table["strike"].map(fmt_strike),
+            "T": table["option_type"],
+            "Vol": table["volume"].round(0).astype(int),
+            "OI": table["open_interest"].round(0).astype(int),
+            "dOI": table["oi_change"].round(0).astype(int),
+            "dOI%": table["oi_change_pct"].map(lambda x: f"{x * 100:.0f}%"),
+            "IV": table["implied_volatility"].map(lambda x: f"{x * 100:.0f}%"),
+            "Spr": table["spread_pct"].map(lambda x: f"{x * 100:.0f}%"),
+            "Score": table["total_score"].map(lambda x: f"{x:.1f}"),
+        }
+    )
+    return render.to_string(index=False)
 
 
-def send_to_telegram(
-    top_df: pd.DataFrame,
-    regime: Dict[str, Any],
-    stats: Dict[str, Any],
+def render_expiration_table(df: pd.DataFrame, ticker: str, limit: int) -> str:
+    table = df[df["ticker"] == ticker].head(limit).copy()
+    if table.empty:
+        return "无"
+    render = pd.DataFrame(
+        {
+            "Exp": table["expiration"].str[5:],
+            "dCallOI": table["call_oi_change_sum"].astype(int),
+            "dPutOI": table["put_oi_change_sum"].astype(int),
+            "Vol": table["total_volume"].astype(int),
+            "Bias": table["bias_label"],
+            "Zone": table["main_zone"],
+        }
+    )
+    return render.to_string(index=False)
+
+
+def render_band_table(df: pd.DataFrame, ticker: str, limit: int) -> str:
+    table = df[df["ticker"] == ticker].head(limit).copy()
+    if table.empty:
+        return "无"
+    render = pd.DataFrame(
+        {
+            "Exp": table["expiration"].str[5:],
+            "Side": table["option_type"].map({"C": "Call", "P": "Put"}).fillna(table["option_type"]),
+            "Band": table["band_label"],
+            "dOI": table["band_oi_change_sum"].astype(int),
+            "Vol": table["band_volume_sum"].astype(int),
+            "Cont": table["band_continuity_days"].map(lambda x: f"{int(x)}日"),
+            "Score": table["band_score"].map(lambda x: f"{x:.1f}"),
+        }
+    )
+    return render.to_string(index=False)
+
+
+def _tg_send(token: str, chat_id: str, text: str) -> bool:
+    if not token or not chat_id:
+        return False
+    if len(text) > 4096:
+        text = text[:4090] + "\n..."
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=20,
+        )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def send_daily_telegram(
+    trade_date: str,
+    ticker_meta: Dict[str, Dict[str, Any]],
+    ticker_contracts: Dict[str, pd.DataFrame],
+    expiration_df: pd.DataFrame,
+    band_df: pd.DataFrame,
+    summaries: Dict[str, Dict[str, str]],
+    bootstrap_mode: bool,
     token: str,
     chat_id: str,
-):
+    cfg: argparse.Namespace,
+) -> None:
     if not token or not chat_id:
-        log.info("未配置 Telegram，跳过推送")
+        log.info("未配置 Telegram，跳过日推送")
         return
 
-    run_dt = datetime.now().strftime("%Y-%m-%d %H:%M")
     header = (
-        "📊 <b>全市场变盘方向扫描</b>\n"
-        f"🕒 {run_dt}\n"
-        f"🌐 股票池 {stats.get('universe_size', 0)} 只  |  预筛 {stats.get('prefilter_size', 0)} 只  |  期权深扫 {stats.get('option_scan_size', 0)} 只\n"
-        f"🧭 大盘: <b>{html.escape(str(regime.get('label', '中性')))}</b>  分数 {float(regime.get('score', 0.0)):+.1f}  VIX {float(regime.get('vix', 0.0)):.1f}\n"
-        f"⚙️ 本次筛选模式: {html.escape(str(stats.get('selection_mode', '严格')))}\n"
-        f"📌 模式: {'多空双向' if stats.get('allow_bearish') else '仅看多'} | "
-        f"{'仅催化' if stats.get('require_catalyst') else '含无催化'} | "
-        f"最小催化分 {float(stats.get('min_catalyst_score', 0.0)):.1f}\n"
-        "📌 输出前10个高置信方向，不含合约明细\n"
-        "━━━━━━━━━━━━━━━━━━━━"
+        f"📡 <b>盘后期权雷达</b>\n"
+        f"交易日: {trade_date}\n"
+        f"标的: {', '.join(cfg.tickers)}\n"
+        f"{'提示: 当前处于初始化模式，OI增量为预热状态' if bootstrap_mode else '提示: 以下结论基于前一日快照对比'}"
     )
     _tg_send(token, chat_id, header)
     time.sleep(0.3)
 
-    if top_df.empty:
-        _tg_send(token, chat_id, "📭 本次未筛到满足条件的高质量方向信号。")
-        return
+    for ticker in cfg.tickers:
+        meta = ticker_meta.get(ticker, {})
+        contracts_df = ticker_contracts.get(ticker, pd.DataFrame()).sort_values("total_score", ascending=False)
+        summary = summaries.get(ticker, {})
 
-    dist = top_df["方向"].value_counts().to_dict()
-    dist_msg = (
-        f"强多:{dist.get('强多', 0)}  偏多:{dist.get('偏多', 0)}  "
-        f"偏空:{dist.get('偏空', 0)}  强空:{dist.get('强空', 0)}"
+        body = (
+            f"<b>{ticker} 盘后期权雷达</b>\n"
+            f"标的收盘价: {safe_float(meta.get('underlying_close'), 0.0):.2f}  "
+            f"当日{safe_float(meta.get('underlying_change_pct'), 0.0):+.2f}%\n"
+            f"今日主战到期日: {html.escape(summary.get('main_expiration', '无'))}\n"
+            f"Call / Put 偏向: {html.escape(summary.get('bias_label', '无明显方向'))}\n"
+            f"最强 strike 带: {html.escape(summary.get('main_band', '无'))}\n"
+            f"最强单合约: {html.escape(summary.get('strongest_contract', '无'))}\n"
+            f"疑似连续布局: {html.escape(summary.get('continuity_text', '无'))}\n"
+            f"次日重点观察: {html.escape(summary.get('next_watch', '无'))}\n"
+            f"<pre>单合约异动榜\n{html.escape(render_contract_table(contracts_df, cfg.top_contracts))}</pre>\n"
+            f"<pre>到期日强度榜\n{html.escape(render_expiration_table(expiration_df, ticker, cfg.top_expirations))}</pre>\n"
+            f"<pre>Strike 带状联动榜\n{html.escape(render_band_table(band_df, ticker, cfg.top_bands))}</pre>"
+        )
+        _tg_send(token, chat_id, body)
+        time.sleep(0.3)
+
+
+def save_daily_outputs(
+    trade_date: str,
+    snapshot_dir: Path,
+    daily_report_dir: Path,
+    full_df: pd.DataFrame,
+    expiration_df: pd.DataFrame,
+    band_df: pd.DataFrame,
+    summaries: Dict[str, Dict[str, str]],
+) -> None:
+    ensure_dir(snapshot_dir)
+    ensure_dir(daily_report_dir)
+
+    snapshot_path = snapshot_dir / f"options_{trade_date}.csv"
+    full_df[DAILY_FIELDS].to_csv(snapshot_path, index=False, encoding="utf-8-sig")
+
+    contracts_path = daily_report_dir / f"contracts_{trade_date}.csv"
+    expiration_path = daily_report_dir / f"expirations_{trade_date}.csv"
+    bands_path = daily_report_dir / f"bands_{trade_date}.csv"
+    summary_path = daily_report_dir / f"summary_{trade_date}.txt"
+
+    top_contracts = (
+        full_df.sort_values(["ticker", "total_score"], ascending=[True, False])
+        .groupby("ticker", group_keys=False)
+        .head(10)
+        .reset_index(drop=True)
     )
-    _tg_send(token, chat_id, f"📌 <b>方向分布</b>\n{dist_msg}")
-    time.sleep(0.2)
+    top_contracts.to_csv(contracts_path, index=False, encoding="utf-8-sig")
+    expiration_df.to_csv(expiration_path, index=False, encoding="utf-8-sig")
+    band_df.to_csv(bands_path, index=False, encoding="utf-8-sig")
 
-    icon_map = {"强多": "🟢", "偏多": "🟩", "中性": "🟨", "偏空": "🟧", "强空": "🔴"}
     lines: List[str] = []
-
-    for i, (_, row) in enumerate(top_df.iterrows(), start=1):
-        icon = icon_map.get(str(row["方向"]), "⚪")
-        lines.append(
-            f"{i}. {icon} <b>{html.escape(str(row['名称']))}</b> ({html.escape(str(row['代码']))}) <b>{html.escape(str(row['方向']))}</b>\n"
-            f"   机会 {float(row['机会评分']):.1f}  分数 {float(row['综合分']):+,.1f}  置信度 {float(row['置信度']):.0f}\n"
-            f"   C/P额比 {float(row['C/P成交额比']):.2f}x  C/P量比 {float(row['C/P成交量比']):.2f}x  额比20日 {float(row['个股额比20日']):.2f}x\n"
-            f"   RS20 {float(row['相对SPY20日%']):+.2f}%  财报 {html.escape(str(row['财报日']))}  行业共振 {html.escape(str(row['行业共振']))}\n"
-            f"   催化 {html.escape(str(row['催化标签']))}  分值 {float(row['催化剂分']):+,.1f}  生物医药 {html.escape(str(row['生物医药']))}\n"
-            f"   催化摘要: {html.escape(str(row['催化摘要']))}\n"
-            f"   理由: {html.escape(str(row['理由']))}"
-        )
-
-    chunk = "🧭 <b>前10方向结论</b>\n"
-    for line in lines:
-        if len(chunk) + len(line) + 1 > 3800:
-            _tg_send(token, chat_id, chunk)
-            time.sleep(0.2)
-            chunk = "🧭 <b>前10方向结论(续)</b>\n"
-        chunk += line + "\n"
-
-    if chunk.strip():
-        _tg_send(token, chat_id, chunk)
+    for ticker in sorted(summaries):
+        lines.append(summaries[ticker]["summary_text"])
+        lines.append("")
+    summary_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
 
 
-# ══════════════════════════════════════════════════════════════
-# 模块8: 主流程
-# ══════════════════════════════════════════════════════════════
-
-def init_quote_context() -> Optional[QuoteContext]:
-    if Config is None or QuoteContext is None:
-        return None
-    try:
-        return QuoteContext(Config.from_env())
-    except Exception as e:
-        log.warning("LongBridge 初始化失败，将仅用 yfinance 期权兜底: %s", e)
-        return None
-
-
-def run(cfg: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    print()
-    print("╔══════════════════════════════════════════════════════════╗")
-    print("║              全市场美股变盘方向扫描器                    ║")
-    print("║      财报 + 行业 + 大盘 + 期权异动 + 资金流向            ║")
-    print("╚══════════════════════════════════════════════════════════╝")
-    print(f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"TopN: {cfg.top}  预筛: {cfg.prefilter_top}  期权深扫: {cfg.option_scan_top}")
-    print(f"DTE范围: {cfg.min_dte}~{cfg.max_dte}  财报过滤: {'开启' if cfg.exclude_near_earnings else '关闭'}")
-    print(
-        f"新闻催化: 回看{cfg.news_lookback_days}天  单票最多{cfg.max_news_items_per_ticker}条  权重={cfg.catalyst_weight:.2f}"
-    )
-    print(
-        f"输出模式: {'多空双向' if cfg.allow_bearish else '仅看多'} | "
-        f"{'仅催化' if cfg.require_catalyst else '含无催化'} | "
-        f"最小催化分={cfg.min_catalyst_score:.1f} | 最小置信度={cfg.min_confidence:.1f}"
-    )
-    print()
-
+def daily_pipeline(cfg: argparse.Namespace) -> None:
     if yf is None:
-        raise RuntimeError("未安装 yfinance，无法执行全市场扫描")
+        raise RuntimeError("未安装 yfinance")
 
-    # 1) 股票池
-    if cfg.underlyings:
-        universe = sorted(set(cfg.underlyings))
-        log.info("使用自定义股票池: %d 只", len(universe))
-    else:
-        universe = build_broad_universe(cfg.universe_limit, cfg.min_universe_expected)
+    snapshot_dir = Path(cfg.snapshot_dir)
+    daily_report_dir = Path(cfg.daily_report_dir)
+    ensure_dir(snapshot_dir)
+    ensure_dir(daily_report_dir)
 
-    # 2) 大盘环境
-    regime = get_market_regime()
-    log.info(
-        "大盘环境: %s (score=%+.1f, VIX=%.1f, SPY>MA20=%s, QQQ>MA20=%s)",
-        regime["label"],
-        float(regime["score"]),
-        float(regime["vix"]),
-        regime["spy_above_ma20"],
-        regime["qqq_above_ma20"],
+    ticker_raw: Dict[str, pd.DataFrame] = {}
+    ticker_meta: Dict[str, Dict[str, Any]] = {}
+    trade_date: Optional[date] = None
+
+    for ticker in cfg.tickers:
+        raw_df, meta = fetch_option_snapshot(ticker)
+        ticker_raw[ticker] = raw_df
+        ticker_meta[ticker] = meta
+        td = datetime.strptime(str(meta["trade_date"]), "%Y-%m-%d").date()
+        trade_date = td if trade_date is None else max(trade_date, td)
+
+    if trade_date is None:
+        raise RuntimeError("未获取到有效 trade_date")
+
+    prev_path = latest_snapshot_before(snapshot_dir, trade_date)
+    prev_df = load_snapshot(prev_path)
+    prior_dfs = [load_snapshot(p) for p in latest_n_snapshots_before(snapshot_dir, trade_date, 2)]
+
+    scored_parts: List[pd.DataFrame] = []
+    ticker_contracts: Dict[str, pd.DataFrame] = {}
+    ticker_bootstrap: Dict[str, bool] = {}
+    for ticker in cfg.tickers:
+        prev_ticker_df = prev_df[prev_df["ticker"] == ticker] if not prev_df.empty else pd.DataFrame()
+        merged, is_bootstrap = merge_previous_oi(ticker_raw[ticker], prev_ticker_df)
+        filtered = apply_filters(merged, cfg)
+        structured = assign_structure(filtered)
+        continued = assign_continuity(structured, [df[df["ticker"] == ticker] for df in prior_dfs if not df.empty])
+        scored = score_contracts(continued, bootstrap_mode=is_bootstrap)
+        signal_rows = select_signal_rows(scored, bootstrap_mode=is_bootstrap)
+        signal_rows = signal_rows.sort_values("total_score", ascending=False).reset_index(drop=True)
+        scored_parts.append(signal_rows.copy())
+        ticker_contracts[ticker] = signal_rows
+        ticker_bootstrap[ticker] = is_bootstrap
+
+    bootstrap_mode = any(ticker_bootstrap.values())
+
+    full_df = pd.concat(scored_parts, ignore_index=True) if scored_parts else pd.DataFrame(columns=DAILY_FIELDS)
+    for col in DAILY_FIELDS:
+        if col not in full_df.columns:
+            full_df[col] = ""
+    full_df = full_df[DAILY_FIELDS].copy()
+
+    expiration_df = build_expiration_strength(full_df)
+    band_df = build_band_summary(full_df)
+
+    summaries: Dict[str, Dict[str, str]] = {}
+    for ticker in cfg.tickers:
+        summaries[ticker] = build_daily_summary(
+            ticker=ticker,
+            meta=ticker_meta[ticker],
+            contracts_df=ticker_contracts.get(ticker, pd.DataFrame()),
+            expiration_df=expiration_df,
+            band_df=band_df,
+            bootstrap_mode=ticker_bootstrap.get(ticker, False),
+        )
+
+    trade_date_str = trade_date.isoformat()
+    save_daily_outputs(
+        trade_date=trade_date_str,
+        snapshot_dir=snapshot_dir,
+        daily_report_dir=daily_report_dir,
+        full_df=full_df,
+        expiration_df=expiration_df,
+        band_df=band_df,
+        summaries=summaries,
     )
-
-    # 3) 全市场预筛
-    prefilter_df = prefilter_universe(universe, float(regime["spy_ret20"]), cfg)
-    if prefilter_df.empty:
-        log.warning("预筛后无候选")
-
-    scan_df = prefilter_df.head(cfg.option_scan_top).copy() if not prefilter_df.empty else pd.DataFrame()
-
-    # 4) 期权深扫
-    ctx = init_quote_context()
-    events_map: Dict[str, List[EventRow]] = {}
-    all_events: List[EventRow] = []
-
-    for _, row in scan_df.iterrows():
-        ticker = str(row["ticker"])
-        underlying = str(row["underlying"])
-
-        rows: List[EventRow] = []
-        if ctx is not None:
-            try:
-                rows = scan_underlying_longbridge(ctx, ticker, underlying, cfg)
-            except Exception as e:
-                log.warning("%s 长桥期权扫描失败: %s", ticker, e)
-
-        if not rows and cfg.enable_yf_option_fallback:
-            try:
-                fb_rows = scan_underlying_yf(ticker, underlying, cfg)
-                if fb_rows:
-                    rows = fb_rows
-            except Exception:
-                pass
-
-        events_map[ticker] = rows
-        all_events.extend(rows)
-        log.info("期权深扫 %s: %d 条异动", ticker, len(rows))
-        time.sleep(cfg.delay_per_underlying)
-
-    def _cfg_with(overrides: Dict[str, Any]) -> argparse.Namespace:
-        d = dict(vars(cfg))
-        d.update(overrides)
-        return argparse.Namespace(**d)
-
-    # 5) 元数据（行业/财报）: 对全部深扫票抓取，避免“仅20只元数据”导致催化漏检
-    meta_tickers = scan_df["ticker"].tolist() if not scan_df.empty else []
-
-    meta_map = fetch_metadata_for_tickers(
-        meta_tickers,
-        workers=cfg.meta_workers,
-        lookback_days=cfg.news_lookback_days,
-        max_news_items=cfg.max_news_items_per_ticker,
-    )
-
-    # 6) 综合评分与Top10（分层放宽，避免全空）
-    direction_df = build_direction_table(
-        prefilter_df=scan_df,
-        events_map=events_map,
-        meta_map=meta_map,
-        regime=regime,
-        cfg=cfg,
-    )
-    selection_mode = "严格"
-
-    if direction_df.empty and not scan_df.empty:
-        log.warning("严格模式无信号，启动一级放宽（保留催化）")
-        cfg_l1 = _cfg_with(
-            {
-                "min_option_events": 0,
-                "min_catalyst_score": max(0.8, float(cfg.min_catalyst_score) - 0.7),
-                "min_confidence": max(22.0, float(cfg.min_confidence) - 10.0),
-                "require_catalyst": True,
-            }
-        )
-        direction_df = build_direction_table(
-            prefilter_df=scan_df,
-            events_map=events_map,
-            meta_map=meta_map,
-            regime=regime,
-            cfg=cfg_l1,
-        )
-        selection_mode = "一级放宽(保留催化)"
-
-    if direction_df.empty and not scan_df.empty:
-        log.warning("一级放宽仍无信号，启动二级放宽（允许无催化）")
-        cfg_l2 = _cfg_with(
-            {
-                "min_option_events": 0,
-                "require_catalyst": False,
-                "min_confidence": max(20.0, float(cfg.min_confidence) - 15.0),
-            }
-        )
-        direction_df = build_direction_table(
-            prefilter_df=scan_df,
-            events_map=events_map,
-            meta_map=meta_map,
-            regime=regime,
-            cfg=cfg_l2,
-        )
-        selection_mode = "二级放宽(允许无催化)"
-
-    if direction_df.empty and not scan_df.empty and not cfg.allow_bearish:
-        log.warning("二级放宽仍无信号，启动三级放宽（允许偏空）")
-        cfg_l3 = _cfg_with(
-            {
-                "allow_bearish": True,
-                "min_option_events": 0,
-                "require_catalyst": False,
-                "min_confidence": 15.0,
-            }
-        )
-        direction_df = build_direction_table(
-            prefilter_df=scan_df,
-            events_map=events_map,
-            meta_map=meta_map,
-            regime=regime,
-            cfg=cfg_l3,
-        )
-        selection_mode = "三级放宽(允许偏空)"
-
-    if not direction_df.empty:
-        direction_df["筛选模式"] = selection_mode
-
-    top_df = direction_df.head(cfg.top).copy() if not direction_df.empty else pd.DataFrame()
-
-    # 7) 输出结果文件
-    output_dir = Path(cfg.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M")
-
-    events_csv = str(output_dir / f"options_events_{ts}.csv")
-    full_csv = str(output_dir / f"direction_full_{ts}.csv")
-    top_csv = str(output_dir / f"direction_top{cfg.top}_{ts}.csv")
-
-    if all_events:
-        events_df = pd.DataFrame([e.__dict__ for e in all_events]).sort_values("total_score", ascending=False)
-        events_df.to_csv(events_csv, index=False, encoding="utf-8-sig")
-    else:
-        events_df = pd.DataFrame(columns=[f.name for f in EventRow.__dataclass_fields__.values()])
-        events_df.to_csv(events_csv, index=False, encoding="utf-8-sig")
-
-    if direction_df.empty:
-        pd.DataFrame(
-            columns=[
-                "代码",
-                "名称",
-                "方向",
-                "机会评分",
-                "综合分",
-                "置信度",
-                "期权异动数",
-                "Call事件数",
-                "Put事件数",
-                "Call成交额M",
-                "Put成交额M",
-                "C/P成交额比",
-                "C/P成交量比",
-                "期权方向分",
-                "个股额比20日",
-                "个股当日涨跌%",
-                "相对SPY20日%",
-                "变盘压缩分",
-                "行业",
-                "子行业",
-                "生物医药",
-                "行业共振分",
-                "行业共振",
-                "财报日",
-                "财报剩余天",
-                "催化剂分",
-                "催化贡献分",
-                "催化标签",
-                "催化新闻数",
-                "催化摘要",
-                "筛选模式",
-                "理由",
-            ]
-        ).to_csv(full_csv, index=False, encoding="utf-8-sig")
-        pd.DataFrame().to_csv(top_csv, index=False, encoding="utf-8-sig")
-    else:
-        direction_df.to_csv(full_csv, index=False, encoding="utf-8-sig")
-        top_df.to_csv(top_csv, index=False, encoding="utf-8-sig")
-
-    print(f"大盘环境: {regime['label']}  score={float(regime['score']):+.1f}  VIX={float(regime['vix']):.1f}")
-    print(f"股票池: {len(universe)}  预筛: {len(prefilter_df)}  深扫: {len(scan_df)}")
-    print(f"期权事件: {len(all_events)}  方向信号: {len(direction_df)}  Top: {len(top_df)}")
-    print(f"筛选模式: {selection_mode if not direction_df.empty else '无结果'}")
-    print(f"文件输出: {events_csv}")
-    print(f"文件输出: {full_csv}")
-    print(f"文件输出: {top_csv}")
-
-    # 8) Telegram
-    stats = {
-        "universe_size": len(universe),
-        "prefilter_size": len(prefilter_df),
-        "option_scan_size": len(scan_df),
-        "allow_bearish": bool(cfg.allow_bearish),
-        "require_catalyst": bool(cfg.require_catalyst),
-        "min_catalyst_score": float(cfg.min_catalyst_score),
-        "selection_mode": selection_mode if not direction_df.empty else "无结果",
-    }
-    send_to_telegram(
-        top_df=top_df,
-        regime=regime,
-        stats=stats,
+    send_daily_telegram(
+        trade_date=trade_date_str,
+        ticker_meta=ticker_meta,
+        ticker_contracts=ticker_contracts,
+        expiration_df=expiration_df,
+        band_df=band_df,
+        summaries=summaries,
+        bootstrap_mode=bootstrap_mode,
         token=cfg.tg_token,
         chat_id=cfg.tg_chat,
+        cfg=cfg,
     )
 
-    return events_df, direction_df, top_df
+    log.info("日雷达完成: trade_date=%s prev_snapshot=%s", trade_date_str, prev_path.name if prev_path else "无")
 
 
-# ══════════════════════════════════════════════════════════════
-# 入口
-# ══════════════════════════════════════════════════════════════
+def weekly_summary_for_ticker(ticker: str, frames: List[pd.DataFrame]) -> str:
+    if not frames:
+        return f"{ticker} 本周无可用快照。"
+
+    df = pd.concat(frames, ignore_index=True)
+    df = df[df["ticker"] == ticker].copy()
+    if df.empty:
+        return f"{ticker} 本周无可用快照。"
+
+    positive = df[df["oi_change"] > 0].copy()
+    if positive.empty:
+        return f"{ticker} 本周未出现明确新增仓信号。"
+
+    call_oi = safe_float(positive.loc[positive["option_type"] == "C", "oi_change"].sum(), 0.0)
+    put_oi = safe_float(positive.loc[positive["option_type"] == "P", "oi_change"].sum(), 0.0)
+    call_vol = safe_float(positive.loc[positive["option_type"] == "C", "volume"].sum(), 0.0)
+    put_vol = safe_float(positive.loc[positive["option_type"] == "P", "volume"].sum(), 0.0)
+    cp_oi_bias = (call_oi - put_oi) / max(abs(call_oi) + abs(put_oi), 1.0)
+    cp_vol_bias = (call_vol - put_vol) / max(call_vol + put_vol, 1.0)
+    bias_label = dominant_side_from_bias(cp_oi_bias, cp_vol_bias)
+
+    exp_df = build_expiration_strength(positive)
+    band_df = build_band_summary(positive)
+
+    top_exp = exp_df[exp_df["ticker"] == ticker].head(1)
+    top_band = band_df[band_df["ticker"] == ticker].head(1)
+    top_contract = positive.sort_values("total_score", ascending=False).head(1)
+
+    repeated_contracts = (
+        positive.groupby(["expiration", "option_type", "strike"])
+        .agg(days=("trade_date", "nunique"), total_oi_change=("oi_change", "sum"))
+        .reset_index()
+        .sort_values(["days", "total_oi_change"], ascending=[False, False])
+    )
+    repeated_contract_text = "无"
+    if not repeated_contracts.empty:
+        rc = repeated_contracts.iloc[0]
+        repeated_contract_text = (
+            f"{rc['expiration']} {fmt_strike(rc['strike'])}{rc['option_type']} "
+            f"（{int(rc['days'])}日）"
+        )
+
+    main_exp = top_exp.iloc[0]["expiration"] if not top_exp.empty else "无"
+    main_zone = top_exp.iloc[0]["main_zone"] if not top_exp.empty else "无"
+    main_band = top_band.iloc[0]["band_label"] if not top_band.empty else main_zone
+    band_days = int(top_band.iloc[0]["band_continuity_days"]) if not top_band.empty else 1
+    strongest_contract = (
+        f"{top_contract.iloc[0]['expiration']} {fmt_strike(top_contract.iloc[0]['strike'])}{top_contract.iloc[0]['option_type']}"
+        if not top_contract.empty
+        else "无"
+    )
+
+    return (
+        f"{ticker} 本周期权总结\n"
+        f"本周主战到期日：{main_exp}\n"
+        f"本周 Call / Put 偏向：{bias_label}\n"
+        f"本周主战 strike 带：{main_band}\n"
+        f"最强单合约：{strongest_contract}\n"
+        f"带状连续性：{main_band}（{band_days}日）\n"
+        f"重复出现合约：{repeated_contract_text}\n"
+        f"下周优先观察：{main_band} / {main_zone}"
+    )
+
+
+def weekly_pipeline(cfg: argparse.Namespace) -> None:
+    snapshot_dir = Path(cfg.snapshot_dir)
+    weekly_report_dir = Path(cfg.weekly_report_dir)
+    ensure_dir(weekly_report_dir)
+
+    week_files = load_latest_week_snapshots(snapshot_dir, count=5)
+    if not week_files:
+        log.warning("周总结跳过: 无历史快照")
+        return
+
+    frames = [load_snapshot(path) for _, path in week_files]
+    texts: List[str] = []
+    start_date = week_files[0][0].isoformat()
+    end_date = week_files[-1][0].isoformat()
+
+    for ticker in cfg.tickers:
+        texts.append(weekly_summary_for_ticker(ticker, frames))
+        texts.append("")
+
+    report_text = "\n".join(texts).strip() + "\n"
+    report_path = weekly_report_dir / f"weekly_{start_date}_{end_date}.txt"
+    report_path.write_text(report_text, encoding="utf-8")
+
+    if cfg.tg_token and cfg.tg_chat:
+        message = f"🗓 <b>周末期权总结</b>\n区间: {start_date} ~ {end_date}\n\n{html.escape(report_text)}"
+        _tg_send(cfg.tg_token, cfg.tg_chat, message)
+
+    log.info("周总结完成: %s", report_path.name)
+
+
+def mode_from_args(mode: str) -> str:
+    if mode in {"daily", "weekly"}:
+        return mode
+    # GitHub 定时任务默认: 周日 UTC 跑 weekly，其他跑 daily
+    weekday = datetime.utcnow().weekday()
+    return "weekly" if weekday == 6 else "daily"
+
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="全市场美股变盘方向扫描器",
+    parser = argparse.ArgumentParser(
+        description="NVDA/TSLA 盘后期权雷达",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--mode", choices=["auto", "daily", "weekly"], default="auto")
+    parser.add_argument("--tickers", type=str, default=",".join(DEFAULT_TICKERS))
+    parser.add_argument("--snapshot-dir", type=str, default="data/options_snapshots")
+    parser.add_argument("--daily-report-dir", type=str, default="reports/daily")
+    parser.add_argument("--weekly-report-dir", type=str, default="reports/weekly")
 
-    p.add_argument(
-        "--underlyings",
-        type=str,
-        default="",
-        help="可选，自定义标的(逗号分隔，如 TSLA,NVDA,AAPL)。留空则自动构建全市场池",
-    )
-    p.add_argument("--universe-limit", type=int, default=3200, help="全市场池上限")
-    p.add_argument("--min-universe-expected", type=int, default=800, help="全市场池期望下限（低于则自动补源）")
+    parser.add_argument("--min-oi", type=int, default=500)
+    parser.add_argument("--min-volume", type=int, default=200)
+    parser.add_argument("--min-dte", type=int, default=2)
+    parser.add_argument("--max-dte", type=int, default=45)
+    parser.add_argument("--max-spread-pct", type=float, default=0.25)
 
-    p.add_argument("--prefilter-period", type=str, default="6mo")
-    p.add_argument("--yf-chunk-size", type=int, default=120)
-    p.add_argument("--prefilter-top", type=int, default=180)
-    p.add_argument("--option-scan-top", type=int, default=80)
-    p.add_argument("--top", type=int, default=10)
+    parser.add_argument("--top-contracts", type=int, default=10)
+    parser.add_argument("--top-expirations", type=int, default=5)
+    parser.add_argument("--top-bands", type=int, default=5)
 
-    p.add_argument("--min-price", type=float, default=5.0)
-    p.add_argument("--min-avg-volume", type=int, default=300_000)
-    p.add_argument("--min-avg-turnover-m", type=float, default=30.0, help="最小20日平均成交额(百万美元)")
+    parser.add_argument("--tg-token", type=str, default=os.environ.get("TELEGRAM_TOKEN", ""))
+    parser.add_argument("--tg-chat", type=str, default=os.environ.get("TELEGRAM_CHAT_ID", ""))
 
-    p.add_argument("--min-dte", type=int, default=7)
-    p.add_argument("--max-dte", type=int, default=60)
-    p.add_argument("--big-order-top-pct", type=float, default=0.08)
-    p.add_argument("--volume-spike-top-pct", type=float, default=0.12)
-    p.add_argument("--max-events-per-underlying", type=int, default=8)
-    p.add_argument("--min-option-events", type=int, default=1)
-    p.add_argument("--delay-per-underlying", type=float, default=0.05)
-
-    p.add_argument(
-        "--enable-yf-option-fallback",
-        dest="enable_yf_option_fallback",
-        action="store_true",
-        default=True,
-        help="长桥无有效事件时使用 yfinance 兜底",
-    )
-    p.add_argument(
-        "--disable-yf-option-fallback",
-        dest="enable_yf_option_fallback",
-        action="store_false",
-        help="关闭 yfinance 期权兜底",
-    )
-
-    p.add_argument("--earnings-guard-days", type=int, default=7)
-    p.add_argument(
-        "--exclude-near-earnings",
-        dest="exclude_near_earnings",
-        action="store_true",
-        default=True,
-        help="过滤财报窗口内标的（提高方向信号稳定性）",
-    )
-    p.add_argument(
-        "--include-near-earnings",
-        dest="exclude_near_earnings",
-        action="store_false",
-        help="保留财报窗口内标的（高波动高风险）",
-    )
-
-    p.add_argument("--meta-workers", type=int, default=6)
-    p.add_argument("--news-lookback-days", type=int, default=10, help="新闻催化回看天数")
-    p.add_argument("--max-news-items-per-ticker", type=int, default=18, help="每只股票最多读取新闻条数")
-    p.add_argument(
-        "--catalyst-weight",
-        type=float,
-        default=0.50,
-        help="新闻催化分在综合分中的权重(0~1建议)",
-    )
-    p.add_argument("--allow-bearish", action="store_true", help="允许输出偏空/强空方向（默认仅看多黑马）")
-    p.add_argument(
-        "--require-catalyst",
-        dest="require_catalyst",
-        action="store_true",
-        default=True,
-        help="仅输出有明确催化新闻的标的",
-    )
-    p.add_argument(
-        "--allow-no-catalyst",
-        dest="require_catalyst",
-        action="store_false",
-        help="允许输出无明确催化的标的",
-    )
-    p.add_argument("--min-catalyst-score", type=float, default=1.0, help="最低催化剂分阈值")
-    p.add_argument("--min-confidence", type=float, default=30.0, help="最低置信度阈值")
-
-    p.add_argument("--output-dir", type=str, default="results")
-    p.add_argument("--tg-token", type=str, default=os.environ.get("TELEGRAM_TOKEN", ""))
-    p.add_argument("--tg-chat", type=str, default=os.environ.get("TELEGRAM_CHAT_ID", ""))
-
-    args = p.parse_args()
-
-    # 归一化自定义标的
-    custom: List[str] = []
-    if args.underlyings and args.underlyings.strip():
-        for x in args.underlyings.split(","):
-            t = x.strip().upper()
-            if not t:
-                continue
-            if t.endswith(".US"):
-                t = t[:-3]
-            t = normalize_yf_ticker(t)
-            if t:
-                custom.append(t)
-    args.underlyings = sorted(set(custom))
-
-    args.big_order_top_pct = clip(float(args.big_order_top_pct), 0.01, 1.0)
-    args.volume_spike_top_pct = clip(float(args.volume_spike_top_pct), 0.01, 1.0)
-    args.catalyst_weight = clip(float(args.catalyst_weight), 0.0, 1.2)
-    args.prefilter_top = max(10, int(args.prefilter_top))
-    args.option_scan_top = max(10, int(args.option_scan_top))
-    args.top = max(1, int(args.top))
-    args.news_lookback_days = max(1, int(args.news_lookback_days))
-    args.max_news_items_per_ticker = max(5, int(args.max_news_items_per_ticker))
-    args.min_universe_expected = max(100, int(args.min_universe_expected))
-    args.min_catalyst_score = max(0.0, float(args.min_catalyst_score))
-    args.min_confidence = max(0.0, float(args.min_confidence))
-
+    args = parser.parse_args()
+    args.tickers = [x.strip().upper() for x in args.tickers.split(",") if x.strip()]
+    if not args.tickers:
+        args.tickers = DEFAULT_TICKERS.copy()
     return args
 
 
 def main() -> None:
     cfg = parse_args()
-    try:
-        run(cfg)
-    except Exception as e:
-        # 兜底：避免 workflow 因单点异常直接失败，保留错误日志并通知 Telegram
-        log.error("扫描运行失败: %s", e)
-        log.error(traceback.format_exc())
+    mode = mode_from_args(cfg.mode)
 
-        out_dir = Path(getattr(cfg, "output_dir", "results"))
-        out_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M")
-        err_file = out_dir / f"scan_error_{ts}.log"
-        err_file.write_text(traceback.format_exc(), encoding="utf-8")
-
-        if getattr(cfg, "tg_token", "") and getattr(cfg, "tg_chat", ""):
-            msg = (
-                "⚠️ <b>黑马扫描运行异常</b>\n"
-                f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"错误: {html.escape(str(e))}\n"
-                f"已写入错误日志: {err_file.name}"
-            )
-            _tg_send(cfg.tg_token, cfg.tg_chat, msg)
+    if mode == "daily":
+        daily_pipeline(cfg)
+        return
+    weekly_pipeline(cfg)
 
 
 if __name__ == "__main__":
