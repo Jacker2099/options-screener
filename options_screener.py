@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NVDA / TSLA 盘前期权雷达
+NVDA / TSLA 盘后期权雷达
 
 设计原则:
 1. 放弃全市场扫描，只跟踪 NVDA 与 TSLA
@@ -1056,7 +1056,7 @@ def build_daily_summary(
 ) -> Dict[str, str]:
     if contracts_df.empty:
         text = (
-            f"{ticker} 盘前期权雷达\n"
+            f"{ticker} 盘后期权雷达\n"
             f"标的收盘价：{meta['underlying_close']:.2f} ({meta['underlying_change_pct']:+.2f}%)\n"
             "今日未发现满足规则的主战合约信号。"
         )
@@ -1144,7 +1144,7 @@ def build_daily_summary(
 
     bootstrap_note = "初始化模式：缺少前一日快照，OI增量与连续布局为预热状态。\n" if bootstrap_mode else ""
     text = (
-        f"{ticker} 盘前期权雷达\n"
+        f"{ticker} 盘后期权雷达\n"
         f"标的收盘价：{meta['underlying_close']:.2f} ({meta['underlying_change_pct']:+.2f}%)\n"
         f"方向结论：{direction_text}（{confidence_text}置信，{confidence_score:.1f}分）\n"
         f"仓位属性：{confirmation_text}\n"
@@ -1306,10 +1306,10 @@ def evaluate_previous_signals(
     return pd.DataFrame(rows, columns=VALIDATION_FIELDS)
 
 
-def in_us_premarket_two_hour_window(now_utc: Optional[datetime] = None) -> bool:
+def in_us_postclose_four_hour_window(now_utc: Optional[datetime] = None) -> bool:
     current_utc = now_utc or datetime.now(ZoneInfo("UTC"))
     eastern = current_utc.astimezone(ZoneInfo("America/New_York"))
-    return eastern.weekday() < 5 and eastern.hour == 7
+    return eastern.weekday() < 5 and eastern.hour == 20
 
 
 def render_validation_table(validation_df: pd.DataFrame) -> str:
@@ -1438,7 +1438,7 @@ def send_daily_telegram(
         return
 
     header = (
-        f"📡 <b>盘前期权雷达</b>\n"
+        f"📡 <b>盘后期权雷达</b>\n"
         f"交易日: {trade_date}\n"
         f"标的: {', '.join(cfg.tickers)}\n"
         f"{'提示: 当前处于初始化模式，OI增量为预热状态' if bootstrap_mode else '提示: 以下结论基于前一日快照对比'}"
@@ -1462,7 +1462,7 @@ def send_daily_telegram(
         summary = summaries.get(ticker, {})
 
         body = (
-            f"<b>{ticker} 盘前期权雷达</b>\n"
+            f"<b>{ticker} 盘后期权雷达</b>\n"
             f"标的收盘价: {safe_float(meta.get('underlying_close'), 0.0):.2f}  "
             f"当日{safe_float(meta.get('underlying_change_pct'), 0.0):+.2f}%\n"
             f"方向结论: {html.escape(summary.get('direction_text', '无方向'))}  "
@@ -1664,7 +1664,7 @@ def daily_pipeline(cfg: argparse.Namespace) -> None:
         cfg=cfg,
     )
 
-    log.info("盘前雷达完成: trade_date=%s prev_snapshot=%s", trade_date_str, prev_path.name if prev_path else "无")
+    log.info("盘后雷达完成: trade_date=%s prev_snapshot=%s", trade_date_str, prev_path.name if prev_path else "无")
 
 
 def weekly_summary_for_ticker(ticker: str, frames: List[pd.DataFrame]) -> str:
@@ -1815,7 +1815,7 @@ def mode_from_args(mode: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="NVDA/TSLA 盘前期权雷达",
+        description="NVDA/TSLA 盘后期权雷达",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--mode", choices=["auto", "daily", "weekly"], default="auto")
@@ -1838,7 +1838,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-bands", type=int, default=5)
     parser.add_argument("--validation-close-threshold-pct", type=float, default=1.0)
     parser.add_argument("--validation-intraday-threshold-pct", type=float, default=1.5)
-    parser.add_argument("--enforce-premarket-window", action="store_true")
+    parser.add_argument("--enforce-postclose-window", action="store_true")
 
     parser.add_argument("--tg-token", type=str, default=os.environ.get("TELEGRAM_TOKEN", ""))
     parser.add_argument("--tg-chat", type=str, default=os.environ.get("TELEGRAM_CHAT_ID", ""))
@@ -1855,8 +1855,8 @@ def main() -> None:
     mode = mode_from_args(cfg.mode)
 
     if mode == "daily":
-        if cfg.enforce_premarket_window and not in_us_premarket_two_hour_window():
-            log.info("跳过日雷达: 当前不在美东盘前 07:00-07:59 窗口")
+        if cfg.enforce_postclose_window and not in_us_postclose_four_hour_window():
+            log.info("跳过日雷达: 当前不在美东盘后 20:00-20:59 窗口")
             return
         daily_pipeline(cfg)
         return
