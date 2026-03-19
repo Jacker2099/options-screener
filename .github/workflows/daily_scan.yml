@@ -1,13 +1,13 @@
-name: Daily Blackhorse Scan
+name: NVDA TSLA Options Radar
 
 on:
   schedule:
-    # GitHub Actions cron is UTC，按需调整为你希望的盘后时间
-    - cron: "0 22 * * 1-5"
+    - cron: "15 11 * * 2-6"
+    - cron: "30 11 * * 0"
   workflow_dispatch:
 
 concurrency:
-  group: daily-options-scan
+  group: nvda-tsla-options-radar
   cancel-in-progress: false
 
 env:
@@ -15,13 +15,11 @@ env:
   PYTHONUNBUFFERED: "1"
 
 jobs:
-  scan:
+  radar:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 45
     permissions:
       contents: write
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
     steps:
       - name: Checkout
@@ -36,54 +34,38 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install longport yfinance pandas requests lxml
+        run: pip install yfinance pandas requests
 
-      - name: Run screener
-        id: run_screener
+      - name: Run Radar
         env:
-          LONGPORT_APP_KEY: ${{ secrets.LONGPORT_APP_KEY }}
-          LONGPORT_APP_SECRET: ${{ secrets.LONGPORT_APP_SECRET }}
-          LONGPORT_ACCESS_TOKEN: ${{ secrets.LONGPORT_ACCESS_TOKEN }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          mkdir -p results
-          python options_screener.py \
-            --output-dir results \
-            --top 10 \
-            --min-universe-expected 800 \
-            --prefilter-top 180 \
-            --option-scan-top 80 \
-            --min-dte 7 \
-            --max-dte 60 \
-            --big-order-top-pct 0.08 \
-            --volume-spike-top-pct 0.12 \
-            --max-events-per-underlying 8 \
-            --news-lookback-days 10 \
-            --max-news-items-per-ticker 18 \
-            --catalyst-weight 0.50 \
-            --min-catalyst-score 1.0 \
-            --min-confidence 30 \
-            2>&1 | tee results/scan_console.log || true
+          set -euo pipefail
+          mkdir -p data/options_snapshots reports/daily reports/weekly
+          python options_screener.py --mode auto 2>&1 | tee reports/last_run.log
 
-      - name: Upload CSV artifact
+      - name: Upload Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: options-unusual-${{ github.run_number }}
+          name: nvda-tsla-options-radar-${{ github.run_number }}
           path: |
-            results/*.csv
+            data/options_snapshots/*
+            reports/daily/*
+            reports/weekly/*
+            reports/last_run.log
           retention-days: 30
           if-no-files-found: warn
 
-      - name: Commit results
+      - name: Commit Data
         if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         continue-on-error: true
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add results/*.csv || true
+          git add data/options_snapshots reports || true
           git diff --staged --quiet && exit 0
-          git commit -m "scan $(date -u +'%Y-%m-%d')"
+          git commit -m "options radar $(date -u +'%Y-%m-%d')"
           git pull --rebase origin "${{ github.ref_name }}" || true
-          git push || echo "git push skipped (protected branch or race), workflow continues"
+          git push || echo "git push skipped, workflow continues"
