@@ -484,12 +484,12 @@ def merge_previous_oi(today_df: pd.DataFrame, prev_df: pd.DataFrame) -> Tuple[pd
 def apply_filters(df: pd.DataFrame, cfg: argparse.Namespace) -> pd.DataFrame:
     out = df.copy()
     out = out[
-        (out["open_interest"] >= cfg.min_oi)
-        & (out["volume"].fillna(0) >= cfg.min_volume)
+        (out["open_interest"] >= cfg.min_raw_oi)
+        & (out["volume"].fillna(0) >= cfg.min_raw_volume)
         & (out["dte"].between(cfg.min_dte, cfg.max_dte))
         & (out["bid"] > 0)
         & (out["ask"] > out["bid"])
-        & (out["spread_pct"] <= cfg.max_spread_pct)
+        & (out["spread_pct"] <= cfg.max_raw_spread_pct)
     ].copy()
     return out
 
@@ -522,16 +522,16 @@ def assign_location_score(option_type: str, signed_distance_pct: float) -> float
 
 
 def assign_expiration_preference_score(dte: float) -> float:
-    if 4 <= dte <= 10:
+    if 10 <= dte <= 21:
         return 100.0
-    if 11 <= dte <= 21:
-        return 85.0
-    if 2 <= dte < 4:
-        return 75.0
     if 22 <= dte <= 35:
-        return 65.0
+        return 85.0
     if 36 <= dte <= 45:
-        return 45.0
+        return 70.0
+    if 46 <= dte <= 60:
+        return 55.0
+    if 7 <= dte < 10:
+        return 35.0
     return 20.0
 
 
@@ -711,13 +711,13 @@ def score_contracts(df: pd.DataFrame, bootstrap_mode: bool) -> pd.DataFrame:
         )
 
     out["raw_rank_score"] = (
-        out["positioning_score"] * 0.34
-        + out["flow_score"] * 0.22
-        + out["liquidity_score"] * 0.12
-        + out["location_score"] * 0.10
-        + out["structure_score"] * 0.08
-        + out["expiration_pref_score"] * 0.08
-        + out["tape_score"] * 0.06
+        out["positioning_score"] * 0.52
+        + out["flow_score"] * 0.16
+        + out["liquidity_score"] * 0.10
+        + out["location_score"] * 0.08
+        + out["structure_score"] * 0.05
+        + out["expiration_pref_score"] * 0.05
+        + out["tape_score"] * 0.04
     ).round(2)
     out["total_score"] = (base + out["continuity_score"]).round(2)
     return out
@@ -935,17 +935,28 @@ def raw_contract_view(df: pd.DataFrame) -> pd.DataFrame:
         return df.copy()
     return (
         df.sort_values(
-            ["raw_rank_score", "open_interest", "volume", "premium_notional"],
+            ["open_interest", "open_interest_notional", "premium_notional", "raw_rank_score"],
             ascending=[False, False, False, False],
         )
         .reset_index(drop=True)
     )
 
 
-def new_contract_view(df: pd.DataFrame) -> pd.DataFrame:
+def new_contract_view(df: pd.DataFrame, cfg: Optional[argparse.Namespace] = None) -> pd.DataFrame:
     if df.empty:
         return df.copy()
-    base = df[df["oi_change"] > 0].copy()
+    min_new_oi = safe_float(getattr(cfg, "min_new_oi", 500), 500)
+    min_new_volume = safe_float(getattr(cfg, "min_new_volume", 200), 200)
+    min_new_oi_change = safe_float(getattr(cfg, "min_new_oi_change", 100), 100)
+    base = df[
+        (df["oi_change"] > 0)
+        & (df["open_interest"] >= min_new_oi)
+        & (df["volume"] >= min_new_volume)
+        & (
+            (df["oi_change"] >= min_new_oi_change)
+            | (df["oi_change_pct"] >= 0.05)
+        )
+    ].copy()
     if base.empty:
         return base
     return (
@@ -1040,6 +1051,7 @@ def build_daily_summary(
     contracts_df: pd.DataFrame,
     expiration_df: pd.DataFrame,
     band_df: pd.DataFrame,
+    cfg: argparse.Namespace,
     bootstrap_mode: bool,
 ) -> Dict[str, str]:
     if contracts_df.empty:
@@ -1068,7 +1080,7 @@ def build_daily_summary(
         }
 
     raw_contracts = raw_contract_view(contracts_df)
-    new_contracts = new_contract_view(contracts_df)
+    new_contracts = new_contract_view(contracts_df, cfg)
     top_contract = raw_contracts.iloc[0]
     comparison = compare_raw_and_new(raw_contracts, new_contracts, safe_float(meta.get("underlying_close"), 0.0))
     main_exp_row = expiration_df[expiration_df["ticker"] == ticker].head(1)
@@ -1446,7 +1458,7 @@ def send_daily_telegram(
         meta = ticker_meta.get(ticker, {})
         contracts_df = ticker_contracts.get(ticker, pd.DataFrame()).copy()
         raw_df = raw_contract_view(contracts_df)
-        new_df = new_contract_view(contracts_df)
+        new_df = new_contract_view(contracts_df, cfg)
         summary = summaries.get(ticker, {})
 
         body = (
@@ -1513,7 +1525,7 @@ def save_daily_outputs(
         .reset_index(drop=True)
     )
     top_new_contracts = (
-        new_contract_view(full_df)
+        new_contract_view(full_df, cfg)
         .groupby("ticker", group_keys=False)
         .head(10)
         .reset_index(drop=True)
@@ -1605,6 +1617,7 @@ def daily_pipeline(cfg: argparse.Namespace) -> None:
             contracts_df=ticker_contracts.get(ticker, pd.DataFrame()),
             expiration_df=expiration_df,
             band_df=band_df,
+            cfg=cfg,
             bootstrap_mode=ticker_bootstrap.get(ticker, False),
         )
 
@@ -1809,11 +1822,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--daily-report-dir", type=str, default="reports/daily")
     parser.add_argument("--weekly-report-dir", type=str, default="reports/weekly")
 
-    parser.add_argument("--min-oi", type=int, default=500)
-    parser.add_argument("--min-volume", type=int, default=200)
-    parser.add_argument("--min-dte", type=int, default=2)
+    parser.add_argument("--min-raw-oi", type=int, default=1000)
+    parser.add_argument("--min-raw-volume", type=int, default=50)
+    parser.add_argument("--max-raw-spread-pct", type=float, default=0.40)
+    parser.add_argument("--min-new-oi", type=int, default=500)
+    parser.add_argument("--min-new-volume", type=int, default=200)
+    parser.add_argument("--min-new-oi-change", type=int, default=100)
+    parser.add_argument("--min-dte", type=int, default=10)
     parser.add_argument("--max-dte", type=int, default=45)
-    parser.add_argument("--max-spread-pct", type=float, default=0.25)
 
     parser.add_argument("--top-contracts", type=int, default=10)
     parser.add_argument("--top-expirations", type=int, default=5)
