@@ -25,6 +25,7 @@ import html
 import logging
 import math
 import os
+import sqlite3
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -94,6 +95,10 @@ DAILY_FIELDS = [
     "continuity_score",
     "band_id",
     "band_label",
+    "band_low_strike",
+    "band_high_strike",
+    "band_continuity_days",
+    "band_continuity_score",
     "total_score",
 ]
 
@@ -133,6 +138,10 @@ NUMERIC_FIELDS = {
     "raw_rank_score",
     "continuity_days",
     "continuity_score",
+    "band_low_strike",
+    "band_high_strike",
+    "band_continuity_days",
+    "band_continuity_score",
     "total_score",
 }
 
@@ -272,33 +281,148 @@ def latest_report_before(report_dir: Path, prefix: str, trade_date: date) -> Opt
     return candidates[-1][1]
 
 
+def daily_outputs_exist(snapshot_dir: Path, daily_report_dir: Path, trade_date: str) -> bool:
+    required = [
+        snapshot_dir / f"options_{trade_date}.csv",
+        daily_report_dir / f"signals_{trade_date}.csv",
+        daily_report_dir / f"summary_{trade_date}.txt",
+    ]
+    return all(path.exists() for path in required)
+
+
+def normalize_snapshot_df(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy() if df is not None else pd.DataFrame()
+    for col in DAILY_FIELDS:
+        if col not in out.columns:
+            out[col] = 0.0 if col in NUMERIC_FIELDS else ""
+    for col in NUMERIC_FIELDS:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
+    return out[DAILY_FIELDS].copy() if not out.empty else pd.DataFrame(columns=DAILY_FIELDS)
+
+
+def sqlite_type_for_column(column: str) -> str:
+    return "REAL" if column in NUMERIC_FIELDS else "TEXT"
+
+
+def ensure_history_db(db_path: Path) -> None:
+    ensure_dir(db_path.parent)
+    cols = ", ".join([f'"{col}" {sqlite_type_for_column(col)}' for col in DAILY_FIELDS])
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS options_daily (
+                {cols},
+                PRIMARY KEY (trade_date, ticker, expiration, option_type, strike)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_options_daily_trade_date
+            ON options_daily (trade_date)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_options_daily_ticker_trade_date
+            ON options_daily (ticker, trade_date)
+            """
+        )
+
+
+def upsert_snapshot_db(db_path: Path, df: pd.DataFrame) -> None:
+    if df is None or df.empty:
+        return
+    normalized = normalize_snapshot_df(df)
+    ensure_history_db(db_path)
+    placeholders = ", ".join(["?"] * len(DAILY_FIELDS))
+    columns = ", ".join([f'"{col}"' for col in DAILY_FIELDS])
+    sql = f"INSERT OR REPLACE INTO options_daily ({columns}) VALUES ({placeholders})"
+    rows = [tuple(row[col] for col in DAILY_FIELDS) for _, row in normalized.iterrows()]
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(sql, rows)
+
+
+def list_snapshot_dates_db(db_path: Path) -> List[date]:
+    if not db_path.exists():
+        return []
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT trade_date FROM options_daily WHERE trade_date IS NOT NULL AND trade_date != '' ORDER BY trade_date"
+            ).fetchall()
+    except Exception:
+        return []
+    dates: List[date] = []
+    for row in rows:
+        try:
+            dates.append(datetime.strptime(str(row[0]), "%Y-%m-%d").date())
+        except Exception:
+            continue
+    return dates
+
+
+def load_snapshot_from_db(db_path: Path, trade_date: Optional[date]) -> pd.DataFrame:
+    if trade_date is None or not db_path.exists():
+        return pd.DataFrame(columns=DAILY_FIELDS)
+    try:
+        with sqlite3.connect(db_path) as conn:
+            df = pd.read_sql_query(
+                "SELECT * FROM options_daily WHERE trade_date = ? ORDER BY ticker, expiration, option_type, strike",
+                conn,
+                params=[trade_date.isoformat()],
+            )
+    except Exception:
+        return pd.DataFrame(columns=DAILY_FIELDS)
+    return normalize_snapshot_df(df)
+
+
+def latest_snapshot_date_before(db_path: Path, snapshot_dir: Path, trade_date: date) -> Optional[date]:
+    db_dates = [d for d in list_snapshot_dates_db(db_path) if d < trade_date]
+    if db_dates:
+        return db_dates[-1]
+    path = latest_snapshot_before(snapshot_dir, trade_date)
+    return parse_csv_date_from_name(path) if path else None
+
+
+def latest_n_snapshot_dates_before(db_path: Path, snapshot_dir: Path, trade_date: date, n: int) -> List[date]:
+    db_dates = [d for d in list_snapshot_dates_db(db_path) if d < trade_date]
+    if db_dates:
+        return list(reversed(db_dates[-n:]))
+    paths = latest_n_snapshots_before(snapshot_dir, trade_date, n)
+    dates: List[date] = []
+    for path in paths:
+        parsed = parse_csv_date_from_name(path)
+        if parsed is not None:
+            dates.append(parsed)
+    return dates
+
+
 def load_snapshot(path: Optional[Path]) -> pd.DataFrame:
     if path is None or not path.exists():
-        return pd.DataFrame()
+        return pd.DataFrame(columns=DAILY_FIELDS)
     try:
         df = pd.read_csv(path)
     except Exception:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=DAILY_FIELDS)
     if df is None:
-        return pd.DataFrame()
-    for col in DAILY_FIELDS:
-        if col not in df.columns:
-            df[col] = 0.0 if col in NUMERIC_FIELDS else ""
-    for col in NUMERIC_FIELDS:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-    return df
+        return pd.DataFrame(columns=DAILY_FIELDS)
+    return normalize_snapshot_df(df)
 
 
-def load_latest_week_snapshots(snapshot_dir: Path, count: int = 5) -> List[Tuple[date, Path]]:
-    candidates: List[Tuple[date, Path]] = []
+def load_latest_week_trade_dates(db_path: Path, snapshot_dir: Path, count: int = 5) -> List[date]:
+    db_dates = list_snapshot_dates_db(db_path)
+    if db_dates:
+        return db_dates[-count:]
+    candidates: List[date] = []
     for path in list_snapshot_files(snapshot_dir):
         d = parse_csv_date_from_name(path)
         if d is None:
             continue
-        candidates.append((d, path))
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return list(reversed(candidates[:count]))
+        candidates.append(d)
+    candidates = sorted(set(candidates))
+    return candidates[-count:]
 
 
 def history_last_trade_info(symbol: str) -> Dict[str, Any]:
@@ -581,16 +705,76 @@ def group_adjacent_strikes(strikes: Sequence[float]) -> List[List[float]]:
     return [g for g in groups if len(g) >= 2]
 
 
+def strike_overlap_ratio(current: Sequence[float], prior: Sequence[float]) -> float:
+    current_set = {round(float(x), 6) for x in current}
+    prior_set = {round(float(x), 6) for x in prior}
+    if not current_set or not prior_set:
+        return 0.0
+    set_overlap = len(current_set & prior_set) / max(1, min(len(current_set), len(prior_set)))
+
+    cur_low, cur_high = min(current_set), max(current_set)
+    prior_low, prior_high = min(prior_set), max(prior_set)
+    overlap_width = max(0.0, min(cur_high, prior_high) - max(cur_low, prior_low))
+    cur_width = max(cur_high - cur_low, 0.01)
+    prior_width = max(prior_high - prior_low, 0.01)
+    range_overlap = overlap_width / max(0.01, min(cur_width, prior_width))
+    return max(set_overlap, range_overlap)
+
+
+def extract_band_groups(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    if df is None or df.empty or "band_id" not in df.columns:
+        return []
+
+    base = df[df["band_id"].astype(str) != ""].copy()
+    if base.empty:
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for (ticker, expiration, option_type, band_id), group in base.groupby(
+        ["ticker", "expiration", "option_type", "band_id"]
+    ):
+        strikes = sorted(set(float(x) for x in group["strike"].tolist()))
+        if not strikes:
+            continue
+        rows.append(
+            {
+                "ticker": str(ticker),
+                "expiration": str(expiration),
+                "option_type": str(option_type),
+                "band_id": str(band_id),
+                "band_label": str(group["band_label"].iloc[0]),
+                "strikes": strikes,
+                "band_low_strike": min(strikes),
+                "band_high_strike": max(strikes),
+                "band_size": len(strikes),
+                "band_score": safe_float(group.get("total_score", pd.Series([0.0])).mean(), 0.0),
+                "band_oi_change_sum": safe_float(group["oi_change"].clip(lower=0).sum(), 0.0) if "oi_change" in group.columns else 0.0,
+                "trade_date": str(group["trade_date"].iloc[0]) if "trade_date" in group.columns else "",
+            }
+        )
+    return rows
+
+
 def assign_structure(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["structure_score"] = 0.0
     out["band_id"] = ""
     out["band_label"] = ""
+    out["band_low_strike"] = 0.0
+    out["band_high_strike"] = 0.0
 
     candidates = out[
-        (out["oi_change"] > 0)
-        & (out["volume"] >= 200)
-        & (out["open_interest"] >= 500)
+        (
+            ((out["oi_change"] > 0) & (out["volume"] >= 200) & (out["open_interest"] >= 500))
+            | (
+                (out["open_interest"] >= 1500)
+                & (out["volume"] >= 50)
+                & (
+                    (out["premium_notional"] >= 20000)
+                    | (out["open_interest_notional"] >= 250000)
+                )
+            )
+        )
     ].copy()
 
     if candidates.empty:
@@ -603,7 +787,12 @@ def assign_structure(df: pd.DataFrame) -> pd.DataFrame:
 
         for band in groups:
             label = " / ".join([f"{fmt_strike(v)}{option_type}" for v in band])
-            score = 100.0 if len(band) >= 3 else 50.0
+            band_group = group[group["strike"].isin(band)]
+            score = 100.0 if len(band) >= 4 else (85.0 if len(band) == 3 else 55.0)
+            if safe_float(band_group["open_interest"].sum(), 0.0) >= 10000:
+                score = min(score + 10.0, 100.0)
+            elif safe_float(band_group["oi_change"].clip(lower=0).sum(), 0.0) >= 1500:
+                score = min(score + 5.0, 100.0)
             band_key = f"{ticker}|{expiration}|{option_type}|{band[0]}|{band[-1]}"
             mask = (
                 (out["ticker"] == ticker)
@@ -614,6 +803,8 @@ def assign_structure(df: pd.DataFrame) -> pd.DataFrame:
             out.loc[mask, "structure_score"] = score
             out.loc[mask, "band_id"] = band_key
             out.loc[mask, "band_label"] = label
+            out.loc[mask, "band_low_strike"] = min(band)
+            out.loc[mask, "band_high_strike"] = max(band)
 
     return out
 
@@ -622,6 +813,8 @@ def assign_continuity(today_df: pd.DataFrame, prior_dfs: List[pd.DataFrame]) -> 
     out = today_df.copy()
     out["continuity_days"] = 1
     out["continuity_score"] = 0.0
+    out["band_continuity_days"] = 1
+    out["band_continuity_score"] = 0.0
 
     if out.empty or not prior_dfs:
         return out
@@ -654,6 +847,41 @@ def assign_continuity(today_df: pd.DataFrame, prior_dfs: List[pd.DataFrame]) -> 
 
     out["continuity_days"] = days_list
     out["continuity_score"] = score_list
+
+    today_bands = extract_band_groups(out)
+    if not today_bands:
+        return out
+
+    prior_bands_by_day = [extract_band_groups(df) for df in prior_dfs]
+    zone_days_by_band: Dict[str, int] = {}
+    zone_score_by_band: Dict[str, float] = {}
+    for band in today_bands:
+        zone_days = 1
+        for prior_bands in prior_bands_by_day:
+            matched = False
+            for prior_band in prior_bands:
+                if (
+                    prior_band["ticker"] != band["ticker"]
+                    or prior_band["expiration"] != band["expiration"]
+                    or prior_band["option_type"] != band["option_type"]
+                ):
+                    continue
+                overlap = strike_overlap_ratio(band["strikes"], prior_band["strikes"])
+                if overlap >= 0.5:
+                    matched = True
+                    break
+            if matched:
+                zone_days += 1
+            else:
+                break
+        zone_score = 40.0 if zone_days >= 3 else (20.0 if zone_days == 2 else 0.0)
+        zone_days_by_band[band["band_id"]] = zone_days
+        zone_score_by_band[band["band_id"]] = zone_score
+
+    out["band_continuity_days"] = out["band_id"].map(zone_days_by_band).fillna(1).astype(int)
+    out["band_continuity_score"] = out["band_id"].map(zone_score_by_band).fillna(0.0)
+    out["continuity_days"] = out[["continuity_days", "band_continuity_days"]].max(axis=1)
+    out["continuity_score"] = out[["continuity_score", "band_continuity_score"]].max(axis=1)
     return out
 
 
@@ -743,8 +971,9 @@ def dominant_side_from_bias(
     return "均衡"
 
 
-def top_zone_text(group: pd.DataFrame, option_type: str, top_n: int = 3) -> str:
-    side_group = group[group["option_type"] == option_type].sort_values("total_score", ascending=False).head(top_n)
+def top_zone_text(group: pd.DataFrame, option_type: str, top_n: int = 3, score_col: str = "total_score") -> str:
+    sort_col = score_col if score_col in group.columns else "total_score"
+    side_group = group[group["option_type"] == option_type].sort_values(sort_col, ascending=False).head(top_n)
     if side_group.empty:
         return ""
     return " / ".join([f"{fmt_strike(v)}{option_type}" for v in side_group["strike"].tolist()])
@@ -806,7 +1035,7 @@ def build_expiration_strength(df: pd.DataFrame) -> pd.DataFrame:
             dominant_type = "C"
         else:
             dominant_type = "C" if call_score_sum >= put_score_sum else "P"
-        main_zone = top_zone_text(group, dominant_type, top_n=3)
+        main_zone = top_zone_text(group, dominant_type, top_n=3, score_col="raw_rank_score")
         strength_ratio = (call_oi + 1.0) / (put_oi + 1.0)
         expiration_score = (
             min(total_oi / 40000.0, 1.0) * 24.0
@@ -859,6 +1088,8 @@ def build_band_summary(df: pd.DataFrame) -> pd.DataFrame:
                 "option_type",
                 "band_id",
                 "band_label",
+                "band_low_strike",
+                "band_high_strike",
                 "band_size",
                 "band_oi_change_sum",
                 "band_volume_sum",
@@ -873,11 +1104,7 @@ def build_band_summary(df: pd.DataFrame) -> pd.DataFrame:
         ["ticker", "expiration", "option_type", "band_id"]
     ):
         strikes = sorted(group["strike"].tolist())
-        cont_days = 1
-        if (group["continuity_days"] >= 3).sum() >= 2:
-            cont_days = 3
-        elif (group["continuity_days"] >= 2).sum() >= 2:
-            cont_days = 2
+        cont_days = int(group["band_continuity_days"].max()) if "band_continuity_days" in group.columns else 1
 
         band_score = group["total_score"].mean() + min(len(strikes), 3) * 3.0 + (cont_days - 1) * 8.0
         rows.append(
@@ -887,6 +1114,8 @@ def build_band_summary(df: pd.DataFrame) -> pd.DataFrame:
                 "option_type": option_type,
                 "band_id": band_id,
                 "band_label": group["band_label"].iloc[0],
+                "band_low_strike": round(safe_float(group["band_low_strike"].max(), min(strikes)), 2),
+                "band_high_strike": round(safe_float(group["band_high_strike"].max(), max(strikes)), 2),
                 "band_size": len(strikes),
                 "band_oi_change_sum": round(group["oi_change"].clip(lower=0).sum(), 0),
                 "band_volume_sum": round(group["volume"].sum(), 0),
@@ -1104,7 +1333,7 @@ def build_daily_summary(
         band_days = int(main_band_row.iloc[0]["band_continuity_days"])
     else:
         main_band = main_zone or f"{fmt_strike(top_contract['strike'])}{top_contract['option_type']}"
-        band_days = int(top_contract["continuity_days"])
+        band_days = int(top_contract.get("band_continuity_days", top_contract["continuity_days"]))
 
     strongest_contract = (
         f"{top_contract['expiration']} {fmt_strike(top_contract['strike'])}{top_contract['option_type']}"
@@ -1129,8 +1358,11 @@ def build_daily_summary(
     )
     confidence_text = confidence_label(confidence_score)
     top_contract_days = int(top_contract["continuity_days"])
+    zone_contract_days = int(top_contract.get("band_continuity_days", top_contract_days))
     if main_band and band_days >= 2:
         continuity_text = f"{main_band}（{max(band_days, 1)}日）" if band_days >= 2 else "无明确连续布局"
+    elif main_band and zone_contract_days >= 2:
+        continuity_text = f"{main_band}（{zone_contract_days}日）"
     elif top_contract_days >= 2:
         continuity_text = (
             f"{fmt_strike(top_contract['strike'])}{top_contract['option_type']}（{top_contract_days}日）"
@@ -1309,7 +1541,7 @@ def evaluate_previous_signals(
 def in_us_postclose_four_hour_window(now_utc: Optional[datetime] = None) -> bool:
     current_utc = now_utc or datetime.now(ZoneInfo("UTC"))
     eastern = current_utc.astimezone(ZoneInfo("America/New_York"))
-    return eastern.weekday() < 5 and eastern.hour == 20
+    return eastern.weekday() < 5 and eastern.hour in {20, 21}
 
 
 def render_validation_table(validation_df: pd.DataFrame) -> str:
@@ -1399,6 +1631,47 @@ def render_band_table(df: pd.DataFrame, ticker: str, limit: int) -> str:
     return render.to_string(index=False)
 
 
+def telegram_validation_brief(validation_df: pd.DataFrame) -> str:
+    if validation_df.empty:
+        return ""
+    parts: List[str] = []
+    for _, row in validation_df.iterrows():
+        ticker = str(row.get("ticker", ""))
+        result = str(row.get("validation_result", "观察"))
+        close_pct = safe_float(row.get("next_close_change_pct"), 0.0)
+        fav_pct = safe_float(row.get("favorable_excursion_pct"), 0.0)
+        parts.append(f"{ticker} {result} 收盘{close_pct:+.1f}% 盘中{fav_pct:+.1f}%")
+    return "\n".join(parts)
+
+
+def telegram_ticker_brief(ticker: str, meta: Dict[str, Any], summary: Dict[str, str]) -> str:
+    price = safe_float(meta.get("underlying_close"), 0.0)
+    chg = safe_float(meta.get("underlying_change_pct"), 0.0)
+    direction = html.escape(summary.get("direction_text", "无方向"))
+    confidence = html.escape(summary.get("confidence_text", "观察"))
+    score = html.escape(summary.get("confidence_score", "0"))
+    main_exp = html.escape(summary.get("main_expiration", "无"))
+    main_band = html.escape(summary.get("main_band", "无"))
+    raw_contract = html.escape(summary.get("raw_strongest_contract", "无"))
+    new_contract = html.escape(summary.get("new_strongest_contract", "无"))
+    compare_label = html.escape(summary.get("comparison_label", "无对比"))
+    continuity = html.escape(summary.get("continuity_text", "无"))
+    next_watch = html.escape(summary.get("next_watch", "无"))
+
+    return (
+        f"<b>{ticker}</b>\n"
+        f"收盘 {price:.2f} ({chg:+.2f}%)\n"
+        f"方向 {direction} | {confidence}置信 ({score}分)\n"
+        f"主战到期 {main_exp}\n"
+        f"主战区域 {main_band}\n"
+        f"原始主战 {raw_contract}\n"
+        f"新增确认 {new_contract}\n"
+        f"关系 {compare_label}\n"
+        f"连续性 {continuity}\n"
+        f"次日观察 {next_watch}"
+    )
+
+
 def _tg_send(token: str, chat_id: str, text: str) -> bool:
     if not token or not chat_id:
         return False
@@ -1437,11 +1710,20 @@ def send_daily_telegram(
         log.info("未配置 Telegram，跳过日推送")
         return
 
+    overview_lines: List[str] = []
+    for ticker in cfg.tickers:
+        meta = ticker_meta.get(ticker, {})
+        summary = summaries.get(ticker, {})
+        overview_lines.append(
+            f"{ticker}: {summary.get('direction_text', '无方向')} | {summary.get('confidence_text', '观察')} | "
+            f"{summary.get('main_expiration', '无')} | {summary.get('main_band', '无')}"
+        )
     header = (
         f"📡 <b>盘后期权雷达</b>\n"
         f"交易日: {trade_date}\n"
         f"标的: {', '.join(cfg.tickers)}\n"
-        f"{'提示: 当前处于初始化模式，OI增量为预热状态' if bootstrap_mode else '提示: 以下结论基于前一日快照对比'}"
+        f"{'提示: 当前处于初始化模式，OI增量为预热状态' if bootstrap_mode else '提示: 以下结论基于前一日快照对比'}\n\n"
+        + "\n".join(overview_lines)
     )
     _tg_send(token, chat_id, header)
     time.sleep(0.3)
@@ -1449,39 +1731,15 @@ def send_daily_telegram(
     if not validation_df.empty:
         validation_text = (
             "<b>昨日信号验证</b>\n"
-            f"<pre>{html.escape(render_validation_table(validation_df))}</pre>"
+            f"{html.escape(telegram_validation_brief(validation_df))}"
         )
         _tg_send(token, chat_id, validation_text)
         time.sleep(0.3)
 
     for ticker in cfg.tickers:
         meta = ticker_meta.get(ticker, {})
-        contracts_df = ticker_contracts.get(ticker, pd.DataFrame()).copy()
-        raw_df = raw_contract_view(contracts_df)
-        new_df = new_contract_view(contracts_df, cfg)
         summary = summaries.get(ticker, {})
-
-        body = (
-            f"<b>{ticker} 盘后期权雷达</b>\n"
-            f"标的收盘价: {safe_float(meta.get('underlying_close'), 0.0):.2f}  "
-            f"当日{safe_float(meta.get('underlying_change_pct'), 0.0):+.2f}%\n"
-            f"方向结论: {html.escape(summary.get('direction_text', '无方向'))}  "
-            f"置信: {html.escape(summary.get('confidence_text', '观察'))} ({html.escape(summary.get('confidence_score', '0'))}分)\n"
-            f"仓位属性: {html.escape(summary.get('confirmation_text', '无'))}\n"
-            f"原始/新增关系: {html.escape(summary.get('comparison_label', '无对比'))}\n"
-            f"分析结论: {html.escape(summary.get('comparison_detail', '无'))}\n"
-            f"今日主战到期日: {html.escape(summary.get('main_expiration', '无'))}\n"
-            f"Call / Put 偏向: {html.escape(summary.get('bias_label', '无明显方向'))}\n"
-            f"最强 strike 带: {html.escape(summary.get('main_band', '无'))}\n"
-            f"原始主战单合约: {html.escape(summary.get('raw_strongest_contract', '无'))}\n"
-            f"新增确认单合约: {html.escape(summary.get('new_strongest_contract', '无'))}\n"
-            f"疑似连续布局: {html.escape(summary.get('continuity_text', '无'))}\n"
-            f"次日重点观察: {html.escape(summary.get('next_watch', '无'))}\n"
-            f"<pre>原始主战榜\n{html.escape(render_contract_table(raw_df, cfg.top_contracts, 'raw_rank_score'))}</pre>\n"
-            f"<pre>新增确认榜\n{html.escape(render_contract_table(new_df, cfg.top_contracts, 'confirmation_score'))}</pre>\n"
-            f"<pre>到期日强度榜\n{html.escape(render_expiration_table(expiration_df, ticker, cfg.top_expirations))}</pre>\n"
-            f"<pre>Strike 带状联动榜\n{html.escape(render_band_table(band_df, ticker, cfg.top_bands))}</pre>"
-        )
+        body = telegram_ticker_brief(ticker, meta, summary)
         _tg_send(token, chat_id, body)
         time.sleep(0.3)
 
@@ -1490,6 +1748,7 @@ def save_daily_outputs(
     trade_date: str,
     snapshot_dir: Path,
     daily_report_dir: Path,
+    history_db_path: Path,
     full_df: pd.DataFrame,
     expiration_df: pd.DataFrame,
     band_df: pd.DataFrame,
@@ -1500,9 +1759,12 @@ def save_daily_outputs(
 ) -> None:
     ensure_dir(snapshot_dir)
     ensure_dir(daily_report_dir)
+    ensure_history_db(history_db_path)
 
     snapshot_path = snapshot_dir / f"options_{trade_date}.csv"
-    full_df[DAILY_FIELDS].to_csv(snapshot_path, index=False, encoding="utf-8-sig")
+    normalized_full_df = normalize_snapshot_df(full_df)
+    normalized_full_df.to_csv(snapshot_path, index=False, encoding="utf-8-sig")
+    upsert_snapshot_db(history_db_path, normalized_full_df)
 
     contracts_path = daily_report_dir / f"contracts_{trade_date}.csv"
     raw_contracts_path = daily_report_dir / f"raw_contracts_{trade_date}.csv"
@@ -1514,19 +1776,19 @@ def save_daily_outputs(
     summary_path = daily_report_dir / f"summary_{trade_date}.txt"
 
     top_contracts = (
-        full_df.sort_values(["ticker", "total_score"], ascending=[True, False])
+        normalized_full_df.sort_values(["ticker", "total_score"], ascending=[True, False])
         .groupby("ticker", group_keys=False)
         .head(10)
         .reset_index(drop=True)
     )
     top_raw_contracts = (
-        raw_contract_view(full_df)
+        raw_contract_view(normalized_full_df)
         .groupby("ticker", group_keys=False)
         .head(10)
         .reset_index(drop=True)
     )
     top_new_contracts = (
-        new_contract_view(full_df, cfg)
+        new_contract_view(normalized_full_df, cfg)
         .groupby("ticker", group_keys=False)
         .head(10)
         .reset_index(drop=True)
@@ -1562,8 +1824,10 @@ def daily_pipeline(cfg: argparse.Namespace) -> None:
 
     snapshot_dir = Path(cfg.snapshot_dir)
     daily_report_dir = Path(cfg.daily_report_dir)
+    history_db_path = Path(cfg.sqlite_db_path)
     ensure_dir(snapshot_dir)
     ensure_dir(daily_report_dir)
+    ensure_history_db(history_db_path)
 
     ticker_raw: Dict[str, pd.DataFrame] = {}
     ticker_meta: Dict[str, Dict[str, Any]] = {}
@@ -1579,9 +1843,18 @@ def daily_pipeline(cfg: argparse.Namespace) -> None:
     if trade_date is None:
         raise RuntimeError("未获取到有效 trade_date")
 
-    prev_path = latest_snapshot_before(snapshot_dir, trade_date)
-    prev_df = load_snapshot(prev_path)
-    prior_dfs = [load_snapshot(p) for p in latest_n_snapshots_before(snapshot_dir, trade_date, 2)]
+    prev_date = latest_snapshot_date_before(history_db_path, snapshot_dir, trade_date)
+    prev_df = load_snapshot_from_db(history_db_path, prev_date)
+    if prev_df.empty:
+        prev_path = latest_snapshot_before(snapshot_dir, trade_date)
+        prev_df = load_snapshot(prev_path)
+    else:
+        prev_path = None
+
+    prior_dates = latest_n_snapshot_dates_before(history_db_path, snapshot_dir, trade_date, 2)
+    prior_dfs = [load_snapshot_from_db(history_db_path, d) for d in prior_dates]
+    if not prior_dfs or all(df.empty for df in prior_dfs):
+        prior_dfs = [load_snapshot(p) for p in latest_n_snapshots_before(snapshot_dir, trade_date, 2)]
 
     scored_parts: List[pd.DataFrame] = []
     ticker_contracts: Dict[str, pd.DataFrame] = {}
@@ -1623,6 +1896,10 @@ def daily_pipeline(cfg: argparse.Namespace) -> None:
         )
 
     trade_date_str = trade_date.isoformat()
+    if cfg.skip_if_trade_date_exists and daily_outputs_exist(snapshot_dir, daily_report_dir, trade_date_str):
+        log.info("跳过日雷达: %s 已存在当日输出", trade_date_str)
+        return
+
     signal_df = build_signal_records(
         trade_date=trade_date_str,
         ticker_meta=ticker_meta,
@@ -1642,6 +1919,7 @@ def daily_pipeline(cfg: argparse.Namespace) -> None:
         trade_date=trade_date_str,
         snapshot_dir=snapshot_dir,
         daily_report_dir=daily_report_dir,
+        history_db_path=history_db_path,
         full_df=full_df,
         expiration_df=expiration_df,
         band_df=band_df,
@@ -1664,10 +1942,142 @@ def daily_pipeline(cfg: argparse.Namespace) -> None:
         cfg=cfg,
     )
 
-    log.info("盘后雷达完成: trade_date=%s prev_snapshot=%s", trade_date_str, prev_path.name if prev_path else "无")
+    prev_ref = prev_date.isoformat() if prev_date is not None else (prev_path.name if prev_path else "无")
+    log.info("盘后雷达完成: trade_date=%s prev_snapshot=%s", trade_date_str, prev_ref)
 
 
-def weekly_summary_for_ticker(ticker: str, frames: List[pd.DataFrame]) -> str:
+def load_recent_signal_rows(daily_report_dir: Path, count: int = 5) -> pd.DataFrame:
+    files = list_report_files(daily_report_dir, "signals")
+    if not files:
+        return pd.DataFrame()
+    frames: List[pd.DataFrame] = []
+    for path in files[-count:]:
+        try:
+            frames.append(pd.read_csv(path))
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def weekly_zone_cluster_summary(ticker: str, frames: List[pd.DataFrame]) -> Dict[str, Any]:
+    bands: List[Dict[str, Any]] = []
+    for frame in frames:
+        if frame is None or frame.empty:
+            continue
+        ticker_frame = frame[frame["ticker"] == ticker].copy()
+        for band in extract_band_groups(ticker_frame):
+            if not band.get("trade_date"):
+                continue
+            bands.append(band)
+
+    if not bands:
+        return {
+            "label": "无",
+            "days": 0,
+            "expiration": "",
+            "option_type": "",
+            "oi_change_sum": 0.0,
+        }
+
+    clusters: List[Dict[str, Any]] = []
+    for band in sorted(bands, key=lambda x: (x["trade_date"], x["expiration"], x["option_type"], x["band_low_strike"])):
+        matched_cluster: Optional[Dict[str, Any]] = None
+        best_overlap = 0.0
+        for cluster in clusters:
+            if cluster["expiration"] != band["expiration"] or cluster["option_type"] != band["option_type"]:
+                continue
+            overlap = strike_overlap_ratio(cluster["strikes"], band["strikes"])
+            if overlap >= 0.5 and overlap > best_overlap:
+                matched_cluster = cluster
+                best_overlap = overlap
+        if matched_cluster is None:
+            clusters.append(
+                {
+                    "expiration": band["expiration"],
+                    "option_type": band["option_type"],
+                    "strikes": list(band["strikes"]),
+                    "labels": [band["band_label"]],
+                    "trade_dates": {band["trade_date"]},
+                    "score_sum": safe_float(band["band_score"], 0.0),
+                    "oi_change_sum": safe_float(band["band_oi_change_sum"], 0.0),
+                }
+            )
+            continue
+
+        matched_cluster["strikes"] = sorted(set(matched_cluster["strikes"]) | set(band["strikes"]))
+        matched_cluster["labels"].append(band["band_label"])
+        matched_cluster["trade_dates"].add(band["trade_date"])
+        matched_cluster["score_sum"] += safe_float(band["band_score"], 0.0)
+        matched_cluster["oi_change_sum"] += safe_float(band["band_oi_change_sum"], 0.0)
+
+    clusters.sort(
+        key=lambda x: (
+            len(x["trade_dates"]),
+            x["score_sum"],
+            x["oi_change_sum"],
+        ),
+        reverse=True,
+    )
+    best = clusters[0]
+    low = min(best["strikes"])
+    high = max(best["strikes"])
+    label = (
+        f"{fmt_strike(low)}-{fmt_strike(high)}{best['option_type']}"
+        if abs(low - high) > 1e-9
+        else f"{fmt_strike(low)}{best['option_type']}"
+    )
+    return {
+        "label": label,
+        "days": len(best["trade_dates"]),
+        "expiration": best["expiration"],
+        "option_type": best["option_type"],
+        "oi_change_sum": round(best["oi_change_sum"], 0),
+    }
+
+
+def weekly_direction_summary(ticker: str, signal_df: pd.DataFrame) -> Dict[str, Any]:
+    if signal_df.empty:
+        return {
+            "switches": 0,
+            "reinforcement_days": 0,
+            "divergence_days": 0,
+            "latest_direction": "无",
+            "latest_bias": "无",
+        }
+
+    df = signal_df[signal_df["ticker"] == ticker].copy()
+    if df.empty:
+        return {
+            "switches": 0,
+            "reinforcement_days": 0,
+            "divergence_days": 0,
+            "latest_direction": "无",
+            "latest_bias": "无",
+        }
+
+    df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
+    df = df.sort_values("trade_date").dropna(subset=["trade_date"])
+    buckets = [str(x) for x in df["direction_bucket"].tolist() if str(x)]
+    switches = 0
+    for prev, cur in zip(buckets, buckets[1:]):
+        if prev != cur:
+            switches += 1
+
+    reinforcement_days = int(df["comparison_label"].isin(["增量强化", "同向扩散"]).sum())
+    divergence_days = int(df["comparison_label"].isin(["对冲分歧", "跨期分歧"]).sum())
+    latest = df.iloc[-1]
+    return {
+        "switches": switches,
+        "reinforcement_days": reinforcement_days,
+        "divergence_days": divergence_days,
+        "latest_direction": str(latest.get("direction_text", "无")),
+        "latest_bias": str(latest.get("bias_label", "无")),
+    }
+
+
+def weekly_summary_for_ticker(ticker: str, frames: List[pd.DataFrame], signal_df: pd.DataFrame) -> str:
     if not frames:
         return f"{ticker} 本周无可用快照。"
 
@@ -1700,6 +2110,8 @@ def weekly_summary_for_ticker(ticker: str, frames: List[pd.DataFrame]) -> str:
     top_exp = exp_df[exp_df["ticker"] == ticker].head(1)
     top_band = band_df[band_df["ticker"] == ticker].head(1)
     top_contract = positive.sort_values("total_score", ascending=False).head(1)
+    zone_summary = weekly_zone_cluster_summary(ticker, frames)
+    direction_summary = weekly_direction_summary(ticker, signal_df)
 
     repeated_contracts = (
         positive.groupby(["expiration", "option_type", "strike"])
@@ -1717,21 +2129,26 @@ def weekly_summary_for_ticker(ticker: str, frames: List[pd.DataFrame]) -> str:
 
     main_exp = top_exp.iloc[0]["expiration"] if not top_exp.empty else "无"
     main_zone = top_exp.iloc[0]["main_zone"] if not top_exp.empty else "无"
-    main_band = top_band.iloc[0]["band_label"] if not top_band.empty else main_zone
-    band_days = int(top_band.iloc[0]["band_continuity_days"]) if not top_band.empty else 1
+    main_band = zone_summary["label"] if zone_summary["days"] >= 2 else (top_band.iloc[0]["band_label"] if not top_band.empty else main_zone)
+    band_days = int(zone_summary["days"]) if zone_summary["days"] >= 1 else (int(top_band.iloc[0]["band_continuity_days"]) if not top_band.empty else 1)
     strongest_contract = (
         f"{top_contract.iloc[0]['expiration']} {fmt_strike(top_contract.iloc[0]['strike'])}{top_contract.iloc[0]['option_type']}"
         if not top_contract.empty
         else "无"
     )
+    switch_text = "无切换" if direction_summary["switches"] == 0 else f"{direction_summary['switches']}次"
+    compare_text = f"强化 {direction_summary['reinforcement_days']} 日 / 分歧 {direction_summary['divergence_days']} 日"
 
     return (
         f"{ticker} 本周期权总结\n"
         f"本周主战到期日：{main_exp}\n"
-        f"本周 Call / Put 偏向：{bias_label}\n"
+        f"本周 Call / Put 偏向：{bias_label}（最新：{direction_summary['latest_direction']}）\n"
         f"本周主战 strike 带：{main_band}\n"
         f"最强单合约：{strongest_contract}\n"
         f"带状连续性：{main_band}（{band_days}日）\n"
+        f"最稳定区域：{zone_summary['expiration']} {zone_summary['label']}（{zone_summary['days']}日）\n"
+        f"方向切换：{switch_text}\n"
+        f"原始/新增关系：{compare_text}\n"
         f"重复出现合约：{repeated_contract_text}\n"
         f"下周优先观察：{main_band} / {main_zone}"
     )
@@ -1774,21 +2191,29 @@ def weekly_pipeline(cfg: argparse.Namespace) -> None:
     snapshot_dir = Path(cfg.snapshot_dir)
     daily_report_dir = Path(cfg.daily_report_dir)
     weekly_report_dir = Path(cfg.weekly_report_dir)
+    history_db_path = Path(cfg.sqlite_db_path)
     ensure_dir(weekly_report_dir)
+    ensure_history_db(history_db_path)
 
-    week_files = load_latest_week_snapshots(snapshot_dir, count=5)
-    if not week_files:
+    week_dates = load_latest_week_trade_dates(history_db_path, snapshot_dir, count=5)
+    if not week_dates:
         log.warning("周总结跳过: 无历史快照")
         return
 
-    frames = [load_snapshot(path) for _, path in week_files]
+    frames = [load_snapshot_from_db(history_db_path, d) for d in week_dates]
+    if not frames or all(frame.empty for frame in frames):
+        fallback_files = list_snapshot_files(snapshot_dir)[-5:]
+        frames = [load_snapshot(path) for path in fallback_files]
+        week_dates = [parse_csv_date_from_name(path) for path in fallback_files if parse_csv_date_from_name(path) is not None]
+
     validation_df = load_recent_validation_rows(daily_report_dir, count=5)
+    signal_df = load_recent_signal_rows(daily_report_dir, count=5)
     texts: List[str] = []
-    start_date = week_files[0][0].isoformat()
-    end_date = week_files[-1][0].isoformat()
+    start_date = week_dates[0].isoformat()
+    end_date = week_dates[-1].isoformat()
 
     for ticker in cfg.tickers:
-        texts.append(weekly_summary_for_ticker(ticker, frames))
+        texts.append(weekly_summary_for_ticker(ticker, frames, signal_df))
         rollup = validation_rollup_text(ticker, validation_df)
         if rollup:
             texts.append(rollup)
@@ -1823,6 +2248,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--snapshot-dir", type=str, default="data/options_snapshots")
     parser.add_argument("--daily-report-dir", type=str, default="reports/daily")
     parser.add_argument("--weekly-report-dir", type=str, default="reports/weekly")
+    parser.add_argument("--sqlite-db-path", type=str, default="data/options_history.sqlite")
 
     parser.add_argument("--min-raw-oi", type=int, default=1000)
     parser.add_argument("--min-raw-volume", type=int, default=50)
@@ -1839,6 +2265,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation-close-threshold-pct", type=float, default=1.0)
     parser.add_argument("--validation-intraday-threshold-pct", type=float, default=1.5)
     parser.add_argument("--enforce-postclose-window", action="store_true")
+    parser.add_argument("--skip-if-trade-date-exists", action="store_true")
 
     parser.add_argument("--tg-token", type=str, default=os.environ.get("TELEGRAM_TOKEN", ""))
     parser.add_argument("--tg-chat", type=str, default=os.environ.get("TELEGRAM_CHAT_ID", ""))
@@ -1856,7 +2283,7 @@ def main() -> None:
 
     if mode == "daily":
         if cfg.enforce_postclose_window and not in_us_postclose_four_hour_window():
-            log.info("跳过日雷达: 当前不在美东盘后 20:00-20:59 窗口")
+            log.info("跳过日雷达: 当前不在美东盘后 20:00-21:59 窗口")
             return
         daily_pipeline(cfg)
         return
