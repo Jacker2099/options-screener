@@ -64,6 +64,9 @@ DAILY_FIELDS = [
     "ask",
     "mid",
     "volume",
+    "prev_volume",
+    "volume_change",
+    "volume_change_pct",
     "open_interest",
     "implied_volatility",
     "last_trade_date",
@@ -75,12 +78,18 @@ DAILY_FIELDS = [
     "distance_pct",
     "signed_distance_pct",
     "premium_notional",
+    "prev_premium_notional",
+    "premium_notional_change",
+    "premium_notional_change_pct",
     "open_interest_notional",
     "prev_open_interest",
     "oi_change",
     "oi_change_pct",
     "oi_change_notional",
     "volume_oi_ratio",
+    "is_monthly",
+    "contract_score",
+    "expiration_rank",
     "positioning_score",
     "oi_score",
     "confirmation_score",
@@ -110,6 +119,9 @@ NUMERIC_FIELDS = {
     "ask",
     "mid",
     "volume",
+    "prev_volume",
+    "volume_change",
+    "volume_change_pct",
     "open_interest",
     "implied_volatility",
     "underlying_close",
@@ -120,12 +132,18 @@ NUMERIC_FIELDS = {
     "distance_pct",
     "signed_distance_pct",
     "premium_notional",
+    "prev_premium_notional",
+    "premium_notional_change",
+    "premium_notional_change_pct",
     "open_interest_notional",
     "prev_open_interest",
     "oi_change",
     "oi_change_pct",
     "oi_change_notional",
     "volume_oi_ratio",
+    "is_monthly",
+    "contract_score",
+    "expiration_rank",
     "positioning_score",
     "oi_score",
     "confirmation_score",
@@ -329,6 +347,11 @@ def ensure_history_db(db_path: Path) -> None:
             ON options_daily (ticker, trade_date)
             """
         )
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(options_daily)").fetchall()}
+        for col in DAILY_FIELDS:
+            if col in existing_cols:
+                continue
+            conn.execute(f'ALTER TABLE options_daily ADD COLUMN "{col}" {sqlite_type_for_column(col)}')
 
 
 def upsert_snapshot_db(db_path: Path, df: pd.DataFrame) -> None:
@@ -591,17 +614,33 @@ def merge_previous_oi(today_df: pd.DataFrame, prev_df: pd.DataFrame) -> Tuple[pd
 
     if bootstrap_mode:
         merged["prev_open_interest"] = merged["open_interest"].fillna(0)
+        merged["prev_volume"] = 0.0
+        merged["prev_premium_notional"] = 0.0
         merged["oi_change"] = 0.0
         merged["oi_change_pct"] = 0.0
     else:
-        prev = prev_df[key + ["open_interest"]].copy().rename(columns={"open_interest": "prev_open_interest"})
+        prev = prev_df[key + ["open_interest", "volume", "premium_notional"]].copy().rename(
+            columns={
+                "open_interest": "prev_open_interest",
+                "volume": "prev_volume",
+                "premium_notional": "prev_premium_notional",
+            }
+        )
         merged = merged.merge(prev, on=key, how="left")
         merged["prev_open_interest"] = merged["prev_open_interest"].fillna(0)
+        merged["prev_volume"] = merged["prev_volume"].fillna(0)
+        merged["prev_premium_notional"] = merged["prev_premium_notional"].fillna(0)
         merged["oi_change"] = merged["open_interest"].fillna(0) - merged["prev_open_interest"].fillna(0)
         merged["oi_change_pct"] = merged["oi_change"] / merged["prev_open_interest"].replace(0, 1)
 
     merged["volume_oi_ratio"] = merged["volume"].fillna(0) / merged["open_interest"].replace(0, 1)
+    merged["volume_change"] = merged["volume"].fillna(0) - merged["prev_volume"].fillna(0)
+    merged["volume_change_pct"] = merged["volume_change"] / merged["prev_volume"].replace(0, 1)
     merged["oi_change_notional"] = merged["oi_change"].clip(lower=0).fillna(0) * merged["mid"].fillna(0) * 100.0
+    merged["premium_notional_change"] = merged["premium_notional"].fillna(0) - merged["prev_premium_notional"].fillna(0)
+    merged["premium_notional_change_pct"] = (
+        merged["premium_notional_change"] / merged["prev_premium_notional"].replace(0, 1)
+    )
     return merged, bootstrap_mode
 
 
@@ -617,6 +656,261 @@ def apply_filters(df: pd.DataFrame, cfg: argparse.Namespace) -> pd.DataFrame:
     ].copy()
     return out
 
+
+def is_monthly_expiration(value: Any) -> bool:
+    try:
+        exp = pd.Timestamp(value).date()
+    except Exception:
+        return False
+    return exp.weekday() == 4 and 15 <= exp.day <= 21
+
+
+def filter_monthly_universe(df: pd.DataFrame, cfg: argparse.Namespace) -> pd.DataFrame:
+    out = apply_filters(df, cfg)
+    if out.empty:
+        return out
+    out["is_monthly"] = out["expiration"].apply(lambda x: 1 if is_monthly_expiration(x) else 0)
+    out = out[out["is_monthly"] == 1].copy()
+    if out.empty:
+        return out
+    expirations = sorted(out["expiration"].dropna().unique().tolist())
+    selected = expirations[: cfg.monthly_count]
+    out = out[out["expiration"].isin(selected)].copy()
+    return out.sort_values(["ticker", "expiration", "option_type", "strike"]).reset_index(drop=True)
+
+
+def split_points(left: float, right: float, weight: float) -> Tuple[float, float]:
+    left = max(left, 0.0)
+    right = max(right, 0.0)
+    total = left + right
+    if total <= 0:
+        return weight / 2.0, weight / 2.0
+    return left / total * weight, right / total * weight
+
+
+def compute_direction_strength(monthly_df: pd.DataFrame, bootstrap_mode: bool) -> Dict[str, Any]:
+    if monthly_df.empty:
+        return {
+            "side": "C",
+            "bias_label": "无明显方向",
+            "direction_text": "无方向",
+            "confidence_score": 0.0,
+            "confidence_text": "观察",
+            "reason_text": "无有效月期权样本。",
+            "call_score": 0.0,
+            "put_score": 0.0,
+        }
+
+    call_df = monthly_df[monthly_df["option_type"] == "C"].copy()
+    put_df = monthly_df[monthly_df["option_type"] == "P"].copy()
+
+    call_oi_total = safe_float(call_df["open_interest"].sum(), 0.0)
+    put_oi_total = safe_float(put_df["open_interest"].sum(), 0.0)
+    call_vol_total = safe_float(call_df["volume"].sum(), 0.0)
+    put_vol_total = safe_float(put_df["volume"].sum(), 0.0)
+    call_amt_total = safe_float(call_df["premium_notional"].sum(), 0.0)
+    put_amt_total = safe_float(put_df["premium_notional"].sum(), 0.0)
+
+    call_oi_delta = safe_float(call_df["oi_change"].sum(), 0.0)
+    put_oi_delta = safe_float(put_df["oi_change"].sum(), 0.0)
+    call_vol_delta = safe_float(call_df["volume_change"].sum(), 0.0)
+    put_vol_delta = safe_float(put_df["volume_change"].sum(), 0.0)
+    call_amt_delta = safe_float(call_df["premium_notional_change"].sum(), 0.0)
+    put_amt_delta = safe_float(put_df["premium_notional_change"].sum(), 0.0)
+
+    call_level = 0.0
+    put_level = 0.0
+    for c_val, p_val, weight in [
+        (call_oi_total, put_oi_total, 45.0),
+        (call_vol_total, put_vol_total, 25.0),
+        (call_amt_total, put_amt_total, 30.0),
+    ]:
+        c_pts, p_pts = split_points(c_val, p_val, weight)
+        call_level += c_pts
+        put_level += p_pts
+
+    if bootstrap_mode:
+        call_score = call_level
+        put_score = put_level
+    else:
+        call_delta = 0.0
+        put_delta = 0.0
+        for c_val, p_val, weight in [
+            (call_oi_delta, put_oi_delta, 50.0),
+            (call_vol_delta, put_vol_delta, 20.0),
+            (call_amt_delta, put_amt_delta, 30.0),
+        ]:
+            c_pts, p_pts = split_points(c_val, p_val, weight)
+            call_delta += c_pts
+            put_delta += p_pts
+        call_score = call_level * 0.35 + call_delta * 0.65
+        put_score = put_level * 0.35 + put_delta * 0.65
+
+    if call_score >= put_score:
+        side = "C"
+        bias_label = "Call 偏强"
+        direction_text = "看多"
+    else:
+        side = "P"
+        bias_label = "Put 偏强"
+        direction_text = "看空"
+
+    confidence_score = clip(55.0 + abs(call_score - put_score) * 0.45, 0.0, 100.0)
+    reason_text = (
+        f"Call总量 OI {call_oi_total:.0f} / Vol {call_vol_total:.0f} / Amt {call_amt_total/1000:.0f}K / "
+        f"ΔOI {call_oi_delta:+.0f} / ΔVol {call_vol_delta:+.0f} / ΔAmt {call_amt_delta/1000:+.0f}K；"
+        f"Put总量 OI {put_oi_total:.0f} / Vol {put_vol_total:.0f} / Amt {put_amt_total/1000:.0f}K / "
+        f"ΔOI {put_oi_delta:+.0f} / ΔVol {put_vol_delta:+.0f} / ΔAmt {put_amt_delta/1000:+.0f}K"
+    )
+    return {
+        "side": side,
+        "bias_label": bias_label,
+        "direction_text": direction_text,
+        "confidence_score": round(confidence_score, 1),
+        "confidence_text": confidence_label(confidence_score),
+        "reason_text": reason_text,
+        "call_score": round(call_score, 1),
+        "put_score": round(put_score, 1),
+        "call_oi_total": round(call_oi_total, 0),
+        "put_oi_total": round(put_oi_total, 0),
+        "call_vol_total": round(call_vol_total, 0),
+        "put_vol_total": round(put_vol_total, 0),
+        "call_amt_total": round(call_amt_total, 0),
+        "put_amt_total": round(put_amt_total, 0),
+        "call_oi_delta": round(call_oi_delta, 0),
+        "put_oi_delta": round(put_oi_delta, 0),
+        "call_vol_delta": round(call_vol_delta, 0),
+        "put_vol_delta": round(put_vol_delta, 0),
+        "call_amt_delta": round(call_amt_delta, 0),
+        "put_amt_delta": round(put_amt_delta, 0),
+    }
+
+
+def exclude_closest_strikes(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    parts: List[pd.DataFrame] = []
+    for expiration, group in df.groupby("expiration"):
+        min_dist = safe_float(group["distance_pct"].min(), 0.0)
+        trimmed = group[group["distance_pct"] > min_dist + 1e-12].copy()
+        parts.append(trimmed if not trimmed.empty else group.copy())
+    return pd.concat(parts, ignore_index=True) if parts else df.copy()
+
+
+def rank_directional_contracts(monthly_df: pd.DataFrame, side: str, cfg: argparse.Namespace, bootstrap_mode: bool) -> pd.DataFrame:
+    side_df = monthly_df[monthly_df["option_type"] == side].copy()
+    if side_df.empty:
+        return side_df
+
+    side_df = exclude_closest_strikes(side_df)
+    ranked_parts: List[pd.DataFrame] = []
+    for expiration, group in side_df.groupby("expiration"):
+        g = group.copy()
+        oi_max = max(safe_float(g["open_interest"].max(), 1.0), 1.0)
+        vol_max = max(safe_float(g["volume"].max(), 1.0), 1.0)
+        amt_max = max(safe_float(g["premium_notional"].max(), 1.0), 1.0)
+        oi_delta_max = max(safe_float(g["oi_change"].clip(lower=0).max(), 1.0), 1.0)
+        vol_delta_max = max(safe_float(g["volume_change"].clip(lower=0).max(), 1.0), 1.0)
+        amt_delta_max = max(safe_float(g["premium_notional_change"].clip(lower=0).max(), 1.0), 1.0)
+
+        g["contract_score"] = (
+            (g["open_interest"] / oi_max).clip(upper=1.0) * 45.0
+            + (g["volume"] / vol_max).clip(upper=1.0) * 25.0
+            + (g["premium_notional"] / amt_max).clip(upper=1.0) * 20.0
+        )
+        g["confirmation_score"] = 0.0
+        if not bootstrap_mode:
+            g["confirmation_score"] = (
+                (g["oi_change"].clip(lower=0) / oi_delta_max).clip(upper=1.0) * 5.0
+                + (g["volume_change"].clip(lower=0) / vol_delta_max).clip(upper=1.0) * 3.0
+                + (g["premium_notional_change"].clip(lower=0) / amt_delta_max).clip(upper=1.0) * 2.0
+            )
+            g["contract_score"] += g["confirmation_score"]
+        g["contract_score"] = g["contract_score"].round(2)
+        g["raw_rank_score"] = g["contract_score"]
+        g["total_score"] = g["contract_score"]
+        g = g.sort_values(
+            ["contract_score", "open_interest", "volume", "premium_notional"],
+            ascending=[False, False, False, False],
+        ).reset_index(drop=True)
+        g["expiration_rank"] = range(1, len(g) + 1)
+        ranked_parts.append(g.head(cfg.top_contracts))
+
+    return pd.concat(ranked_parts, ignore_index=True) if ranked_parts else side_df.head(0)
+
+
+def build_monthly_expiration_summary(monthly_df: pd.DataFrame, side: str) -> pd.DataFrame:
+    side_df = monthly_df[monthly_df["option_type"] == side].copy()
+    opp_side = "P" if side == "C" else "C"
+    if side_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "ticker",
+                "expiration",
+                "direction_side",
+                "bias_label",
+                "side_oi_total",
+                "side_volume_total",
+                "side_amount_total",
+                "side_oi_change",
+                "side_volume_change",
+                "side_amount_change",
+                "opp_oi_total",
+                "opp_volume_total",
+                "opp_amount_total",
+                "expiration_score",
+            ]
+        )
+
+    rows: List[Dict[str, Any]] = []
+    grouped = []
+    for (ticker, expiration), group in side_df.groupby(["ticker", "expiration"]):
+        all_exp_group = monthly_df[(monthly_df["ticker"] == ticker) & (monthly_df["expiration"] == expiration)].copy()
+        side_oi_total = safe_float(group["open_interest"].sum(), 0.0)
+        side_volume_total = safe_float(group["volume"].sum(), 0.0)
+        side_amount_total = safe_float(group["premium_notional"].sum(), 0.0)
+        side_oi_change = safe_float(group["oi_change"].sum(), 0.0)
+        side_volume_change = safe_float(group["volume_change"].sum(), 0.0)
+        side_amount_change = safe_float(group["premium_notional_change"].sum(), 0.0)
+        opp_group = all_exp_group[all_exp_group["option_type"] == opp_side]
+        grouped.append(
+            {
+                "ticker": ticker,
+                "expiration": expiration,
+                "direction_side": side,
+                "bias_label": "Call 偏强" if side == "C" else "Put 偏强",
+                "side_oi_total": side_oi_total,
+                "side_volume_total": side_volume_total,
+                "side_amount_total": side_amount_total,
+                "side_oi_change": side_oi_change,
+                "side_volume_change": side_volume_change,
+                "side_amount_change": side_amount_change,
+                "opp_oi_total": safe_float(opp_group["open_interest"].sum(), 0.0),
+                "opp_volume_total": safe_float(opp_group["volume"].sum(), 0.0),
+                "opp_amount_total": safe_float(opp_group["premium_notional"].sum(), 0.0),
+            }
+        )
+
+    if not grouped:
+        return pd.DataFrame(rows)
+
+    temp = pd.DataFrame(grouped)
+    oi_max = max(safe_float(temp["side_oi_total"].max(), 1.0), 1.0)
+    vol_max = max(safe_float(temp["side_volume_total"].max(), 1.0), 1.0)
+    amt_max = max(safe_float(temp["side_amount_total"].max(), 1.0), 1.0)
+    oi_delta_max = max(safe_float(temp["side_oi_change"].clip(lower=0).max(), 1.0), 1.0)
+    for _, row in temp.iterrows():
+        score = (
+            min(safe_float(row["side_oi_total"], 0.0) / oi_max, 1.0) * 45.0
+            + min(safe_float(row["side_volume_total"], 0.0) / vol_max, 1.0) * 25.0
+            + min(safe_float(row["side_amount_total"], 0.0) / amt_max, 1.0) * 20.0
+            + min(max(safe_float(row["side_oi_change"], 0.0), 0.0) / oi_delta_max, 1.0) * 10.0
+        )
+        item = row.to_dict()
+        item["expiration_score"] = round(score, 2)
+        rows.append(item)
+
+    return pd.DataFrame(rows).sort_values(["ticker", "expiration_score"], ascending=[True, False]).reset_index(drop=True)
 
 def assign_location_score(option_type: str, signed_distance_pct: float) -> float:
     if option_type == "C":
@@ -1167,7 +1461,11 @@ def infer_direction_text(bias_label: str, option_type: str) -> str:
 
 
 def infer_direction_bucket(direction_text: str) -> str:
-    return "bullish" if "看多" in direction_text else "bearish"
+    if "看多" in direction_text:
+        return "bullish"
+    if "看空" in direction_text:
+        return "bearish"
+    return ""
 
 
 def confidence_label(score: float) -> str:
@@ -1228,6 +1526,31 @@ def new_contract_view(df: pd.DataFrame, cfg: Optional[argparse.Namespace] = None
 
 def contract_text_from_row(row: pd.Series) -> str:
     return f"{row['expiration']} {fmt_strike(safe_float(row['strike'], 0.0))}{row['option_type']}"
+
+
+def compact_contract_text(row: pd.Series) -> str:
+    return f"{fmt_strike(safe_float(row['strike'], 0.0))}{row['option_type']}"
+
+
+def contract_delta_brief(row: pd.Series) -> str:
+    return (
+        f"{compact_contract_text(row)} "
+        f"OI {safe_float(row.get('open_interest'), 0.0):.0f} ({safe_float(row.get('oi_change'), 0.0):+.0f}) "
+        f"Vol {safe_float(row.get('volume'), 0.0):.0f} ({safe_float(row.get('volume_change'), 0.0):+.0f}) "
+        f"Amt {safe_float(row.get('premium_notional'), 0.0)/1000:.0f}K ({safe_float(row.get('premium_notional_change'), 0.0)/1000:+.0f}K)"
+    )
+
+
+def monthly_sections_text(contracts_df: pd.DataFrame, plain: bool = False) -> str:
+    if contracts_df.empty:
+        return "无"
+    sections: List[str] = []
+    for expiration, group in contracts_df.groupby("expiration"):
+        lines = [f"{expiration}"]
+        for _, row in group.sort_values("expiration_rank").iterrows():
+            lines.append(contract_delta_brief(row))
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections)
 
 
 def compare_raw_and_new(raw_df: pd.DataFrame, new_df: pd.DataFrame, spot: float) -> Dict[str, str]:
@@ -1314,154 +1637,118 @@ def build_daily_summary(
     contracts_df: pd.DataFrame,
     expiration_df: pd.DataFrame,
     band_df: pd.DataFrame,
+    direction_info: Dict[str, Any],
     cfg: argparse.Namespace,
     bootstrap_mode: bool,
 ) -> Dict[str, str]:
-    if contracts_df.empty:
+    ticker_exp_df = expiration_df[expiration_df["ticker"] == ticker].copy()
+    if contracts_df.empty or ticker_exp_df.empty:
         text = (
-            f"{ticker} 盘后期权雷达\n"
+            f"{ticker} 盘后月期权雷达\n"
             f"标的收盘价：{meta['underlying_close']:.2f} ({meta['underlying_change_pct']:+.2f}%)\n"
-            "今日未发现满足规则的主战合约信号。"
+            "今日未发现满足规则的月期权方向信号。"
         )
         return {
             "main_expiration": "",
-            "bias_label": "无明显方向",
+            "bias_label": direction_info.get("bias_label", "无明显方向"),
             "direction_text": "无方向",
             "direction_bucket": "",
             "confidence_text": "观察",
             "confidence_score": "0.0",
             "confirmation_text": "无",
             "comparison_label": "无对比",
-            "comparison_detail": "无可用合约进行原始/新增对比。",
+            "comparison_detail": "无可用月期权合约进行增减分析。",
             "main_band": "",
             "strongest_contract": "",
             "raw_strongest_contract": "",
             "new_strongest_contract": "",
             "continuity_text": "无",
             "next_watch": "无",
+            "direction_reason": direction_info.get("reason_text", ""),
+            "monthly_sections_text": "无",
             "summary_text": text,
         }
 
-    raw_contracts = raw_contract_view(contracts_df)
-    new_contracts = new_contract_view(contracts_df, cfg)
-    top_contract = raw_contracts.iloc[0]
-    main_exp_row = expiration_df[expiration_df["ticker"] == ticker].head(1)
-    ticker_band_df = band_df[band_df["ticker"] == ticker].copy()
+    main_exp_row = ticker_exp_df.head(1).iloc[0]
+    main_exp = str(main_exp_row["expiration"])
+    main_side = str(main_exp_row["direction_side"])
+    bias_label = str(direction_info.get("bias_label", main_exp_row.get("bias_label", "无明显方向")))
+    direction_text = str(direction_info.get("direction_text", infer_direction_text(bias_label, main_side)))
 
-    main_exp = top_contract["expiration"]
-    bias_label = "均衡"
-    main_zone = ""
-    main_side = top_contract["option_type"]
-    if not main_exp_row.empty:
-        main_exp = main_exp_row.iloc[0]["expiration"]
-        bias_label = main_exp_row.iloc[0]["bias_label"]
-        main_zone = main_exp_row.iloc[0]["main_zone"]
-        if bias_label == "Put 偏强":
-            main_side = "P"
-        elif bias_label == "Call 偏强":
-            main_side = "C"
+    main_exp_contracts = contracts_df[contracts_df["expiration"] == main_exp].copy()
+    if main_exp_contracts.empty:
+        main_exp_contracts = contracts_df.copy()
+    main_exp_contracts = main_exp_contracts.sort_values(
+        ["expiration_rank", "contract_score", "open_interest"],
+        ascending=[True, False, False],
+    ).reset_index(drop=True)
 
-    raw_display_df = prioritize_context_rows(
-        raw_contracts,
-        expiration=str(main_exp),
-        option_type=str(main_side),
-        allow_same_exp_opposite=False,
-        allow_global_fallback=True,
+    top_contract = main_exp_contracts.iloc[0]
+    strongest_contract = contract_text_from_row(top_contract)
+    focus_contracts = " / ".join(
+        compact_contract_text(row)
+        for _, row in main_exp_contracts.head(3).iterrows()
     )
-    raw_compare_df = prioritize_context_rows(
-        raw_contracts,
-        expiration=str(main_exp),
-        option_type=str(main_side),
-        allow_same_exp_opposite=True,
-        allow_global_fallback=True,
-    )
-    new_display_df = prioritize_context_rows(
-        new_contracts,
-        expiration=str(main_exp),
-        option_type=str(main_side),
-        allow_same_exp_opposite=False,
-        allow_global_fallback=False,
-    )
-    new_compare_df = prioritize_context_rows(
-        new_contracts,
-        expiration=str(main_exp),
-        option_type=str(main_side),
-        allow_same_exp_opposite=True,
-        allow_global_fallback=True,
-    )
-    comparison = compare_raw_and_new(raw_compare_df, new_compare_df, safe_float(meta.get("underlying_close"), 0.0))
+    focus_contracts = focus_contracts or compact_contract_text(top_contract)
 
-    top_contract = raw_display_df.iloc[0] if not raw_display_df.empty else raw_contracts.iloc[0]
-
-    main_band_row = prioritize_context_rows(
-        ticker_band_df,
-        expiration=str(main_exp),
-        option_type=str(main_side),
-        allow_same_exp_opposite=False,
-        allow_global_fallback=False,
-    ).head(1)
-
-    if not main_band_row.empty:
-        main_band = main_band_row.iloc[0]["band_label"]
-        band_days = int(main_band_row.iloc[0]["band_continuity_days"])
-    else:
-        main_band = main_zone or f"{fmt_strike(top_contract['strike'])}{top_contract['option_type']}"
-        band_days = int(top_contract.get("band_continuity_days", top_contract["continuity_days"]))
-
-    strongest_contract = (
-        f"{top_contract['expiration']} {fmt_strike(top_contract['strike'])}{top_contract['option_type']}"
-    )
+    positive_new = main_exp_contracts[
+        (main_exp_contracts["oi_change"] > 0)
+        | (main_exp_contracts["volume_change"] > 0)
+        | (main_exp_contracts["premium_notional_change"] > 0)
+    ].copy()
     new_strongest_contract = (
-        f"{new_display_df.iloc[0]['expiration']} {fmt_strike(new_display_df.iloc[0]['strike'])}{new_display_df.iloc[0]['option_type']}"
-        if not new_display_df.empty
-        else "无同向新增确认"
+        contract_text_from_row(positive_new.iloc[0]) if not positive_new.empty else "无明显新增"
     )
-    direction_text = infer_direction_text(bias_label, top_contract["option_type"])
+
+    exp_oi_delta = safe_float(main_exp_row.get("side_oi_change"), 0.0)
+    exp_vol_delta = safe_float(main_exp_row.get("side_volume_change"), 0.0)
+    exp_amt_delta = safe_float(main_exp_row.get("side_amount_change"), 0.0)
+    if exp_oi_delta > 0 and exp_vol_delta > 0 and exp_amt_delta > 0:
+        comparison_label = "增仓放量"
+    elif exp_oi_delta > 0:
+        comparison_label = "增仓主导"
+    elif exp_vol_delta > 0 or exp_amt_delta > 0:
+        comparison_label = "成交活跃"
+    else:
+        comparison_label = "存量观察"
+    comparison_detail = (
+        f"{main_exp} {direction_text} | ΔOI {exp_oi_delta:+.0f} | "
+        f"ΔVol {exp_vol_delta:+.0f} | ΔAmt {exp_amt_delta/1000:+.0f}K"
+    )
+
+    confidence_score = clip(
+        safe_float(direction_info.get("confidence_score"), 0.0) * 0.7
+        + safe_float(main_exp_row.get("expiration_score"), 0.0) * 0.3,
+        0.0,
+        100.0,
+    )
+    confidence_text = confidence_label(confidence_score)
     confirmation_text = confirmation_label(
         safe_float(top_contract["open_interest"], 0.0),
         safe_float(top_contract["oi_change"], 0.0),
         safe_float(top_contract["oi_change_pct"], 0.0),
     )
-    top_exp_score = safe_float(main_exp_row.iloc[0]["expiration_score"], 0.0) if not main_exp_row.empty else 0.0
-    top_band_score = safe_float(main_band_row.iloc[0]["band_score"], 0.0) if not main_band_row.empty else 0.0
-    confidence_score = clip(
-        safe_float(top_contract["total_score"], 0.0) * 0.55 + top_exp_score * 0.30 + top_band_score * 0.15,
-        0.0,
-        100.0,
+    continuity_days = int(top_contract.get("continuity_days", 0))
+    continuity_text = (
+        f"{compact_contract_text(top_contract)}（{continuity_days}日）" if continuity_days >= 2 else "以当日月度仓位变化为主"
     )
-    confidence_text = confidence_label(confidence_score)
-    top_contract_days = int(top_contract["continuity_days"])
-    zone_contract_days = int(top_contract.get("band_continuity_days", top_contract_days))
-    if main_band and band_days >= 2:
-        continuity_text = f"{main_band}（{max(band_days, 1)}日）" if band_days >= 2 else "无明确连续布局"
-    elif main_band and zone_contract_days >= 2:
-        continuity_text = f"{main_band}（{zone_contract_days}日）"
-    elif top_contract_days >= 2:
-        continuity_text = (
-            f"{fmt_strike(top_contract['strike'])}{top_contract['option_type']}（{top_contract_days}日）"
-        )
-    else:
-        continuity_text = "无明确连续布局"
-
-    opposite_zone = strongest_opposite_zone(contracts_df, main_side, preferred_expiration=str(main_exp))
-    watch_items = [x for x in [main_band or main_zone, opposite_zone] if x]
-    next_watch = " / ".join(watch_items) if watch_items else strongest_contract
-
-    bootstrap_note = "初始化模式：缺少前一日快照，OI增量与连续布局为预热状态。\n" if bootstrap_mode else ""
+    opposite_zone = strongest_opposite_zone(contracts_df, main_side, preferred_expiration=main_exp)
+    next_watch = " / ".join([x for x in [focus_contracts, opposite_zone] if x]) or strongest_contract
+    monthly_text = monthly_sections_text(contracts_df)
+    bootstrap_note = "初始化模式：缺少前一日快照，OI 增减仅供预热参考。\n" if bootstrap_mode else ""
     text = (
         f"{ticker} 盘后期权雷达\n"
         f"标的收盘价：{meta['underlying_close']:.2f} ({meta['underlying_change_pct']:+.2f}%)\n"
         f"方向结论：{direction_text}（{confidence_text}置信，{confidence_score:.1f}分）\n"
-        f"仓位属性：{confirmation_text}\n"
-        f"原始/新增关系：{comparison['comparison_label']}\n"
-        f"分析结论：{comparison['comparison_detail']}\n"
-        f"今日主战到期日：{main_exp}\n"
-        f"Call / Put 偏向：{bias_label}\n"
-        f"最强 strike 带：{main_band or main_zone or '无'}\n"
-        f"原始主战单合约：{strongest_contract}\n"
+        f"方向依据：{direction_info.get('reason_text', '')}\n"
+        f"今日主月到期：{main_exp}\n"
+        f"主月重点合约：{focus_contracts}\n"
+        f"主战单合约：{strongest_contract}\n"
         f"新增确认单合约：{new_strongest_contract}\n"
-        f"疑似连续布局：{continuity_text}\n"
+        f"月度变化：{comparison_detail}\n"
+        f"连续性：{continuity_text}\n"
         f"次日重点观察：{next_watch}\n"
+        f"\n月度前五合约\n{monthly_text}\n"
         f"{bootstrap_note}".rstrip()
     )
     return {
@@ -1472,14 +1759,16 @@ def build_daily_summary(
         "confidence_text": str(confidence_text),
         "confidence_score": f"{confidence_score:.1f}",
         "confirmation_text": str(confirmation_text),
-        "comparison_label": str(comparison["comparison_label"]),
-        "comparison_detail": str(comparison["comparison_detail"]),
-        "main_band": str(main_band or main_zone),
+        "comparison_label": str(comparison_label),
+        "comparison_detail": str(comparison_detail),
+        "main_band": str(focus_contracts),
         "strongest_contract": str(strongest_contract),
         "raw_strongest_contract": str(strongest_contract),
         "new_strongest_contract": str(new_strongest_contract),
         "continuity_text": str(continuity_text),
         "next_watch": str(next_watch),
+        "direction_reason": str(direction_info.get("reason_text", "")),
+        "monthly_sections_text": str(monthly_text),
         "summary_text": text,
     }
 
@@ -1494,9 +1783,11 @@ def build_signal_records(
 ) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     for ticker, meta in ticker_meta.items():
-        contracts_df = ticker_contracts.get(ticker, pd.DataFrame()).sort_values("total_score", ascending=False)
+        contracts_df = ticker_contracts.get(ticker, pd.DataFrame()).sort_values(
+            ["expiration", "expiration_rank", "contract_score"],
+            ascending=[True, True, False],
+        )
         exp_row = expiration_df[expiration_df["ticker"] == ticker].head(1)
-        band_row = band_df[band_df["ticker"] == ticker].head(1)
         summary = summaries.get(ticker, {})
         top_contract = contracts_df.head(1)
 
@@ -1521,10 +1812,10 @@ def build_signal_records(
                 "strongest_contract": summary.get("strongest_contract", ""),
                 "raw_strongest_contract": summary.get("raw_strongest_contract", ""),
                 "new_strongest_contract": summary.get("new_strongest_contract", ""),
-                "top_contract_score": safe_float(top_contract.iloc[0]["total_score"], 0.0) if not top_contract.empty else 0.0,
+                "top_contract_score": safe_float(top_contract.iloc[0].get("contract_score"), 0.0) if not top_contract.empty else 0.0,
                 "top_contract_notional": safe_float(top_contract.iloc[0]["premium_notional"], 0.0) if not top_contract.empty else 0.0,
                 "top_expiration_score": safe_float(exp_row.iloc[0]["expiration_score"], 0.0) if not exp_row.empty else 0.0,
-                "top_band_score": safe_float(band_row.iloc[0]["band_score"], 0.0) if not band_row.empty else 0.0,
+                "top_band_score": 0.0,
             }
         )
     return pd.DataFrame(rows)
@@ -1578,7 +1869,7 @@ def evaluate_previous_signals(
                 result = "失效"
             else:
                 result = "观察"
-        else:
+        elif direction_bucket == "bearish":
             favorable_excursion_pct = (prev_close - current_low) / prev_close * 100.0
             if next_close_change_pct <= -close_threshold_pct:
                 result = "命中"
@@ -1588,6 +1879,9 @@ def evaluate_previous_signals(
                 result = "失效"
             else:
                 result = "观察"
+        else:
+            favorable_excursion_pct = 0.0
+            result = "观察"
 
         rows.append(
             {
@@ -1725,23 +2019,27 @@ def telegram_ticker_brief(ticker: str, meta: Dict[str, Any], summary: Dict[str, 
     score = html.escape(summary.get("confidence_score", "0"))
     main_exp = html.escape(summary.get("main_expiration", "无"))
     main_band = html.escape(summary.get("main_band", "无"))
+    direction_reason = html.escape(summary.get("direction_reason", ""))
     raw_contract = html.escape(summary.get("raw_strongest_contract", "无"))
     new_contract = html.escape(summary.get("new_strongest_contract", "无"))
-    compare_label = html.escape(summary.get("comparison_label", "无对比"))
+    compare_detail = html.escape(summary.get("comparison_detail", "无"))
     continuity = html.escape(summary.get("continuity_text", "无"))
     next_watch = html.escape(summary.get("next_watch", "无"))
+    monthly_lines = html.escape(summary.get("monthly_sections_text", "无"))
 
     return (
         f"<b>{ticker}</b>\n"
         f"收盘 {price:.2f} ({chg:+.2f}%)\n"
         f"方向 {direction} | {confidence}置信 ({score}分)\n"
-        f"主战到期 {main_exp}\n"
-        f"主战区域 {main_band}\n"
-        f"原始主战 {raw_contract}\n"
-        f"新增确认 {new_contract}\n"
-        f"关系 {compare_label}\n"
+        f"方向依据 {direction_reason}\n"
+        f"主月到期 {main_exp}\n"
+        f"主月重点 {main_band}\n"
+        f"主战单合约 {raw_contract}\n"
+        f"新增变化 {new_contract}\n"
+        f"月度变化 {compare_detail}\n"
         f"连续性 {continuity}\n"
-        f"次日观察 {next_watch}"
+        f"次日观察 {next_watch}\n\n"
+        f"<pre>{monthly_lines}</pre>"
     )
 
 
@@ -1792,9 +2090,10 @@ def send_daily_telegram(
             f"{summary.get('main_expiration', '无')} | {summary.get('main_band', '无')}"
         )
     header = (
-        f"📡 <b>盘后期权雷达</b>\n"
+        f"📡 <b>盘后月期权雷达</b>\n"
         f"交易日: {trade_date}\n"
         f"标的: {', '.join(cfg.tickers)}\n"
+        f"规则: 仅月期权 | 排除周度 | DTE&gt;10 | 排除最近行权价\n"
         f"{'提示: 当前处于初始化模式，OI增量为预热状态' if bootstrap_mode else '提示: 以下结论基于前一日快照对比'}\n\n"
         + "\n".join(overview_lines)
     )
@@ -1823,6 +2122,7 @@ def save_daily_outputs(
     daily_report_dir: Path,
     history_db_path: Path,
     full_df: pd.DataFrame,
+    report_df: pd.DataFrame,
     expiration_df: pd.DataFrame,
     band_df: pd.DataFrame,
     signal_df: pd.DataFrame,
@@ -1848,22 +2148,24 @@ def save_daily_outputs(
     validation_path = daily_report_dir / f"validation_{trade_date}.csv"
     summary_path = daily_report_dir / f"summary_{trade_date}.txt"
 
+    normalized_report_df = normalize_snapshot_df(report_df)
+
     top_contracts = (
-        normalized_full_df.sort_values(["ticker", "total_score"], ascending=[True, False])
+        normalized_report_df.sort_values(["ticker", "expiration", "expiration_rank", "contract_score"], ascending=[True, True, True, False])
         .groupby("ticker", group_keys=False)
-        .head(10)
+        .head(cfg.top_contracts * max(1, cfg.monthly_count))
         .reset_index(drop=True)
     )
     top_raw_contracts = (
-        raw_contract_view(normalized_full_df)
+        raw_contract_view(normalized_report_df)
         .groupby("ticker", group_keys=False)
-        .head(10)
+        .head(cfg.top_contracts * max(1, cfg.monthly_count))
         .reset_index(drop=True)
     )
     top_new_contracts = (
-        new_contract_view(normalized_full_df, cfg)
+        new_contract_view(normalized_report_df, cfg)
         .groupby("ticker", group_keys=False)
-        .head(10)
+        .head(cfg.top_contracts * max(1, cfg.monthly_count))
         .reset_index(drop=True)
     )
     top_contracts.to_csv(contracts_path, index=False, encoding="utf-8-sig")
@@ -1883,10 +2185,11 @@ def save_daily_outputs(
         ticker_raw = top_raw_contracts[top_raw_contracts["ticker"] == ticker]
         ticker_new = top_new_contracts[top_new_contracts["ticker"] == ticker]
         lines.append(summaries[ticker]["summary_text"])
-        lines.append("原始主战榜")
-        lines.append(render_contract_table(ticker_raw, 5, "raw_rank_score"))
-        lines.append("新增确认榜")
-        lines.append(render_contract_table(ticker_new, 5, "confirmation_score"))
+        lines.append("月度前五合约")
+        lines.append(monthly_sections_text(top_contracts[top_contracts["ticker"] == ticker], plain=True))
+        if not ticker_new.empty:
+            lines.append("同向新增")
+            lines.append(render_contract_table(ticker_new, 5, "confirmation_score"))
         lines.append("")
     summary_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
 
@@ -1929,32 +2232,51 @@ def daily_pipeline(cfg: argparse.Namespace) -> None:
     if not prior_dfs or all(df.empty for df in prior_dfs):
         prior_dfs = [load_snapshot(p) for p in latest_n_snapshots_before(snapshot_dir, trade_date, 2)]
 
-    scored_parts: List[pd.DataFrame] = []
+    storage_parts: List[pd.DataFrame] = []
+    selected_parts: List[pd.DataFrame] = []
+    expiration_parts: List[pd.DataFrame] = []
     ticker_contracts: Dict[str, pd.DataFrame] = {}
     ticker_bootstrap: Dict[str, bool] = {}
+    ticker_direction: Dict[str, Dict[str, Any]] = {}
     for ticker in cfg.tickers:
         prev_ticker_df = prev_df[prev_df["ticker"] == ticker] if not prev_df.empty else pd.DataFrame()
         merged, is_bootstrap = merge_previous_oi(ticker_raw[ticker], prev_ticker_df)
-        filtered = apply_filters(merged, cfg)
-        structured = assign_structure(filtered)
-        continued = assign_continuity(structured, [df[df["ticker"] == ticker] for df in prior_dfs if not df.empty])
-        scored = score_contracts(continued, bootstrap_mode=is_bootstrap)
-        signal_rows = select_signal_rows(scored, bootstrap_mode=is_bootstrap)
-        signal_rows = signal_rows.sort_values("total_score", ascending=False).reset_index(drop=True)
-        scored_parts.append(signal_rows.copy())
-        ticker_contracts[ticker] = signal_rows
+        monthly_base = filter_monthly_universe(merged, cfg)
+        direction_info = compute_direction_strength(monthly_base, is_bootstrap)
+        directional_rows = rank_directional_contracts(monthly_base, str(direction_info["side"]), cfg, is_bootstrap)
+        exp_rows = build_monthly_expiration_summary(monthly_base, str(direction_info["side"]))
+
+        storage_parts.append(monthly_base.copy())
+        selected_parts.append(directional_rows.copy())
+        if not exp_rows.empty:
+            expiration_parts.append(exp_rows.copy())
+        ticker_contracts[ticker] = directional_rows.sort_values(
+            ["expiration", "expiration_rank", "contract_score"],
+            ascending=[True, True, False],
+        ).reset_index(drop=True)
         ticker_bootstrap[ticker] = is_bootstrap
+        ticker_direction[ticker] = direction_info
 
     bootstrap_mode = any(ticker_bootstrap.values())
 
-    full_df = pd.concat(scored_parts, ignore_index=True) if scored_parts else pd.DataFrame(columns=DAILY_FIELDS)
+    storage_df = pd.concat(storage_parts, ignore_index=True) if storage_parts else pd.DataFrame(columns=DAILY_FIELDS)
+    selected_df = pd.concat(selected_parts, ignore_index=True) if selected_parts else pd.DataFrame(columns=DAILY_FIELDS)
     for col in DAILY_FIELDS:
-        if col not in full_df.columns:
-            full_df[col] = ""
-    full_df = full_df[DAILY_FIELDS].copy()
+        if col not in storage_df.columns:
+            storage_df[col] = ""
+        if col not in selected_df.columns:
+            selected_df[col] = ""
+    storage_df = storage_df[DAILY_FIELDS].copy()
+    selected_df = selected_df[DAILY_FIELDS].copy()
 
-    expiration_df = build_expiration_strength(full_df)
-    band_df = build_band_summary(full_df)
+    expiration_df = (
+        pd.concat(expiration_parts, ignore_index=True)
+        if expiration_parts
+        else pd.DataFrame()
+    )
+    if not expiration_df.empty:
+        expiration_df = expiration_df.sort_values(["ticker", "expiration_score"], ascending=[True, False]).reset_index(drop=True)
+    band_df = pd.DataFrame()
 
     summaries: Dict[str, Dict[str, str]] = {}
     for ticker in cfg.tickers:
@@ -1964,6 +2286,7 @@ def daily_pipeline(cfg: argparse.Namespace) -> None:
             contracts_df=ticker_contracts.get(ticker, pd.DataFrame()),
             expiration_df=expiration_df,
             band_df=band_df,
+            direction_info=ticker_direction.get(ticker, {}),
             cfg=cfg,
             bootstrap_mode=ticker_bootstrap.get(ticker, False),
         )
@@ -1993,7 +2316,8 @@ def daily_pipeline(cfg: argparse.Namespace) -> None:
         snapshot_dir=snapshot_dir,
         daily_report_dir=daily_report_dir,
         history_db_path=history_db_path,
-        full_df=full_df,
+        full_df=storage_df,
+        report_df=selected_df,
         expiration_df=expiration_df,
         band_df=band_df,
         signal_df=signal_df,
@@ -2151,79 +2475,66 @@ def weekly_direction_summary(ticker: str, signal_df: pd.DataFrame) -> Dict[str, 
 
 
 def weekly_summary_for_ticker(ticker: str, frames: List[pd.DataFrame], signal_df: pd.DataFrame) -> str:
-    if not frames:
-        return f"{ticker} 本周无可用快照。"
+    signal_part = signal_df[signal_df["ticker"] == ticker].copy() if not signal_df.empty else pd.DataFrame()
+    if signal_part.empty:
+        return f"{ticker} 本周无有效日信号。"
 
-    df = pd.concat(frames, ignore_index=True)
-    df = df[df["ticker"] == ticker].copy()
-    if df.empty:
-        return f"{ticker} 本周无可用快照。"
+    signal_part["trade_date"] = pd.to_datetime(signal_part["trade_date"], errors="coerce")
+    signal_part = signal_part.sort_values("trade_date").dropna(subset=["trade_date"])
+    latest = signal_part.iloc[-1]
+    direction_counts = signal_part["direction_text"].value_counts()
+    main_exp_counts = signal_part["main_expiration"].value_counts()
+    focus_counts = signal_part["main_band"].value_counts()
+    bullish_days = int((signal_part["direction_bucket"] == "bullish").sum())
+    bearish_days = int((signal_part["direction_bucket"] == "bearish").sum())
+    avg_conf = safe_float(signal_part["confidence_score"].mean(), 0.0)
 
-    positive = df[df["oi_change"] > 0].copy()
-    if positive.empty:
-        return f"{ticker} 本周未出现明确新增仓信号。"
-
-    call_oi = safe_float(positive.loc[positive["option_type"] == "C", "oi_change"].sum(), 0.0)
-    put_oi = safe_float(positive.loc[positive["option_type"] == "P", "oi_change"].sum(), 0.0)
-    call_vol = safe_float(positive.loc[positive["option_type"] == "C", "volume"].sum(), 0.0)
-    put_vol = safe_float(positive.loc[positive["option_type"] == "P", "volume"].sum(), 0.0)
-    call_notional = safe_float(positive.loc[positive["option_type"] == "C", "premium_notional"].sum(), 0.0)
-    put_notional = safe_float(positive.loc[positive["option_type"] == "P", "premium_notional"].sum(), 0.0)
-    call_oi_total = safe_float(positive.loc[positive["option_type"] == "C", "open_interest"].sum(), 0.0)
-    put_oi_total = safe_float(positive.loc[positive["option_type"] == "P", "open_interest"].sum(), 0.0)
-    cp_position_bias = (call_oi_total - put_oi_total) / max(call_oi_total + put_oi_total, 1.0)
-    cp_oi_bias = (call_oi - put_oi) / max(abs(call_oi) + abs(put_oi), 1.0)
-    cp_vol_bias = (call_vol - put_vol) / max(call_vol + put_vol, 1.0)
-    cp_notional_bias = (call_notional - put_notional) / max(call_notional + put_notional, 1.0)
-    bias_label = dominant_side_from_bias(cp_position_bias, cp_oi_bias, cp_vol_bias, cp_notional_bias)
-
-    exp_df = build_expiration_strength(positive)
-    band_df = build_band_summary(positive)
-
-    top_exp = exp_df[exp_df["ticker"] == ticker].head(1)
-    top_band = band_df[band_df["ticker"] == ticker].head(1)
-    top_contract = positive.sort_values("total_score", ascending=False).head(1)
-    zone_summary = weekly_zone_cluster_summary(ticker, frames)
-    direction_summary = weekly_direction_summary(ticker, signal_df)
-
-    repeated_contracts = (
-        positive.groupby(["expiration", "option_type", "strike"])
-        .agg(days=("trade_date", "nunique"), total_oi_change=("oi_change", "sum"))
-        .reset_index()
-        .sort_values(["days", "total_oi_change"], ascending=[False, False])
-    )
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    df = df[df["ticker"] == ticker].copy() if not df.empty else pd.DataFrame()
     repeated_contract_text = "无"
-    if not repeated_contracts.empty:
-        rc = repeated_contracts.iloc[0]
-        repeated_contract_text = (
-            f"{rc['expiration']} {fmt_strike(rc['strike'])}{rc['option_type']} "
-            f"（{int(rc['days'])}日）"
+    biggest_delta_text = "无"
+    if not df.empty:
+        monthly_df = df[df["is_monthly"] == 1].copy() if "is_monthly" in df.columns else df.copy()
+        latest_direction = str(latest.get("direction_text", ""))
+        if "看多" in latest_direction:
+            side = "C"
+            monthly_side = monthly_df[monthly_df["option_type"] == side].copy()
+        elif "看空" in latest_direction:
+            side = "P"
+            monthly_side = monthly_df[monthly_df["option_type"] == side].copy()
+        else:
+            monthly_side = monthly_df.copy()
+        repeated_contracts = (
+            monthly_side.groupby(["expiration", "option_type", "strike"])
+            .agg(days=("trade_date", "nunique"), total_oi_change=("oi_change", "sum"))
+            .reset_index()
+            .sort_values(["days", "total_oi_change"], ascending=[False, False])
         )
+        if not repeated_contracts.empty:
+            rc = repeated_contracts.iloc[0]
+            repeated_contract_text = f"{rc['expiration']} {fmt_strike(rc['strike'])}{rc['option_type']}（{int(rc['days'])}日）"
 
-    main_exp = top_exp.iloc[0]["expiration"] if not top_exp.empty else "无"
-    main_zone = top_exp.iloc[0]["main_zone"] if not top_exp.empty else "无"
-    main_band = zone_summary["label"] if zone_summary["days"] >= 2 else (top_band.iloc[0]["band_label"] if not top_band.empty else main_zone)
-    band_days = int(zone_summary["days"]) if zone_summary["days"] >= 1 else (int(top_band.iloc[0]["band_continuity_days"]) if not top_band.empty else 1)
-    strongest_contract = (
-        f"{top_contract.iloc[0]['expiration']} {fmt_strike(top_contract.iloc[0]['strike'])}{top_contract.iloc[0]['option_type']}"
-        if not top_contract.empty
-        else "无"
-    )
-    switch_text = "无切换" if direction_summary["switches"] == 0 else f"{direction_summary['switches']}次"
-    compare_text = f"强化 {direction_summary['reinforcement_days']} 日 / 分歧 {direction_summary['divergence_days']} 日"
+        delta_view = monthly_side.copy()
+        if not delta_view.empty:
+            delta_view["delta_combo"] = (
+                delta_view["oi_change"].clip(lower=0)
+                + delta_view["volume_change"].clip(lower=0) * 0.2
+                + delta_view["premium_notional_change"].clip(lower=0) / 1000.0
+            )
+            delta_view = delta_view.sort_values(["delta_combo", "open_interest"], ascending=[False, False])
+            top_delta = delta_view.iloc[0]
+            biggest_delta_text = contract_delta_brief(top_delta)
 
     return (
         f"{ticker} 本周期权总结\n"
-        f"本周主战到期日：{main_exp}\n"
-        f"本周 Call / Put 偏向：{bias_label}（最新：{direction_summary['latest_direction']}）\n"
-        f"本周主战 strike 带：{main_band}\n"
-        f"最强单合约：{strongest_contract}\n"
-        f"带状连续性：{main_band}（{band_days}日）\n"
-        f"最稳定区域：{zone_summary['expiration']} {zone_summary['label']}（{zone_summary['days']}日）\n"
-        f"方向切换：{switch_text}\n"
-        f"原始/新增关系：{compare_text}\n"
+        f"本周方向分布：看多 {bullish_days} 日 / 看空 {bearish_days} 日\n"
+        f"本周主方向：{direction_counts.index[0]}（{int(direction_counts.iloc[0])}日）\n"
+        f"本周主月到期：{main_exp_counts.index[0]}（{int(main_exp_counts.iloc[0])}日）\n"
+        f"本周主月重点：{focus_counts.index[0]}（{int(focus_counts.iloc[0])}日）\n"
+        f"最新信号：{latest.get('direction_text', '无')} / {latest.get('main_expiration', '无')} / {latest.get('main_band', '无')}\n"
+        f"平均置信度：{avg_conf:.1f}\n"
         f"重复出现合约：{repeated_contract_text}\n"
-        f"下周优先观察：{main_band} / {main_zone}"
+        f"本周最大增量：{biggest_delta_text}"
     )
 
 
@@ -2323,16 +2634,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weekly-report-dir", type=str, default="reports/weekly")
     parser.add_argument("--sqlite-db-path", type=str, default="data/options_history.sqlite")
 
-    parser.add_argument("--min-raw-oi", type=int, default=1000)
-    parser.add_argument("--min-raw-volume", type=int, default=50)
-    parser.add_argument("--max-raw-spread-pct", type=float, default=0.40)
+    parser.add_argument("--min-raw-oi", type=int, default=500)
+    parser.add_argument("--min-raw-volume", type=int, default=10)
+    parser.add_argument("--max-raw-spread-pct", type=float, default=0.60)
     parser.add_argument("--min-new-oi", type=int, default=500)
     parser.add_argument("--min-new-volume", type=int, default=200)
     parser.add_argument("--min-new-oi-change", type=int, default=100)
     parser.add_argument("--min-dte", type=int, default=10)
-    parser.add_argument("--max-dte", type=int, default=45)
+    parser.add_argument("--max-dte", type=int, default=120)
+    parser.add_argument("--monthly-count", type=int, default=3)
 
-    parser.add_argument("--top-contracts", type=int, default=10)
+    parser.add_argument("--top-contracts", type=int, default=5)
     parser.add_argument("--top-expirations", type=int, default=5)
     parser.add_argument("--top-bands", type=int, default=5)
     parser.add_argument("--validation-close-threshold-pct", type=float, default=1.0)
