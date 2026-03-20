@@ -979,6 +979,35 @@ def top_zone_text(group: pd.DataFrame, option_type: str, top_n: int = 3, score_c
     return " / ".join([f"{fmt_strike(v)}{option_type}" for v in side_group["strike"].tolist()])
 
 
+def prioritize_context_rows(
+    df: pd.DataFrame,
+    expiration: str,
+    option_type: str,
+    allow_same_exp_opposite: bool = True,
+    allow_global_fallback: bool = True,
+) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=df.columns if df is not None else [])
+
+    same_exp_same_side = df[(df["expiration"] == expiration) & (df["option_type"] == option_type)]
+    if not same_exp_same_side.empty:
+        return same_exp_same_side.reset_index(drop=True)
+
+    same_side = df[df["option_type"] == option_type]
+    if not same_side.empty:
+        return same_side.reset_index(drop=True)
+
+    if allow_same_exp_opposite:
+        same_exp = df[df["expiration"] == expiration]
+        if not same_exp.empty:
+            return same_exp.reset_index(drop=True)
+
+    if allow_global_fallback:
+        return df.reset_index(drop=True)
+
+    return pd.DataFrame(columns=df.columns)
+
+
 def build_expiration_strength(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(
@@ -1261,11 +1290,16 @@ def compare_raw_and_new(raw_df: pd.DataFrame, new_df: pd.DataFrame, spot: float)
     }
 
 
-def strongest_opposite_zone(df: pd.DataFrame, main_side: str) -> str:
+def strongest_opposite_zone(df: pd.DataFrame, main_side: str, preferred_expiration: str = "") -> str:
     opposite = "P" if main_side == "C" else "C"
     opp_df = df[df["option_type"] == opposite].sort_values("total_score", ascending=False)
     if opp_df.empty:
         return ""
+
+    if preferred_expiration:
+        same_exp = opp_df[opp_df["expiration"] == preferred_expiration]
+        if not same_exp.empty:
+            opp_df = same_exp
 
     top_band = opp_df[opp_df["band_label"] != ""].head(1)
     if not top_band.empty:
@@ -1311,9 +1345,8 @@ def build_daily_summary(
     raw_contracts = raw_contract_view(contracts_df)
     new_contracts = new_contract_view(contracts_df, cfg)
     top_contract = raw_contracts.iloc[0]
-    comparison = compare_raw_and_new(raw_contracts, new_contracts, safe_float(meta.get("underlying_close"), 0.0))
     main_exp_row = expiration_df[expiration_df["ticker"] == ticker].head(1)
-    main_band_row = band_df[band_df["ticker"] == ticker].head(1)
+    ticker_band_df = band_df[band_df["ticker"] == ticker].copy()
 
     main_exp = top_contract["expiration"]
     bias_label = "均衡"
@@ -1328,6 +1361,46 @@ def build_daily_summary(
         elif bias_label == "Call 偏强":
             main_side = "C"
 
+    raw_display_df = prioritize_context_rows(
+        raw_contracts,
+        expiration=str(main_exp),
+        option_type=str(main_side),
+        allow_same_exp_opposite=False,
+        allow_global_fallback=True,
+    )
+    raw_compare_df = prioritize_context_rows(
+        raw_contracts,
+        expiration=str(main_exp),
+        option_type=str(main_side),
+        allow_same_exp_opposite=True,
+        allow_global_fallback=True,
+    )
+    new_display_df = prioritize_context_rows(
+        new_contracts,
+        expiration=str(main_exp),
+        option_type=str(main_side),
+        allow_same_exp_opposite=False,
+        allow_global_fallback=False,
+    )
+    new_compare_df = prioritize_context_rows(
+        new_contracts,
+        expiration=str(main_exp),
+        option_type=str(main_side),
+        allow_same_exp_opposite=True,
+        allow_global_fallback=True,
+    )
+    comparison = compare_raw_and_new(raw_compare_df, new_compare_df, safe_float(meta.get("underlying_close"), 0.0))
+
+    top_contract = raw_display_df.iloc[0] if not raw_display_df.empty else raw_contracts.iloc[0]
+
+    main_band_row = prioritize_context_rows(
+        ticker_band_df,
+        expiration=str(main_exp),
+        option_type=str(main_side),
+        allow_same_exp_opposite=False,
+        allow_global_fallback=False,
+    ).head(1)
+
     if not main_band_row.empty:
         main_band = main_band_row.iloc[0]["band_label"]
         band_days = int(main_band_row.iloc[0]["band_continuity_days"])
@@ -1339,9 +1412,9 @@ def build_daily_summary(
         f"{top_contract['expiration']} {fmt_strike(top_contract['strike'])}{top_contract['option_type']}"
     )
     new_strongest_contract = (
-        f"{new_contracts.iloc[0]['expiration']} {fmt_strike(new_contracts.iloc[0]['strike'])}{new_contracts.iloc[0]['option_type']}"
-        if not new_contracts.empty
-        else "无明确新增确认"
+        f"{new_display_df.iloc[0]['expiration']} {fmt_strike(new_display_df.iloc[0]['strike'])}{new_display_df.iloc[0]['option_type']}"
+        if not new_display_df.empty
+        else "无同向新增确认"
     )
     direction_text = infer_direction_text(bias_label, top_contract["option_type"])
     confirmation_text = confirmation_label(
@@ -1370,7 +1443,7 @@ def build_daily_summary(
     else:
         continuity_text = "无明确连续布局"
 
-    opposite_zone = strongest_opposite_zone(contracts_df, main_side)
+    opposite_zone = strongest_opposite_zone(contracts_df, main_side, preferred_expiration=str(main_exp))
     watch_items = [x for x in [main_band or main_zone, opposite_zone] if x]
     next_watch = " / ".join(watch_items) if watch_items else strongest_contract
 
