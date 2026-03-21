@@ -2,11 +2,23 @@ name: NVDA TSLA Post-Close Options Radar
 
 on:
   schedule:
-    # GitHub Actions schedule can be delayed. Trigger multiple times across 00-02 UTC
-    # and let the script accept only the ET 20:00-21:59 post-close window.
-    - cron: "17,47 0-2 * * 2-6"
-    - cron: "30 12 * * 0"
+    # 美股收盘 16:00 ET + 4h = 20:00 ET
+    # EDT (3月-11月): ET = UTC-4, 所以 20:00 ET = 00:00 UTC 次日
+    # EST (11月-3月): ET = UTC-5, 所以 20:00 ET = 01:00 UTC 次日
+    # GitHub Actions cron 经常延迟 15-60 分钟，需要多次触发覆盖
+    # 覆盖 UTC 00:00-04:00 (ET 20:00-00:00 EDT / ET 19:00-23:00 EST)
+    - cron: "0,30 0-4 * * 2-6"    # 周二到周六 UTC (对应周一到周五美股交易日盘后)
+    - cron: "30 12 * * 0"          # 周日 12:30 UTC 跑周总结
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "运行模式"
+        required: false
+        default: "daily"
+        type: choice
+        options:
+          - daily
+          - weekly
 
 concurrency:
   group: nvda-tsla-options-radar
@@ -34,21 +46,31 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: pip install yfinance pandas requests
 
       - name: Run Radar
+        id: radar
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set -euo pipefail
           mkdir -p data/options_snapshots reports/daily reports/weekly
+
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            python options_screener.py --mode daily 2>&1 | tee reports/last_run.log
+            MODE="${{ github.event.inputs.mode || 'daily' }}"
+            echo "手动触发, mode=${MODE}"
+            python options_screener.py --mode "${MODE}" 2>&1 | tee reports/last_run.log
           else
-            python options_screener.py --mode auto --enforce-postclose-window --skip-if-trade-date-exists 2>&1 | tee reports/last_run.log
+            echo "定时触发, mode=auto, 启用盘后窗口检查和去重"
+            python options_screener.py \
+              --mode auto \
+              --enforce-postclose-window \
+              --skip-if-trade-date-exists \
+              2>&1 | tee reports/last_run.log
           fi
 
       - name: Upload Artifacts
@@ -72,7 +94,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data reports || true
-          git diff --staged --quiet && exit 0
-          git commit -m "options radar $(date -u +'%Y-%m-%d')"
-          git pull --rebase origin "${{ github.ref_name }}" || true
-          git push || echo "git push skipped, workflow continues"
+          git diff --staged --quiet && echo "无变更, 跳过提交" && exit 0
+          git commit -m "options radar $(date -u +'%Y-%m-%d %H:%M')"
+          # 处理并发推送冲突
+          for i in 1 2 3; do
+            git pull --rebase origin "${{ github.ref_name }}" && git push && break
+            echo "推送重试 $i..."
+            sleep 5
+          done

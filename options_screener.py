@@ -1906,9 +1906,22 @@ def evaluate_previous_signals(
 
 
 def in_us_postclose_four_hour_window(now_utc: Optional[datetime] = None) -> bool:
+    """美东盘后 4 小时窗口: 20:00-23:59 ET (收盘 16:00 + 4h ~ +8h).
+
+    原先只允许 20-21 两小时，GitHub Actions cron 经常延迟 15-60 分钟，
+    窗口过窄极易全部跳过。现扩展到 20-23 以容纳延迟。
+    """
     current_utc = now_utc or datetime.now(ZoneInfo("UTC"))
     eastern = current_utc.astimezone(ZoneInfo("America/New_York"))
-    return eastern.weekday() < 5 and eastern.hour in {20, 21}
+    in_window = eastern.weekday() < 5 and 20 <= eastern.hour <= 23
+    log.info(
+        "盘后窗口检查: ET %s (weekday=%d, hour=%d) -> %s",
+        eastern.strftime("%Y-%m-%d %H:%M:%S"),
+        eastern.weekday(),
+        eastern.hour,
+        "在窗口内" if in_window else "不在窗口内",
+    )
+    return in_window
 
 
 def render_validation_table(validation_df: pd.DataFrame) -> str:
@@ -2219,6 +2232,12 @@ def daily_pipeline(cfg: argparse.Namespace) -> None:
     if trade_date is None:
         raise RuntimeError("未获取到有效 trade_date")
 
+    # --- 尽早检查是否已有当日输出，避免重复处理 ---
+    trade_date_str_early = trade_date.isoformat()
+    if cfg.skip_if_trade_date_exists and daily_outputs_exist(snapshot_dir, daily_report_dir, trade_date_str_early):
+        log.info("跳过日雷达: %s 已存在当日输出（提前检查）", trade_date_str_early)
+        return
+
     prev_date = latest_snapshot_date_before(history_db_path, snapshot_dir, trade_date)
     prev_df = load_snapshot_from_db(history_db_path, prev_date)
     if prev_df.empty:
@@ -2292,9 +2311,6 @@ def daily_pipeline(cfg: argparse.Namespace) -> None:
         )
 
     trade_date_str = trade_date.isoformat()
-    if cfg.skip_if_trade_date_exists and daily_outputs_exist(snapshot_dir, daily_report_dir, trade_date_str):
-        log.info("跳过日雷达: %s 已存在当日输出", trade_date_str)
-        return
 
     signal_df = build_signal_records(
         trade_date=trade_date_str,
@@ -2618,7 +2634,7 @@ def mode_from_args(mode: str) -> str:
     if mode in {"daily", "weekly"}:
         return mode
     # GitHub 定时任务默认: 周日 UTC 跑 weekly，其他跑 daily
-    weekday = datetime.utcnow().weekday()
+    weekday = datetime.now(ZoneInfo("UTC")).weekday()
     return "weekly" if weekday == 6 else "daily"
 
 
