@@ -1,0 +1,3 @@
+﻿signal_trade_date,validation_trade_date,ticker,direction_text,confidence_text,main_expiration,main_band,prev_close,current_close,current_high,current_low,next_close_change_pct,favorable_excursion_pct,validation_result
+2026-03-19,2026-03-20,NVDA,看多,中高,2026-04-17,200C / 190C / 185C,178.56,172.7,178.26,171.73,-3.28,-0.17,失效
+2026-03-19,2026-03-20,TSLA,看空,中高,2026-04-17,500P / 400P / 370P,380.3,367.96,379.89,364.46,-3.24,4.17,命中
