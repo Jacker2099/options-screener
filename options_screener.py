@@ -746,21 +746,32 @@ def compute_direction_strength(monthly_df: pd.DataFrame, bootstrap_mode: bool) -
         call_score = call_level * 0.35 + call_delta * 0.65
         put_score = put_level * 0.35 + put_delta * 0.65
 
+    # --- 双边平仓检测：当 Call 和 Put 的 OI 增量都为负时，方向信号不可靠 ---
+    both_liquidating = (
+        not bootstrap_mode
+        and call_oi_delta < 0
+        and put_oi_delta < 0
+    )
+
     if call_score >= put_score:
         side = "C"
-        bias_label = "Call 偏强"
-        direction_text = "看多"
+        bias_label = "平仓观望(Call侧)" if both_liquidating else "Call 偏强"
+        direction_text = "平仓观望" if both_liquidating else "看多"
     else:
         side = "P"
-        bias_label = "Put 偏强"
-        direction_text = "看空"
+        bias_label = "平仓观望(Put侧)" if both_liquidating else "Put 偏强"
+        direction_text = "平仓观望" if both_liquidating else "看空"
 
-    confidence_score = clip(55.0 + abs(call_score - put_score) * 0.45, 0.0, 100.0)
+    confidence_score = clip(42.0 + abs(call_score - put_score) * 0.45, 0.0, 100.0)
+    # 双边平仓时置信度打五折
+    if both_liquidating:
+        confidence_score = clip(confidence_score * 0.5, 0.0, 100.0)
     reason_text = (
         f"Call总量 OI {call_oi_total:.0f} / Vol {call_vol_total:.0f} / Amt {call_amt_total/1000:.0f}K / "
         f"ΔOI {call_oi_delta:+.0f} / ΔVol {call_vol_delta:+.0f} / ΔAmt {call_amt_delta/1000:+.0f}K；"
         f"Put总量 OI {put_oi_total:.0f} / Vol {put_vol_total:.0f} / Amt {put_amt_total/1000:.0f}K / "
         f"ΔOI {put_oi_delta:+.0f} / ΔVol {put_vol_delta:+.0f} / ΔAmt {put_amt_delta/1000:+.0f}K"
+        f"{'；⚠️ 双边OI均下降，方向信号减弱' if both_liquidating else ''}"
     )
     return {
         "side": side,
@@ -786,15 +797,17 @@ def compute_direction_strength(monthly_df: pd.DataFrame, bootstrap_mode: bool) -
     }
 
 
-def exclude_closest_strikes(df: pd.DataFrame) -> pd.DataFrame:
+def exclude_closest_strikes(df: pd.DataFrame, min_distance_pct: float = 0.01) -> pd.DataFrame:
+    """排除 ATM 附近做市商主导的 strike（distance_pct < 1%）。
+
+    对 NVDA/TSLA 等大票，ATM ±1-2 档通常由做市商对冲驱动，
+    OI/Volume 虽高但不反映方向性观点。
+    """
     if df.empty:
         return df.copy()
-    parts: List[pd.DataFrame] = []
-    for expiration, group in df.groupby("expiration"):
-        min_dist = safe_float(group["distance_pct"].min(), 0.0)
-        trimmed = group[group["distance_pct"] > min_dist + 1e-12].copy()
-        parts.append(trimmed if not trimmed.empty else group.copy())
-    return pd.concat(parts, ignore_index=True) if parts else df.copy()
+    trimmed = df[df["distance_pct"] >= min_distance_pct].copy()
+    # 如果全部被排除（极端情况），保留原始数据
+    return trimmed if not trimmed.empty else df.copy()
 
 
 def rank_directional_contracts(monthly_df: pd.DataFrame, side: str, cfg: argparse.Namespace, bootstrap_mode: bool) -> pd.DataFrame:
@@ -1087,6 +1100,17 @@ def assign_structure(df: pd.DataFrame) -> pd.DataFrame:
                 score = min(score + 10.0, 100.0)
             elif safe_float(band_group["oi_change"].clip(lower=0).sum(), 0.0) >= 1500:
                 score = min(score + 5.0, 100.0)
+            # OI 分布均匀度：如果 band 内多数 strike 都有实质 OI，加分；否则打折
+            band_oi_values = band_group["open_interest"].fillna(0).tolist()
+            if len(band_oi_values) >= 2:
+                oi_max_in_band = max(band_oi_values) if max(band_oi_values) > 0 else 1.0
+                uniformity = min(band_oi_values) / oi_max_in_band
+                # uniformity 0→1: 0 表示极度集中, 1 表示完全均匀
+                # 均匀度 < 0.1 时打 7 折（有量的只有一两个 strike）
+                if uniformity < 0.10:
+                    score *= 0.70
+                elif uniformity >= 0.30:
+                    score = min(score + 5.0, 100.0)
             band_key = f"{ticker}|{expiration}|{option_type}|{band[0]}|{band[-1]}"
             mask = (
                 (out["ticker"] == ticker)
@@ -1135,7 +1159,7 @@ def assign_continuity(today_df: pd.DataFrame, prior_dfs: List[pd.DataFrame]) -> 
                 days = 2
             if len(positive_maps) >= 2 and row_key in positive_maps[0] and row_key in positive_maps[1]:
                 days = 3
-        score = 40.0 if days >= 3 else (20.0 if days == 2 else 0.0)
+        score = 20.0 if days >= 3 else (10.0 if days == 2 else 0.0)
         days_list.append(days)
         score_list.append(score)
 
@@ -1168,7 +1192,7 @@ def assign_continuity(today_df: pd.DataFrame, prior_dfs: List[pd.DataFrame]) -> 
                 zone_days += 1
             else:
                 break
-        zone_score = 40.0 if zone_days >= 3 else (20.0 if zone_days == 2 else 0.0)
+        zone_score = 20.0 if zone_days >= 3 else (10.0 if zone_days == 2 else 0.0)
         zone_days_by_band[band["band_id"]] = zone_days
         zone_score_by_band[band["band_id"]] = zone_score
 
@@ -1181,9 +1205,12 @@ def assign_continuity(today_df: pd.DataFrame, prior_dfs: List[pd.DataFrame]) -> 
 
 def score_contracts(df: pd.DataFrame, bootstrap_mode: bool) -> pd.DataFrame:
     out = df.copy()
+    # positioning: 提高天花板，用 log 归一化区分 NVDA/TSLA 大 OI 合约
+    _oi_log_norm = (out["open_interest"].clip(lower=1).apply(math.log10) / math.log10(40000)).clip(upper=1.0)
+    _oi_notional_log_norm = (out["open_interest_notional"].clip(lower=1).apply(math.log10) / math.log10(4000000)).clip(upper=1.0)
     out["positioning_score"] = (
-        (out["open_interest"] / 15000.0).clip(upper=1.0) * 55.0
-        + (out["open_interest_notional"].clip(lower=0) / 1500000.0).clip(upper=1.0) * 45.0
+        _oi_log_norm * 55.0
+        + _oi_notional_log_norm * 45.0
     )
     out["confirmation_score"] = (
         (out["oi_change"].clip(lower=0) / 3000.0).clip(upper=1.0) * 40.0
@@ -1191,10 +1218,11 @@ def score_contracts(df: pd.DataFrame, bootstrap_mode: bool) -> pd.DataFrame:
         + (out["oi_change_notional"].clip(lower=0) / 300000.0).clip(upper=1.0) * 25.0
     )
     out["oi_score"] = out["confirmation_score"]
+    # flow: 提高天花板适配 NVDA/TSLA 量级
     out["flow_score"] = (
-        (out["volume"] / 2000.0).clip(upper=1.0) * 30.0
+        (out["volume"] / 5000.0).clip(upper=1.0) * 30.0
         + (out["volume_oi_ratio"] / 0.80).clip(upper=1.0) * 30.0
-        + (out["premium_notional"].clip(lower=0) / 500000.0).clip(upper=1.0) * 40.0
+        + (out["premium_notional"].clip(lower=0) / 1500000.0).clip(upper=1.0) * 40.0
     )
     out["liquidity_score"] = (
         (out["open_interest"] / 5000.0).clip(upper=1.0) * 50.0
@@ -2651,7 +2679,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sqlite-db-path", type=str, default="data/options_history.sqlite")
 
     parser.add_argument("--min-raw-oi", type=int, default=500)
-    parser.add_argument("--min-raw-volume", type=int, default=10)
+    parser.add_argument("--min-raw-volume", type=int, default=50)
     parser.add_argument("--max-raw-spread-pct", type=float, default=0.60)
     parser.add_argument("--min-new-oi", type=int, default=500)
     parser.add_argument("--min-new-volume", type=int, default=200)
