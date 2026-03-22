@@ -1,9 +1,13 @@
-14:56:12 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-14:56:13 [WARNING] Databento NVDA 拉取失败: 400 symbology_invalid_symbol
-Invalid format for `parent` symbol 'NVDA', expected format: '[ROOT].SPOT', '[ROOT].FUT', or '[ROOT].OPT'
-documentation: https://databento.com/docs/api-reference-historical/basics/symbology
-14:56:13 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-14:56:13 [WARNING] Databento TSLA 拉取失败: 400 symbology_invalid_symbol
-Invalid format for `parent` symbol 'TSLA', expected format: '[ROOT].SPOT', '[ROOT].OPT', or '[ROOT].FUT'
-documentation: https://databento.com/docs/api-reference-historical/basics/symbology
-14:56:17 [INFO] 盘后雷达完成: trade_date=2026-03-20 prev_snapshot=2026-03-19
+15:01:22 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+15:01:22 [INFO] Databento NVDA stype=parent 失败: 400 symbology_invalid_symbol
+Invalid format for `parent` symbol 'NVDA', expected format: '[ROOT].SPOT', '[ROOT].OPT', or '[ROOT].FUT'
+documentation: https://databento.com/docs/api-reference-historical/basics/symbology, 尝试下一个
+15:01:22 [INFO] Databento NVDA stype=smart 失败: 400 Bad Request: Invalid `stype_in`, was 'smart'. Use any of ['instrument_id', 'raw_symbol', 'parent', 'continuous']., 尝试下一个
+15:01:22 [INFO] Databento NVDA 2026-03-20 无成交数据
+15:01:22 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+15:01:22 [INFO] Databento TSLA stype=parent 失败: 400 symbology_invalid_symbol
+Invalid format for `parent` symbol 'TSLA', expected format: '[ROOT].FUT', '[ROOT].SPOT', or '[ROOT].OPT'
+documentation: https://databento.com/docs/api-reference-historical/basics/symbology, 尝试下一个
+15:01:22 [INFO] Databento TSLA stype=smart 失败: 400 Bad Request: Invalid `stype_in`, was 'smart'. Use any of ['instrument_id', 'raw_symbol', 'parent', 'continuous']., 尝试下一个
+15:01:22 [INFO] Databento TSLA 2026-03-20 无成交数据
+15:01:26 [INFO] 盘后雷达完成: trade_date=2026-03-20 prev_snapshot=2026-03-19
