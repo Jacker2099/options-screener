@@ -660,16 +660,24 @@ def fetch_block_trades(
         return pd.DataFrame()
 
     all_rows: List[Dict[str, Any]] = []
+
+    # 诊断: 列出可用数据集
+    try:
+        diag_client = db.Historical(key=api_key)
+        datasets = diag_client.metadata.list_datasets()
+        log.info("Databento 可用数据集: %s", datasets)
+    except Exception as e:
+        log.info("Databento 数据集列表失败: %s", e)
+
     for symbol in symbols:
         try:
             client = db.Historical(key=api_key)
             start_dt = datetime(trade_date.year, trade_date.month, trade_date.day, 0, 0, tzinfo=ZoneInfo("UTC"))
             end_dt = datetime(trade_date.year, trade_date.month, trade_date.day, 23, 59, tzinfo=ZoneInfo("UTC"))
 
-            # Databento OPRA: 先尝试 OPRA.PILLAR, 再尝试 DBEQ.BASIC (含期权)
-            # parent stype 用于按标的查所有期权
+            # 尝试多个数据集 + parent stype
             df = None
-            for dataset in ("OPRA.PILLAR", "DBEQ.BASIC"):
+            for dataset in ("OPRA.PILLAR", "DBEQ.BASIC", "XNAS.ITCH"):
                 try:
                     data = client.timeseries.get_range(
                         dataset=dataset,
