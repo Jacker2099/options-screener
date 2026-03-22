@@ -971,7 +971,7 @@ def build_block_strike_analysis(block_agg: pd.DataFrame, ticker: str) -> str:
     if tb.empty:
         return ""
 
-    # 分类: 扫货买入/卖出, 主买/偏买, 主卖/偏卖, 其他
+    # 分类: 扫货买入/卖出, 主买/偏买, 主卖/偏卖, 无方向时按扫单/活跃分类
     category_map = {
         "主动扫货买入": ("🔥扫货买入", 1),
         "主动扫货卖出": ("🔥扫货卖出", 2),
@@ -984,11 +984,14 @@ def build_block_strike_analysis(block_agg: pd.DataFrame, ticker: str) -> str:
         "大单主卖": ("📉主卖", 9),
         "大单偏卖": ("📉偏卖", 10),
         "大单均衡": ("⚖️均衡", 11),
+        "密集扫单": ("⚡密集扫单", 12),
+        "大单扫单": ("⚡大单扫单", 13),
+        "大单活跃": ("📊大单活跃", 14),
     }
 
     tb["_cat_label"] = tb["block_label"].map(lambda x: category_map.get(x, ("其他", 99))[0])
     tb["_cat_order"] = tb["block_label"].map(lambda x: category_map.get(x, ("其他", 99))[1])
-    tb = tb.sort_values(["_cat_order", "block_score"], ascending=[True, False])
+    tb = tb.sort_values(["_cat_order", "block_total_volume"], ascending=[True, False])
 
     lines: List[str] = []
     for cat_label, grp in tb.groupby("_cat_label", sort=False):
