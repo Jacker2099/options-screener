@@ -1,11 +1,9 @@
-15:29:30 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-15:29:30 [INFO] Databento NVDA 查询失败: 422 symbology_invalid_request
-Unable to process symbology with parameters: `dataset=OPRA.PILLAR`, `stype_in=parent`, `stype_out=raw_symbol`. See the symbology docs for supported combinations per dataset https://databento.com/docs/standards-and-conventions/symbology.
-documentation: https://databento.com/docs/api-reference-historical/basics/symbology
-15:29:30 [INFO] Databento NVDA 2026-03-20 无成交数据
-15:29:30 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-15:29:31 [INFO] Databento TSLA 查询失败: 422 symbology_invalid_request
-Unable to process symbology with parameters: `dataset=OPRA.PILLAR`, `stype_in=parent`, `stype_out=raw_symbol`. See the symbology docs for supported combinations per dataset https://databento.com/docs/standards-and-conventions/symbology.
-documentation: https://databento.com/docs/api-reference-historical/basics/symbology
-15:29:31 [INFO] Databento TSLA 2026-03-20 无成交数据
-15:29:34 [INFO] 盘后雷达完成: trade_date=2026-03-20 prev_snapshot=2026-03-19
+15:33:11 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+15:33:16 [INFO] Databento NVDA 成功, 345068 笔成交, 映射 500 个合约, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags', 'ts_in_delta', 'sequence']
+15:33:16 [INFO] Databento NVDA 大单 11278 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags']
+15:33:16 [INFO] Databento NVDA 大单 11278 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags', 'ts_in_delta', 'sequence']
+15:33:17 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+15:33:22 [INFO] Databento TSLA 成功, 550756 笔成交, 映射 500 个合约, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags', 'ts_in_delta', 'sequence']
+15:33:22 [INFO] Databento TSLA 大单 8290 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags']
+15:33:22 [INFO] Databento TSLA 大单 8290 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags', 'ts_in_delta', 'sequence']
+15:33:26 [INFO] 盘后雷达完成: trade_date=2026-03-20 prev_snapshot=2026-03-19
