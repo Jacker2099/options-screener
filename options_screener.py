@@ -678,13 +678,18 @@ def fetch_block_trades(
                     dataset="OPRA.PILLAR",
                     schema="trades",
                     stype_in="parent",
+                    stype_out="raw_symbol",
                     symbols=[parent_symbol],
                     start=start_dt,
                     end=end_dt,
                 )
-                df = data.to_df()
+                # to_df() with pretty_ts 获取人可读的合约名
+                try:
+                    df = data.to_df(pretty_ts=True, map_symbols=True)
+                except TypeError:
+                    df = data.to_df()
                 if df is not None and not df.empty:
-                    log.info("Databento %s 成功, %d 笔成交", symbol, len(df))
+                    log.info("Databento %s 成功, %d 笔成交, 列: %s", symbol, len(df), list(df.columns)[:12])
                 else:
                     log.info("Databento %s 无成交数据", symbol)
             except Exception as e:
@@ -706,14 +711,19 @@ def fetch_block_trades(
 
             log.info("Databento %s 大单 %d 笔, 列: %s", symbol, len(df), list(df.columns)[:10])
 
+            log.info("Databento %s 大单 %d 笔, 列: %s", symbol, len(df), list(df.columns)[:12])
+
             for _, row in df.iterrows():
-                # 合约符号可能在不同列名
+                # 合约符号: stype_out=raw_symbol 后可能在 symbol 或 raw_symbol 列
                 raw_sym = ""
-                for col_name in ("symbol", "raw_symbol", "instrument_id"):
+                for col_name in ("symbol", "raw_symbol"):
                     val = str(row.get(col_name, ""))
-                    if val and val != "nan":
+                    if val and val != "nan" and not val.isdigit():
                         raw_sym = val
                         break
+                # 如果仍是数字 instrument_id，跳过（无法解析合约详情）
+                if not raw_sym or raw_sym.isdigit():
+                    continue
                 parsed = _parse_opra_symbol(raw_sym, symbol)
                 if parsed is None:
                     continue
