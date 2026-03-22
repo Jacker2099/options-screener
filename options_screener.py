@@ -685,28 +685,34 @@ def fetch_block_trades(
                 df = data.to_df()
                 if df is not None and not df.empty:
                     # 构建 instrument_id -> raw_symbol 映射
+                    # 方法: 查询 definitions schema 获取 instrument_id 对应的 raw_symbol
                     id_to_sym: Dict[int, str] = {}
                     try:
-                        sym_map = data.symbology
-                        if sym_map:
-                            for mapping in sym_map.mappings:
-                                for interval in mapping.intervals:
-                                    id_to_sym[interval.symbol] = mapping.raw_symbol
-                    except Exception:
-                        pass
-                    if not id_to_sym:
-                        # 尝试通过 metadata.get_symbology_for_instrument_ids
-                        try:
-                            inst_ids = df["instrument_id"].unique().tolist()
-                            for iid in inst_ids[:500]:
-                                id_to_sym[int(iid)] = str(iid)  # placeholder
-                        except Exception:
-                            pass
-                    # 将 instrument_id 映射到 symbol 列
+                        defs_data = client.timeseries.get_range(
+                            dataset="OPRA.PILLAR",
+                            schema="definition",
+                            stype_in="parent",
+                            symbols=[parent_symbol],
+                            start=start_dt,
+                            end=end_dt,
+                        )
+                        defs_df = defs_data.to_df()
+                        if defs_df is not None and not defs_df.empty:
+                            for _, drow in defs_df.iterrows():
+                                iid = int(drow.get("instrument_id", 0))
+                                raw = str(drow.get("raw_symbol", ""))
+                                if iid and raw and raw != "nan":
+                                    id_to_sym[iid] = raw
+                            log.info("Databento %s definitions: %d 个合约映射", symbol, len(id_to_sym))
+                    except Exception as e:
+                        log.info("Databento %s definitions 失败: %s", symbol, e)
+
                     if id_to_sym:
                         df["symbol"] = df["instrument_id"].map(id_to_sym).fillna("")
-                    log.info("Databento %s 成功, %d 笔成交, 映射 %d 个合约, 列: %s",
-                             symbol, len(df), len(id_to_sym), list(df.columns)[:12])
+                    else:
+                        df["symbol"] = ""
+                    log.info("Databento %s 成功, %d 笔成交, 映射 %d 个合约",
+                             symbol, len(df), len(id_to_sym))
                 else:
                     log.info("Databento %s 无成交数据", symbol)
             except Exception as e:
