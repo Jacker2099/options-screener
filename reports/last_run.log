@@ -1,2 +1,9 @@
-14:51:16 [INFO] Databento 未配置或未安装，跳过大单数据
-14:51:20 [INFO] 盘后雷达完成: trade_date=2026-03-20 prev_snapshot=2026-03-19
+14:56:12 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+14:56:13 [WARNING] Databento NVDA 拉取失败: 400 symbology_invalid_symbol
+Invalid format for `parent` symbol 'NVDA', expected format: '[ROOT].SPOT', '[ROOT].FUT', or '[ROOT].OPT'
+documentation: https://databento.com/docs/api-reference-historical/basics/symbology
+14:56:13 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+14:56:13 [WARNING] Databento TSLA 拉取失败: 400 symbology_invalid_symbol
+Invalid format for `parent` symbol 'TSLA', expected format: '[ROOT].SPOT', '[ROOT].OPT', or '[ROOT].FUT'
+documentation: https://databento.com/docs/api-reference-historical/basics/symbology
+14:56:17 [INFO] 盘后雷达完成: trade_date=2026-03-20 prev_snapshot=2026-03-19
