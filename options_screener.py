@@ -669,68 +669,26 @@ def fetch_block_trades(
             start_date_str = trade_date.isoformat()
             end_date_str = trade_date.isoformat()
 
-            # 步骤 1: 通过 symbology.resolve 找到该标的所有 OPRA 期权合约
-            option_symbols: List[str] = []
-            try:
-                resolved = client.symbology.resolve(
-                    dataset="OPRA.PILLAR",
-                    symbols=[symbol],
-                    stype_in="parent",
-                    stype_out="raw_symbol",
-                    start_date=start_date_str,
-                    end_date=end_date_str,
-                )
-                # resolved.result 是 dict: {input_symbol: [{d0, d1, s}]}
-                mappings = resolved.result or {}
-                for input_sym, entries in mappings.items():
-                    for entry in entries:
-                        raw = entry.get("s", "")
-                        if raw:
-                            option_symbols.append(raw)
-                log.info("Databento %s symbology 解析: %d 个期权合约", symbol, len(option_symbols))
-            except Exception as e:
-                log.info("Databento %s symbology 解析失败: %s, 尝试直接 parent 查询", symbol, e)
+            # Databento parent stype 格式: "NVDA.OPT" (不是裸 "NVDA")
+            parent_symbol = f"{symbol}.OPT"
 
-            # 步骤 2: 查询 trades
             df = None
-            if option_symbols:
-                # 用 raw_symbol 批量查大量合约的 trades (分批，每批 100)
-                batch_dfs: List[pd.DataFrame] = []
-                for i in range(0, min(len(option_symbols), 500), 100):
-                    batch = option_symbols[i : i + 100]
-                    try:
-                        data = client.timeseries.get_range(
-                            dataset="OPRA.PILLAR",
-                            schema="trades",
-                            stype_in="raw_symbol",
-                            symbols=batch,
-                            start=start_dt,
-                            end=end_dt,
-                        )
-                        batch_df = data.to_df()
-                        if batch_df is not None and not batch_df.empty:
-                            batch_dfs.append(batch_df)
-                    except Exception as e:
-                        log.info("Databento %s batch %d 失败: %s", symbol, i, e)
-                if batch_dfs:
-                    df = pd.concat(batch_dfs, ignore_index=True)
-                    log.info("Databento %s raw_symbol 查询成功, %d 笔成交", symbol, len(df))
-            else:
-                # 无 symbology 结果时直接用 parent 查
-                try:
-                    data = client.timeseries.get_range(
-                        dataset="OPRA.PILLAR",
-                        schema="trades",
-                        stype_in="parent",
-                        symbols=[symbol],
-                        start=start_dt,
-                        end=end_dt,
-                    )
-                    df = data.to_df()
-                    if df is not None and not df.empty:
-                        log.info("Databento %s parent 查询成功, %d 笔成交", symbol, len(df))
-                except Exception as e:
-                    log.info("Databento %s parent 查询失败: %s", symbol, e)
+            try:
+                data = client.timeseries.get_range(
+                    dataset="OPRA.PILLAR",
+                    schema="trades",
+                    stype_in="parent",
+                    symbols=[parent_symbol],
+                    start=start_dt,
+                    end=end_dt,
+                )
+                df = data.to_df()
+                if df is not None and not df.empty:
+                    log.info("Databento %s 成功, %d 笔成交", symbol, len(df))
+                else:
+                    log.info("Databento %s 无成交数据", symbol)
+            except Exception as e:
+                log.info("Databento %s 查询失败: %s", symbol, e)
 
             if df is None or df.empty:
                 log.info("Databento %s %s 无成交数据", symbol, trade_date)
