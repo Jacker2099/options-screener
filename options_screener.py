@@ -661,26 +661,65 @@ def fetch_block_trades(
 
     all_rows: List[Dict[str, Any]] = []
 
-    # 诊断: 列出可用数据集
-    try:
-        diag_client = db.Historical(key=api_key)
-        datasets = diag_client.metadata.list_datasets()
-        log.info("Databento 可用数据集: %s", datasets)
-    except Exception as e:
-        log.info("Databento 数据集列表失败: %s", e)
-
     for symbol in symbols:
         try:
             client = db.Historical(key=api_key)
             start_dt = datetime(trade_date.year, trade_date.month, trade_date.day, 0, 0, tzinfo=ZoneInfo("UTC"))
             end_dt = datetime(trade_date.year, trade_date.month, trade_date.day, 23, 59, tzinfo=ZoneInfo("UTC"))
+            start_date_str = trade_date.isoformat()
+            end_date_str = trade_date.isoformat()
 
-            # 尝试多个数据集 + parent stype
+            # 步骤 1: 通过 symbology.resolve 找到该标的所有 OPRA 期权合约
+            option_symbols: List[str] = []
+            try:
+                resolved = client.symbology.resolve(
+                    dataset="OPRA.PILLAR",
+                    symbols=[symbol],
+                    stype_in="parent",
+                    stype_out="raw_symbol",
+                    start_date=start_date_str,
+                    end_date=end_date_str,
+                )
+                # resolved.result 是 dict: {input_symbol: [{d0, d1, s}]}
+                mappings = resolved.result or {}
+                for input_sym, entries in mappings.items():
+                    for entry in entries:
+                        raw = entry.get("s", "")
+                        if raw:
+                            option_symbols.append(raw)
+                log.info("Databento %s symbology 解析: %d 个期权合约", symbol, len(option_symbols))
+            except Exception as e:
+                log.info("Databento %s symbology 解析失败: %s, 尝试直接 parent 查询", symbol, e)
+
+            # 步骤 2: 查询 trades
             df = None
-            for dataset in ("OPRA.PILLAR", "DBEQ.BASIC", "XNAS.ITCH"):
+            if option_symbols:
+                # 用 raw_symbol 批量查大量合约的 trades (分批，每批 100)
+                batch_dfs: List[pd.DataFrame] = []
+                for i in range(0, min(len(option_symbols), 500), 100):
+                    batch = option_symbols[i : i + 100]
+                    try:
+                        data = client.timeseries.get_range(
+                            dataset="OPRA.PILLAR",
+                            schema="trades",
+                            stype_in="raw_symbol",
+                            symbols=batch,
+                            start=start_dt,
+                            end=end_dt,
+                        )
+                        batch_df = data.to_df()
+                        if batch_df is not None and not batch_df.empty:
+                            batch_dfs.append(batch_df)
+                    except Exception as e:
+                        log.info("Databento %s batch %d 失败: %s", symbol, i, e)
+                if batch_dfs:
+                    df = pd.concat(batch_dfs, ignore_index=True)
+                    log.info("Databento %s raw_symbol 查询成功, %d 笔成交", symbol, len(df))
+            else:
+                # 无 symbology 结果时直接用 parent 查
                 try:
                     data = client.timeseries.get_range(
-                        dataset=dataset,
+                        dataset="OPRA.PILLAR",
                         schema="trades",
                         stype_in="parent",
                         symbols=[symbol],
@@ -689,13 +728,9 @@ def fetch_block_trades(
                     )
                     df = data.to_df()
                     if df is not None and not df.empty:
-                        log.info("Databento %s 成功 (dataset=%s), %d 笔成交", symbol, dataset, len(df))
-                        break
-                    else:
-                        log.info("Databento %s dataset=%s 无数据", symbol, dataset)
+                        log.info("Databento %s parent 查询成功, %d 笔成交", symbol, len(df))
                 except Exception as e:
-                    log.info("Databento %s dataset=%s 失败: %s", symbol, dataset, e)
-                    continue
+                    log.info("Databento %s parent 查询失败: %s", symbol, e)
 
             if df is None or df.empty:
                 log.info("Databento %s %s 无成交数据", symbol, trade_date)
