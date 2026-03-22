@@ -116,11 +116,14 @@ DAILY_FIELDS = [
     "total_score",
     "block_buy_volume",
     "block_sell_volume",
+    "block_total_volume",
     "block_net_volume",
     "block_buy_notional",
     "block_sell_notional",
+    "block_total_notional",
     "block_net_notional",
     "sweep_count",
+    "trade_count",
     "block_score",
     "block_label",
 ]
@@ -859,29 +862,36 @@ def aggregate_block_trades(block_df: pd.DataFrame) -> pd.DataFrame:
         ticker, exp, strike, ot = key
         buy_mask = grp["side"] == "B"
         sell_mask = grp["side"] == "S"
+        unknown_mask = ~buy_mask & ~sell_mask  # side == "U" or other
         buy_vol = int(grp.loc[buy_mask, "size"].sum())
         sell_vol = int(grp.loc[sell_mask, "size"].sum())
+        unknown_vol = int(grp.loc[unknown_mask, "size"].sum())
         buy_notional = float(grp.loc[buy_mask, "notional"].sum())
         sell_notional = float(grp.loc[sell_mask, "notional"].sum())
+        unknown_notional = float(grp.loc[unknown_mask, "notional"].sum())
         sweep_count = int(grp["is_sweep"].sum())
+        trade_count = len(grp)
 
         net_vol = buy_vol - sell_vol
         net_notional = buy_notional - sell_notional
 
+        # 总量包括方向未知的大单 (OPRA 数据经常不含 aggressor side)
+        total_vol = buy_vol + sell_vol + unknown_vol
+        total_notional = buy_notional + sell_notional + unknown_notional
+
         # 大单评分 (0-100)
-        total_vol = buy_vol + sell_vol
-        total_notional = buy_notional + sell_notional
         # 量级分 (0-50): 大单总量越大分越高
         size_score = min(total_vol / 500.0, 1.0) * 30.0 + min(total_notional / 2000000.0, 1.0) * 20.0
-        # 方向性分 (0-30): 买卖越一边倒分越高
-        directional_ratio = abs(net_vol) / max(total_vol, 1) if total_vol > 0 else 0
+        # 方向性分 (0-30): 有方向数据时按买卖倾向评分，无方向时给 0
+        directed_vol = buy_vol + sell_vol
+        directional_ratio = abs(net_vol) / max(directed_vol, 1) if directed_vol > 0 else 0
         dir_score = directional_ratio * 30.0
         # sweep 加分 (0-20)
         sweep_score = min(sweep_count / 5.0, 1.0) * 20.0
         block_score = round(size_score + dir_score + sweep_score, 1)
 
         # 标签
-        label = _block_label(buy_vol, sell_vol, sweep_count, net_notional)
+        label = _block_label(buy_vol, sell_vol, sweep_count, net_notional, total_vol)
 
         rows.append({
             "ticker": ticker,
@@ -890,11 +900,14 @@ def aggregate_block_trades(block_df: pd.DataFrame) -> pd.DataFrame:
             "option_type": ot,
             "block_buy_volume": buy_vol,
             "block_sell_volume": sell_vol,
+            "block_total_volume": total_vol,
             "block_net_volume": net_vol,
             "block_buy_notional": round(buy_notional, 0),
             "block_sell_notional": round(sell_notional, 0),
+            "block_total_notional": round(total_notional, 0),
             "block_net_notional": round(net_notional, 0),
             "sweep_count": sweep_count,
+            "trade_count": trade_count,
             "block_score": block_score,
             "block_label": label,
         })
@@ -902,38 +915,48 @@ def aggregate_block_trades(block_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _block_label(buy_vol: int, sell_vol: int, sweep_count: int, net_notional: float) -> str:
+def _block_label(buy_vol: int, sell_vol: int, sweep_count: int, net_notional: float, total_vol: int = 0) -> str:
     """生成大单中文标签。"""
-    total = buy_vol + sell_vol
-    if total == 0:
+    directed = buy_vol + sell_vol
+    all_vol = total_vol if total_vol > 0 else directed
+    if all_vol == 0:
         return ""
-    ratio = buy_vol / total if total > 0 else 0.5
 
+    # 当有方向数据时，按买卖比例分类
+    if directed > 0:
+        ratio = buy_vol / directed
+        if sweep_count >= 3:
+            if ratio >= 0.7:
+                return "主动扫货买入"
+            elif ratio <= 0.3:
+                return "主动扫货卖出"
+            else:
+                return "扫单对冲"
+        elif sweep_count >= 1:
+            if ratio >= 0.7:
+                return "扫单偏买"
+            elif ratio <= 0.3:
+                return "扫单偏卖"
+            else:
+                return "扫单混合"
+        if ratio >= 0.8:
+            return "大单主买"
+        elif ratio >= 0.6:
+            return "大单偏买"
+        elif ratio <= 0.2:
+            return "大单主卖"
+        elif ratio <= 0.4:
+            return "大单偏卖"
+        else:
+            return "大单均衡"
+
+    # 无方向数据时，按 sweep 和总量分类
     if sweep_count >= 3:
-        if ratio >= 0.7:
-            return "主动扫货买入"
-        elif ratio <= 0.3:
-            return "主动扫货卖出"
-        else:
-            return "扫单对冲"
+        return "密集扫单"
     elif sweep_count >= 1:
-        if ratio >= 0.7:
-            return "扫单偏买"
-        elif ratio <= 0.3:
-            return "扫单偏卖"
-        else:
-            return "扫单混合"
-
-    if ratio >= 0.8:
-        return "大单主买"
-    elif ratio >= 0.6:
-        return "大单偏买"
-    elif ratio <= 0.2:
-        return "大单主卖"
-    elif ratio <= 0.4:
-        return "大单偏卖"
+        return "大单扫单"
     else:
-        return "大单均衡"
+        return "大单活跃"
 
 
 def build_block_strike_analysis(block_agg: pd.DataFrame, ticker: str) -> str:
@@ -975,13 +998,21 @@ def build_block_strike_analysis(block_agg: pd.DataFrame, ticker: str) -> str:
             ot = r["option_type"]
             buy_v = int(r["block_buy_volume"])
             sell_v = int(r["block_sell_volume"])
-            parts = []
-            if buy_v > 0:
-                parts.append(f"买{buy_v}")
-            if sell_v > 0:
-                parts.append(f"卖{sell_v}")
-            vol_str = "/".join(parts) if parts else "0"
-            items.append(f"{strike_str}{ot}({vol_str})")
+            total_v = int(r["block_total_volume"])
+            sweep_c = int(r["sweep_count"])
+            # 有方向时显示买/卖，否则显示总量
+            if buy_v > 0 or sell_v > 0:
+                vol_parts = []
+                if buy_v > 0:
+                    vol_parts.append(f"买{buy_v}")
+                if sell_v > 0:
+                    vol_parts.append(f"卖{sell_v}")
+                vol_str = "/".join(vol_parts)
+            else:
+                vol_str = f"{total_v}张"
+            sweep_tag = f"S{sweep_c}" if sweep_c > 0 else ""
+            detail = f"{vol_str}" + (f"/{sweep_tag}" if sweep_tag else "")
+            items.append(f"{strike_str}{ot}({detail})")
         lines.append(f"{cat_label}: {' '.join(items)}")
 
     return "\n".join(lines)
@@ -991,19 +1022,19 @@ def merge_block_data(contracts_df: pd.DataFrame, block_agg: pd.DataFrame) -> pd.
     """将聚合后的大单数据合并到合约 DataFrame。"""
     if block_agg.empty or contracts_df.empty:
         for col in [
-            "block_buy_volume", "block_sell_volume", "block_net_volume",
-            "block_buy_notional", "block_sell_notional", "block_net_notional",
-            "sweep_count", "block_score", "block_label",
+            "block_buy_volume", "block_sell_volume", "block_total_volume", "block_net_volume",
+            "block_buy_notional", "block_sell_notional", "block_total_notional", "block_net_notional",
+            "sweep_count", "trade_count", "block_score", "block_label",
         ]:
             if col not in contracts_df.columns:
-                contracts_df[col] = 0 if col != "block_label" else ""
+                contracts_df[col] = 0 if col not in ("block_label",) else ""
         return contracts_df
 
     key = ["ticker", "expiration", "strike", "option_type"]
     block_cols = [
-        "block_buy_volume", "block_sell_volume", "block_net_volume",
-        "block_buy_notional", "block_sell_notional", "block_net_notional",
-        "sweep_count", "block_score", "block_label",
+        "block_buy_volume", "block_sell_volume", "block_total_volume", "block_net_volume",
+        "block_buy_notional", "block_sell_notional", "block_total_notional", "block_net_notional",
+        "sweep_count", "trade_count", "block_score", "block_label",
     ]
     merged = contracts_df.merge(
         block_agg[key + block_cols],
@@ -2186,12 +2217,24 @@ def build_daily_summary(
     block_text = "无大单数据"
     if block_summary:
         bs = block_summary
-        net_k = bs["block_net_notional"] / 1000
-        block_text = (
-            f"大单 {bs['total_block_volume']}张 "
-            f"(买{bs['block_buy_volume']}/卖{bs['block_sell_volume']}) "
-            f"净额{net_k:+.0f}K"
-        )
+        total_vol = bs["total_block_volume"]
+        buy_vol = bs["block_buy_volume"]
+        sell_vol = bs["block_sell_volume"]
+        total_notional_k = bs.get("block_total_notional", 0) / 1000
+        trade_count = bs.get("trade_count", 0)
+        # 根据有无方向数据显示不同格式
+        if buy_vol > 0 or sell_vol > 0:
+            net_k = bs["block_net_notional"] / 1000
+            block_text = (
+                f"大单 {total_vol}张 "
+                f"(买{buy_vol}/卖{sell_vol}) "
+                f"金额{total_notional_k:.0f}K 净额{net_k:+.0f}K"
+            )
+        else:
+            block_text = (
+                f"大单 {total_vol}张 ({trade_count}笔) "
+                f"金额{total_notional_k:.0f}K"
+            )
         if bs["sweep_count"] > 0:
             block_text += f" | Sweep {bs['sweep_count']}笔"
         block_text += f"\n  主力合约 {bs['top_block_contract']} [{bs['top_block_label']}]"
@@ -2199,15 +2242,22 @@ def build_daily_summary(
     # 合约大单标注
     block_contracts_text = ""
     if not contracts_df.empty and "block_label" in contracts_df.columns:
-        block_rows = contracts_df[contracts_df["block_label"].astype(str).str.len() > 0].head(3)
+        block_rows = contracts_df[contracts_df["block_label"].astype(str).str.len() > 0].head(5)
         if not block_rows.empty:
             parts = []
             for _, r in block_rows.iterrows():
+                buy_v = safe_int(r.get('block_buy_volume'))
+                sell_v = safe_int(r.get('block_sell_volume'))
+                total_v = safe_int(r.get('block_total_volume'))
+                sweep_c = safe_int(r.get('sweep_count'))
+                if buy_v > 0 or sell_v > 0:
+                    vol_str = f"买{buy_v}/卖{sell_v}"
+                else:
+                    vol_str = f"{total_v}张"
+                sweep_str = f" S{sweep_c}" if sweep_c > 0 else ""
                 parts.append(
                     f"  {fmt_strike(r['strike'])}{r['option_type']} "
-                    f"[{r['block_label']}] "
-                    f"买{safe_int(r.get('block_buy_volume'))}/"
-                    f"卖{safe_int(r.get('block_sell_volume'))}"
+                    f"[{r['block_label']}] {vol_str}{sweep_str}"
                 )
             block_contracts_text = "\n".join(parts)
 
@@ -2784,17 +2834,24 @@ def daily_pipeline(cfg: argparse.Namespace) -> None:
         # 计算该 ticker 的大单摘要
         if not ticker_block.empty:
             tb = ticker_block
+            top_row = tb.sort_values("block_score", ascending=False).iloc[0]
+            total_vol = int(tb["block_total_volume"].sum())
+            buy_vol = int(tb["block_buy_volume"].sum())
+            sell_vol = int(tb["block_sell_volume"].sum())
+            total_notional = float(tb["block_total_notional"].sum())
             ticker_block_summary[ticker] = {
-                "total_block_volume": int(tb["block_buy_volume"].sum() + tb["block_sell_volume"].sum()),
-                "block_buy_volume": int(tb["block_buy_volume"].sum()),
-                "block_sell_volume": int(tb["block_sell_volume"].sum()),
+                "total_block_volume": total_vol,
+                "block_buy_volume": buy_vol,
+                "block_sell_volume": sell_vol,
+                "block_total_notional": total_notional,
                 "block_net_notional": float(tb["block_net_notional"].sum()),
                 "sweep_count": int(tb["sweep_count"].sum()),
-                "top_block_label": tb.sort_values("block_score", ascending=False).iloc[0]["block_label"],
+                "trade_count": int(tb["trade_count"].sum()),
+                "top_block_label": top_row["block_label"],
                 "top_block_contract": (
-                    f"{tb.sort_values('block_score', ascending=False).iloc[0]['expiration']} "
-                    f"{fmt_strike(tb.sort_values('block_score', ascending=False).iloc[0]['strike'])}"
-                    f"{tb.sort_values('block_score', ascending=False).iloc[0]['option_type']}"
+                    f"{top_row['expiration']} "
+                    f"{fmt_strike(top_row['strike'])}"
+                    f"{top_row['option_type']}"
                 ),
             }
         monthly_base = filter_monthly_universe(merged, cfg)
