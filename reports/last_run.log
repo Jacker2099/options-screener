@@ -1,12 +1,83 @@
-16:21:00 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-16:21:16 [INFO] Databento NVDA definitions: 4006 个合约映射
-16:21:16 [INFO] Databento NVDA 成功, 345068 笔成交, 映射 4006 个合约
-16:21:16 [INFO] Databento NVDA 大单 11278 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags']
-16:21:16 [INFO] Databento NVDA 大单 11278 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags', 'ts_in_delta', 'sequence']
-16:21:17 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-16:21:28 [INFO] Databento TSLA definitions: 6360 个合约映射
-16:21:28 [INFO] Databento TSLA 成功, 550756 笔成交, 映射 6360 个合约
-16:21:28 [INFO] Databento TSLA 大单 8290 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags']
-16:21:28 [INFO] Databento TSLA 大单 8290 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags', 'ts_in_delta', 'sequence']
-16:21:43 [INFO] Databento 大单: 19568 笔 (sweep 5432 笔)
-16:21:49 [INFO] 盘后雷达完成: trade_date=2026-03-20 prev_snapshot=2026-03-19
+23:41:17 [INFO] 交易日: 2026-03-20
+23:41:17 [INFO] 监控月度到期日: ['2026-03-20', '2026-04-17', '2026-05-15']
+23:41:18 [INFO] NVDA 收盘 $172.93 (-3.15%)
+23:41:18 [INFO] TSLA 收盘 $367.96 (-3.24%)
+23:41:18 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+23:41:18 [INFO] Databento NVDA 拉取 trades ...
+23:41:23 [INFO] Databento NVDA 拉取 definitions ...
+23:41:26 [INFO] Databento NVDA definitions: 4006 个合约映射
+23:41:26 [INFO] Databento NVDA 原始成交: 345068 笔
+23:41:45 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+23:41:45 [INFO] Databento TSLA 拉取 trades ...
+23:41:51 [INFO] Databento TSLA 拉取 definitions ...
+23:42:01 [INFO] Databento TSLA definitions: 6360 个合约映射
+23:42:01 [INFO] Databento TSLA 原始成交: 550756 笔
+23:42:32 [INFO] 大单总计: 949 笔 (sweep 314 笔), 总名义 $618.3M
+23:42:33 [INFO] OI 数据: 877 条
+23:42:33 [INFO] 报告已保存: reports/daily/NVDA_2026-03-20.md
+
+============================================================
+# NVDA 月度期权大单雷达 2026-03-20
+收盘价 $172.93 (-3.15%)
+
+## 📊 月度资金热力图
+  03/20 | ⚪ 中性 | 净金流 ↓$0K (总额$164.9M, 388笔)
+  04/17 | ⚪ 中性 | 净金流 ↓$0K (总额$29.8M, 95笔)
+  05/15 | ⚪ 中性 | 净金流 ↓$0K (总额$28.9M, 60笔)
+  合计: ⚪ 中性 净金流 $0K
+
+## 🏆 顶级大宗成交 (Top 5)
+  #1 03/20 155C | $10.3M | 4935张×$20.80 | 方向未知
+  #2 03/20 135C | $8.0M | 1945张×$41.00 | 方向未知
+  #3 03/20 135C | $7.5M | 1837张×$40.85 | 方向未知
+  #4 05/15 175C | $7.3M | 7000张×$10.45 | 方向未知
+  #5 03/20 135C | $7.2M | 1816张×$39.85 | 方向未知
+
+## 🎯 主力成本区间 (Whale VWAP)
+  03/20 135C | VWAP $39.90 | 13,471张/$53.8M | 密集扫单 S49 | OI:N/A 
+  03/20 150C | VWAP $23.45 | 13,804张/$32.4M | 密集扫单 S111 | OI:N/A 
+  03/20 145C | VWAP $30.40 | 9,111张/$27.7M | 密集扫单 S28 | OI:N/A 
+  03/20 155C | VWAP $20.71 | 7,203张/$14.9M | 密集扫单 S8 | OI:N/A 
+  05/15 175C | VWAP $10.48 | 7,285张/$7.6M | 大单 | OI:6,399 V/OI:1.1 ⚠️新仓
+  05/15 180C | VWAP $8.97 | 7,750张/$7.0M | 大单 | OI:28,625 V/OI:0.3
+  03/20 100C | VWAP $75.09 | 617张/$4.6M | 大单 | OI:N/A 
+  04/17 180P | VWAP $9.80 | 4,158张/$4.1M | 大单 | OI:38,029 V/OI:0.1
+
+## 💡 交易提示
+👀 多空均衡: 大资金方向不明 (含239笔Sweep), 等待明确信号, 当前价 $172.93
+============================================================
+
+23:42:33 [INFO] 报告已保存: reports/daily/TSLA_2026-03-20.md
+
+============================================================
+# TSLA 月度期权大单雷达 2026-03-20
+收盘价 $367.96 (-3.24%)
+
+## 📊 月度资金热力图
+  03/20 | ⚪ 中性 | 净金流 ↓$0K (总额$41.4M, 181笔)
+  04/17 | ⚪ 中性 | 净金流 ↓$0K (总额$338.3M, 153笔)
+  05/15 | ⚪ 中性 | 净金流 ↓$0K (总额$15.0M, 72笔)
+  合计: ⚪ 中性 净金流 $0K
+
+## 🏆 顶级大宗成交 (Top 5)
+  #1 04/17 500P | $130.6M | 10000张×$130.60 | 方向未知
+  #2 04/17 505P | $103.1M | 7600张×$135.60 | 方向未知
+  #3 04/17 505P | $32.5M | 2400张×$135.61 | 方向未知
+  #4 04/17 500P | $13.1M | 977张×$133.80 | 方向未知
+  #5 04/17 525P | $5.6M | 350张×$159.25 | 方向未知
+
+## 🎯 主力成本区间 (Whale VWAP)
+  04/17 500P | VWAP $130.88 | 10,977张/$143.7M | 大单 | OI:3,261 V/OI:3.4 ⚠️新仓
+  04/17 505P | VWAP $135.61 | 10,020张/$135.9M | 大单 | OI:3 V/OI:3340.0 ⚠️新仓
+  04/17 450P | VWAP $79.79 | 885张/$7.1M | 大单 | OI:2,525 V/OI:0.3
+  03/20 300C | VWAP $68.42 | 977张/$6.7M | 密集扫单 S9 | OI:N/A 
+  04/17 305C | VWAP $66.89 | 963张/$6.4M | 密集扫单 S11 | OI:150 V/OI:6.4 ⚠️新仓
+  04/17 525P | VWAP $159.25 | 350张/$5.6M | 大单 | OI:50 V/OI:7.0 ⚠️新仓
+  04/17 380C | VWAP $14.62 | 3,637张/$5.3M | 大单 | OI:1,746 V/OI:2.1 ⚠️新仓
+  04/17 370C | VWAP $18.84 | 2,500张/$4.7M | 大单 | OI:516 V/OI:4.8 ⚠️新仓
+
+## 💡 交易提示
+👀 多空均衡: 大资金方向不明 (含75笔Sweep), 等待明确信号, 当前价 $367.96
+============================================================
+
+23:42:36 [INFO] Pipeline 完成 ✓
