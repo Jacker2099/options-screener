@@ -1007,12 +1007,12 @@ def build_block_strike_analysis(block_agg: pd.DataFrame, ticker: str) -> str:
             if buy_v > 0 or sell_v > 0:
                 vol_parts = []
                 if buy_v > 0:
-                    vol_parts.append(f"买{buy_v}")
+                    vol_parts.append(f"买{buy_v:,}")
                 if sell_v > 0:
-                    vol_parts.append(f"卖{sell_v}")
+                    vol_parts.append(f"卖{sell_v:,}")
                 vol_str = "/".join(vol_parts)
             else:
-                vol_str = f"{total_v}张"
+                vol_str = f"{total_v:,}张"
             sweep_tag = f"S{sweep_c}" if sweep_c > 0 else ""
             detail = f"{vol_str}" + (f"/{sweep_tag}" if sweep_tag else "")
             items.append(f"{strike_str}{ot}({detail})")
@@ -2216,7 +2216,7 @@ def build_daily_summary(
     opposite_zone = strongest_opposite_zone(contracts_df, main_side, preferred_expiration=main_exp)
     next_watch = " / ".join([x for x in [focus_contracts, opposite_zone] if x]) or strongest_contract
     monthly_text = monthly_sections_text(contracts_df)
-    # 大单摘要文本
+    # 大单摘要文本 (含分类 strike 列表)
     block_text = "无大单数据"
     if block_summary:
         bs = block_summary
@@ -2229,45 +2229,22 @@ def build_daily_summary(
         if buy_vol > 0 or sell_vol > 0:
             net_k = bs["block_net_notional"] / 1000
             block_text = (
-                f"大单 {total_vol}张 "
-                f"(买{buy_vol}/卖{sell_vol}) "
-                f"金额{total_notional_k:.0f}K 净额{net_k:+.0f}K"
+                f"大单 {total_vol:,}张 "
+                f"(买{buy_vol:,}/卖{sell_vol:,}) "
+                f"金额{total_notional_k:,.0f}K 净额{net_k:+,.0f}K"
             )
         else:
             block_text = (
-                f"大单 {total_vol}张 ({trade_count}笔) "
-                f"金额{total_notional_k:.0f}K"
+                f"大单 {total_vol:,}张 ({trade_count:,}笔) "
+                f"金额{total_notional_k:,.0f}K"
             )
         if bs["sweep_count"] > 0:
-            block_text += f" | Sweep {bs['sweep_count']}笔"
-        block_text += f"\n  主力合约 {bs['top_block_contract']} [{bs['top_block_label']}]"
-
-    # 合约大单标注
-    block_contracts_text = ""
-    if not contracts_df.empty and "block_label" in contracts_df.columns:
-        block_rows = contracts_df[contracts_df["block_label"].astype(str).str.len() > 0].head(5)
-        if not block_rows.empty:
-            parts = []
-            for _, r in block_rows.iterrows():
-                buy_v = safe_int(r.get('block_buy_volume'))
-                sell_v = safe_int(r.get('block_sell_volume'))
-                total_v = safe_int(r.get('block_total_volume'))
-                sweep_c = safe_int(r.get('sweep_count'))
-                if buy_v > 0 or sell_v > 0:
-                    vol_str = f"买{buy_v}/卖{sell_v}"
-                else:
-                    vol_str = f"{total_v}张"
-                sweep_str = f" S{sweep_c}" if sweep_c > 0 else ""
-                parts.append(
-                    f"  {fmt_strike(r['strike'])}{r['option_type']} "
-                    f"[{r['block_label']}] {vol_str}{sweep_str}"
-                )
-            block_contracts_text = "\n".join(parts)
-
-    # 按价位分类的大单分析
-    block_strike_analysis = ""
-    if block_agg is not None and not block_agg.empty:
-        block_strike_analysis = build_block_strike_analysis(block_agg, ticker)
+            block_text += f" | Sweep {bs['sweep_count']:,}笔"
+        # 附加分类 strike 列表
+        if block_agg is not None and not block_agg.empty:
+            strike_lines = build_block_strike_analysis(block_agg, ticker)
+            if strike_lines:
+                block_text += "\n" + strike_lines
 
     bootstrap_note = "初始化模式：缺少前一日快照，OI 增减仅供预热参考。\n" if bootstrap_mode else ""
     text = (
@@ -2282,9 +2259,7 @@ def build_daily_summary(
         f"月度变化：{comparison_detail}\n"
         f"连续性：{continuity_text}\n"
         f"大单动向：{block_text}\n"
-        + (f"大单合约：\n{block_contracts_text}\n" if block_contracts_text else "")
-        + (f"大单价位分析：\n{block_strike_analysis}\n" if block_strike_analysis else "")
-        + f"次日重点观察：{next_watch}\n"
+        f"次日重点观察：{next_watch}\n"
         f"\n月度前五合约\n{monthly_text}\n"
         f"{bootstrap_note}".rstrip()
     )
@@ -2307,8 +2282,6 @@ def build_daily_summary(
         "direction_reason": str(direction_info.get("reason_text", "")),
         "monthly_sections_text": str(monthly_text),
         "block_text": str(block_text),
-        "block_contracts_text": str(block_contracts_text),
-        "block_strike_analysis": str(block_strike_analysis),
         "summary_text": text,
     }
 
@@ -2585,8 +2558,6 @@ def telegram_ticker_brief(ticker: str, meta: Dict[str, Any], summary: Dict[str, 
     continuity = html.escape(summary.get("continuity_text", "无"))
     next_watch = html.escape(summary.get("next_watch", "无"))
     block_text = html.escape(summary.get("block_text", "无大单数据"))
-    block_contracts = html.escape(summary.get("block_contracts_text", ""))
-    block_strike = html.escape(summary.get("block_strike_analysis", ""))
     monthly_lines = html.escape(summary.get("monthly_sections_text", "无"))
 
     # 方向 emoji
@@ -2600,12 +2571,6 @@ def telegram_ticker_brief(ticker: str, meta: Dict[str, Any], summary: Dict[str, 
         f"📊 <b>大单</b>",
         block_text,
     ]
-    if block_contracts:
-        lines.append(block_contracts)
-    if block_strike:
-        lines.append("")
-        lines.append("<b>价位分析</b>")
-        lines.append(f"<pre>{block_strike}</pre>")
     lines += [
         "",
         f"📋 <b>持仓</b>",
