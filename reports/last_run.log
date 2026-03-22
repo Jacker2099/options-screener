@@ -1,8 +1,11 @@
-15:25:30 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-15:25:44 [INFO] Databento NVDA 成功, 345068 笔成交
-15:25:44 [INFO] Databento NVDA 大单 11278 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags']
-15:25:45 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-15:25:51 [INFO] Databento TSLA 成功, 550756 笔成交
-15:25:51 [INFO] Databento TSLA 大单 8290 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags']
-15:26:07 [INFO] Databento 大单: 19568 笔 (sweep 5432 笔)
-15:26:12 [INFO] 盘后雷达完成: trade_date=2026-03-20 prev_snapshot=2026-03-19
+15:29:30 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+15:29:30 [INFO] Databento NVDA 查询失败: 422 symbology_invalid_request
+Unable to process symbology with parameters: `dataset=OPRA.PILLAR`, `stype_in=parent`, `stype_out=raw_symbol`. See the symbology docs for supported combinations per dataset https://databento.com/docs/standards-and-conventions/symbology.
+documentation: https://databento.com/docs/api-reference-historical/basics/symbology
+15:29:30 [INFO] Databento NVDA 2026-03-20 无成交数据
+15:29:30 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+15:29:31 [INFO] Databento TSLA 查询失败: 422 symbology_invalid_request
+Unable to process symbology with parameters: `dataset=OPRA.PILLAR`, `stype_in=parent`, `stype_out=raw_symbol`. See the symbology docs for supported combinations per dataset https://databento.com/docs/standards-and-conventions/symbology.
+documentation: https://databento.com/docs/api-reference-historical/basics/symbology
+15:29:31 [INFO] Databento TSLA 2026-03-20 无成交数据
+15:29:34 [INFO] 盘后雷达完成: trade_date=2026-03-20 prev_snapshot=2026-03-19
