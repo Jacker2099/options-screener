@@ -40,6 +40,11 @@ try:
 except Exception:
     yf = None
 
+try:
+    import databento as db  # type: ignore
+except Exception:
+    db = None
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -109,6 +114,15 @@ DAILY_FIELDS = [
     "band_continuity_days",
     "band_continuity_score",
     "total_score",
+    "block_buy_volume",
+    "block_sell_volume",
+    "block_net_volume",
+    "block_buy_notional",
+    "block_sell_notional",
+    "block_net_notional",
+    "sweep_count",
+    "block_score",
+    "block_label",
 ]
 
 NUMERIC_FIELDS = {
@@ -161,6 +175,14 @@ NUMERIC_FIELDS = {
     "band_continuity_days",
     "band_continuity_score",
     "total_score",
+    "block_buy_volume",
+    "block_sell_volume",
+    "block_net_volume",
+    "block_buy_notional",
+    "block_sell_notional",
+    "block_net_notional",
+    "sweep_count",
+    "block_score",
 }
 
 VALIDATION_FIELDS = [
@@ -607,6 +629,280 @@ def fetch_option_snapshot(symbol: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     return out, meta
 
 
+# ---------------------------------------------------------------------------
+# Databento 大单 / Sweep 数据
+# ---------------------------------------------------------------------------
+
+# 大单阈值: 单笔 >= 50 张视为大单
+BLOCK_THRESHOLD = 50
+# Sweep 判定: 同一合约在 2 秒内跨 >= 2 个交易所成交
+SWEEP_WINDOW_SEC = 2.0
+SWEEP_MIN_EXCHANGES = 2
+
+
+def _databento_api_key() -> str:
+    return os.environ.get("DATABENTO_API_KEY", "")
+
+
+def fetch_block_trades(
+    symbols: List[str],
+    trade_date: date,
+) -> pd.DataFrame:
+    """从 Databento OPRA 拉取当日期权逐笔成交，筛选大单和 sweep。
+
+    返回 DataFrame 列:
+        ticker, expiration, strike, option_type, trade_time,
+        size, price, side (B/S/U), exchange, is_sweep
+    """
+    api_key = _databento_api_key()
+    if not api_key or db is None:
+        log.info("Databento 未配置或未安装，跳过大单数据")
+        return pd.DataFrame()
+
+    all_rows: List[Dict[str, Any]] = []
+    for symbol in symbols:
+        try:
+            client = db.Historical(key=api_key)
+            # 查询 OPRA 当日逐笔成交，按标的过滤
+            data = client.timeseries.get_range(
+                dataset="OPRA.PILLAR",
+                schema="trades",
+                stype_in="parent",
+                symbols=[symbol],
+                start=f"{trade_date}T00:00",
+                end=f"{trade_date}T23:59",
+            )
+            df = data.to_df()
+            if df is None or df.empty:
+                log.info("Databento %s %s 无成交数据", symbol, trade_date)
+                continue
+
+            # 只保留大单
+            df = df[df["size"] >= BLOCK_THRESHOLD].copy()
+            if df.empty:
+                continue
+
+            # 解析 instrument_id -> 合约信息
+            # Databento OPRA 的 symbol 格式: NVDA  250418C00120000
+            for _, row in df.iterrows():
+                raw_sym = str(row.get("symbol", ""))
+                parsed = _parse_opra_symbol(raw_sym, symbol)
+                if parsed is None:
+                    continue
+                trade_price = safe_float(row.get("price"), 0.0)
+                trade_size = safe_int(row.get("size"), 0)
+                # 判定买卖方向: Databento side 字段
+                # 'A' = aggressor buy (at ask), 'B' = aggressor sell (at bid)
+                raw_side = str(row.get("side", ""))
+                if raw_side == "A":
+                    side = "B"  # aggressive buy
+                elif raw_side == "B":
+                    side = "S"  # aggressive sell
+                else:
+                    side = "U"  # unknown
+
+                ts = row.name if hasattr(row.name, 'timestamp') else row.get("ts_event")
+                all_rows.append({
+                    "ticker": symbol,
+                    "expiration": parsed["expiration"],
+                    "strike": parsed["strike"],
+                    "option_type": parsed["option_type"],
+                    "trade_time": ts,
+                    "size": trade_size,
+                    "price": trade_price,
+                    "notional": trade_price * trade_size * 100,
+                    "side": side,
+                    "exchange": str(row.get("venue", "")),
+                    "raw_symbol": raw_sym,
+                })
+        except Exception as e:
+            log.warning("Databento %s 拉取失败: %s", symbol, e)
+            continue
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    result = pd.DataFrame(all_rows)
+    # 标记 sweep: 同一合约在 SWEEP_WINDOW_SEC 内跨 >= SWEEP_MIN_EXCHANGES 个交易所
+    result["is_sweep"] = False
+    if "trade_time" in result.columns and not result.empty:
+        result = result.sort_values(["ticker", "raw_symbol", "trade_time"]).reset_index(drop=True)
+        for _, grp in result.groupby("raw_symbol"):
+            if len(grp) < 2:
+                continue
+            times = pd.to_datetime(grp["trade_time"], errors="coerce")
+            for i in grp.index:
+                t = times.get(i)
+                if pd.isna(t):
+                    continue
+                window = grp[
+                    (times >= t) & (times <= t + pd.Timedelta(seconds=SWEEP_WINDOW_SEC))
+                ]
+                if window["exchange"].nunique() >= SWEEP_MIN_EXCHANGES:
+                    result.loc[window.index, "is_sweep"] = True
+
+    log.info("Databento 大单: %d 笔 (sweep %d 笔)", len(result), result["is_sweep"].sum())
+    return result
+
+
+def _parse_opra_symbol(raw_sym: str, ticker: str) -> Optional[Dict[str, Any]]:
+    """解析 OPRA 合约符号，例如 'NVDA  250418C00120000'"""
+    raw_sym = raw_sym.strip()
+    # 尝试标准 OCC 格式: 6 char underlying + 6 date + C/P + 8 strike
+    if len(raw_sym) < 15:
+        return None
+    try:
+        # 找到 C 或 P 的位置
+        idx = -1
+        for i in range(len(ticker), len(raw_sym)):
+            if raw_sym[i] in ("C", "P"):
+                # 前面 6 位应该是日期
+                date_part = raw_sym[i - 6 : i]
+                if date_part.isdigit():
+                    idx = i
+                    break
+        if idx < 0:
+            return None
+        date_str = raw_sym[idx - 6 : idx]
+        option_type = raw_sym[idx]
+        strike_str = raw_sym[idx + 1 :]
+        exp_date = datetime.strptime("20" + date_str, "%Y%m%d").date()
+        strike = int(strike_str) / 1000.0
+        return {
+            "expiration": exp_date.isoformat(),
+            "strike": strike,
+            "option_type": option_type,
+        }
+    except Exception:
+        return None
+
+
+def aggregate_block_trades(block_df: pd.DataFrame) -> pd.DataFrame:
+    """按 (ticker, expiration, strike, option_type) 聚合大单数据。
+
+    返回列: ticker, expiration, strike, option_type,
+            block_buy_volume, block_sell_volume, block_net_volume,
+            block_buy_notional, block_sell_notional, block_net_notional,
+            sweep_count, block_score, block_label
+    """
+    if block_df.empty:
+        return pd.DataFrame()
+
+    rows: List[Dict[str, Any]] = []
+    key_cols = ["ticker", "expiration", "strike", "option_type"]
+    for key, grp in block_df.groupby(key_cols):
+        ticker, exp, strike, ot = key
+        buy_mask = grp["side"] == "B"
+        sell_mask = grp["side"] == "S"
+        buy_vol = int(grp.loc[buy_mask, "size"].sum())
+        sell_vol = int(grp.loc[sell_mask, "size"].sum())
+        buy_notional = float(grp.loc[buy_mask, "notional"].sum())
+        sell_notional = float(grp.loc[sell_mask, "notional"].sum())
+        sweep_count = int(grp["is_sweep"].sum())
+
+        net_vol = buy_vol - sell_vol
+        net_notional = buy_notional - sell_notional
+
+        # 大单评分 (0-100)
+        total_vol = buy_vol + sell_vol
+        total_notional = buy_notional + sell_notional
+        # 量级分 (0-50): 大单总量越大分越高
+        size_score = min(total_vol / 500.0, 1.0) * 30.0 + min(total_notional / 2000000.0, 1.0) * 20.0
+        # 方向性分 (0-30): 买卖越一边倒分越高
+        directional_ratio = abs(net_vol) / max(total_vol, 1) if total_vol > 0 else 0
+        dir_score = directional_ratio * 30.0
+        # sweep 加分 (0-20)
+        sweep_score = min(sweep_count / 5.0, 1.0) * 20.0
+        block_score = round(size_score + dir_score + sweep_score, 1)
+
+        # 标签
+        label = _block_label(buy_vol, sell_vol, sweep_count, net_notional)
+
+        rows.append({
+            "ticker": ticker,
+            "expiration": exp,
+            "strike": strike,
+            "option_type": ot,
+            "block_buy_volume": buy_vol,
+            "block_sell_volume": sell_vol,
+            "block_net_volume": net_vol,
+            "block_buy_notional": round(buy_notional, 0),
+            "block_sell_notional": round(sell_notional, 0),
+            "block_net_notional": round(net_notional, 0),
+            "sweep_count": sweep_count,
+            "block_score": block_score,
+            "block_label": label,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def _block_label(buy_vol: int, sell_vol: int, sweep_count: int, net_notional: float) -> str:
+    """生成大单中文标签。"""
+    total = buy_vol + sell_vol
+    if total == 0:
+        return ""
+    ratio = buy_vol / total if total > 0 else 0.5
+
+    if sweep_count >= 3:
+        if ratio >= 0.7:
+            return "主动扫货买入"
+        elif ratio <= 0.3:
+            return "主动扫货卖出"
+        else:
+            return "扫单对冲"
+    elif sweep_count >= 1:
+        if ratio >= 0.7:
+            return "扫单偏买"
+        elif ratio <= 0.3:
+            return "扫单偏卖"
+        else:
+            return "扫单混合"
+
+    if ratio >= 0.8:
+        return "大单主买"
+    elif ratio >= 0.6:
+        return "大单偏买"
+    elif ratio <= 0.2:
+        return "大单主卖"
+    elif ratio <= 0.4:
+        return "大单偏卖"
+    else:
+        return "大单均衡"
+
+
+def merge_block_data(contracts_df: pd.DataFrame, block_agg: pd.DataFrame) -> pd.DataFrame:
+    """将聚合后的大单数据合并到合约 DataFrame。"""
+    if block_agg.empty or contracts_df.empty:
+        for col in [
+            "block_buy_volume", "block_sell_volume", "block_net_volume",
+            "block_buy_notional", "block_sell_notional", "block_net_notional",
+            "sweep_count", "block_score", "block_label",
+        ]:
+            if col not in contracts_df.columns:
+                contracts_df[col] = 0 if col != "block_label" else ""
+        return contracts_df
+
+    key = ["ticker", "expiration", "strike", "option_type"]
+    block_cols = [
+        "block_buy_volume", "block_sell_volume", "block_net_volume",
+        "block_buy_notional", "block_sell_notional", "block_net_notional",
+        "sweep_count", "block_score", "block_label",
+    ]
+    merged = contracts_df.merge(
+        block_agg[key + block_cols],
+        on=key,
+        how="left",
+        suffixes=("", "_blk"),
+    )
+    for col in block_cols:
+        if col == "block_label":
+            merged[col] = merged[col].fillna("")
+        else:
+            merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
+    return merged
+
+
 def merge_previous_oi(today_df: pd.DataFrame, prev_df: pd.DataFrame) -> Tuple[pd.DataFrame, bool]:
     key = ["ticker", "expiration", "option_type", "strike"]
     merged = today_df.copy()
@@ -746,32 +1042,21 @@ def compute_direction_strength(monthly_df: pd.DataFrame, bootstrap_mode: bool) -
         call_score = call_level * 0.35 + call_delta * 0.65
         put_score = put_level * 0.35 + put_delta * 0.65
 
-    # --- 双边平仓检测：当 Call 和 Put 的 OI 增量都为负时，方向信号不可靠 ---
-    both_liquidating = (
-        not bootstrap_mode
-        and call_oi_delta < 0
-        and put_oi_delta < 0
-    )
-
     if call_score >= put_score:
         side = "C"
-        bias_label = "平仓观望(Call侧)" if both_liquidating else "Call 偏强"
-        direction_text = "平仓观望" if both_liquidating else "看多"
+        bias_label = "Call 偏强"
+        direction_text = "看多"
     else:
         side = "P"
-        bias_label = "平仓观望(Put侧)" if both_liquidating else "Put 偏强"
-        direction_text = "平仓观望" if both_liquidating else "看空"
+        bias_label = "Put 偏强"
+        direction_text = "看空"
 
-    confidence_score = clip(42.0 + abs(call_score - put_score) * 0.45, 0.0, 100.0)
-    # 双边平仓时置信度打五折
-    if both_liquidating:
-        confidence_score = clip(confidence_score * 0.5, 0.0, 100.0)
+    confidence_score = clip(55.0 + abs(call_score - put_score) * 0.45, 0.0, 100.0)
     reason_text = (
         f"Call总量 OI {call_oi_total:.0f} / Vol {call_vol_total:.0f} / Amt {call_amt_total/1000:.0f}K / "
         f"ΔOI {call_oi_delta:+.0f} / ΔVol {call_vol_delta:+.0f} / ΔAmt {call_amt_delta/1000:+.0f}K；"
         f"Put总量 OI {put_oi_total:.0f} / Vol {put_vol_total:.0f} / Amt {put_amt_total/1000:.0f}K / "
         f"ΔOI {put_oi_delta:+.0f} / ΔVol {put_vol_delta:+.0f} / ΔAmt {put_amt_delta/1000:+.0f}K"
-        f"{'；⚠️ 双边OI均下降，方向信号减弱' if both_liquidating else ''}"
     )
     return {
         "side": side,
@@ -797,17 +1082,15 @@ def compute_direction_strength(monthly_df: pd.DataFrame, bootstrap_mode: bool) -
     }
 
 
-def exclude_closest_strikes(df: pd.DataFrame, min_distance_pct: float = 0.01) -> pd.DataFrame:
-    """排除 ATM 附近做市商主导的 strike（distance_pct < 1%）。
-
-    对 NVDA/TSLA 等大票，ATM ±1-2 档通常由做市商对冲驱动，
-    OI/Volume 虽高但不反映方向性观点。
-    """
+def exclude_closest_strikes(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df.copy()
-    trimmed = df[df["distance_pct"] >= min_distance_pct].copy()
-    # 如果全部被排除（极端情况），保留原始数据
-    return trimmed if not trimmed.empty else df.copy()
+    parts: List[pd.DataFrame] = []
+    for expiration, group in df.groupby("expiration"):
+        min_dist = safe_float(group["distance_pct"].min(), 0.0)
+        trimmed = group[group["distance_pct"] > min_dist + 1e-12].copy()
+        parts.append(trimmed if not trimmed.empty else group.copy())
+    return pd.concat(parts, ignore_index=True) if parts else df.copy()
 
 
 def rank_directional_contracts(monthly_df: pd.DataFrame, side: str, cfg: argparse.Namespace, bootstrap_mode: bool) -> pd.DataFrame:
@@ -1100,17 +1383,6 @@ def assign_structure(df: pd.DataFrame) -> pd.DataFrame:
                 score = min(score + 10.0, 100.0)
             elif safe_float(band_group["oi_change"].clip(lower=0).sum(), 0.0) >= 1500:
                 score = min(score + 5.0, 100.0)
-            # OI 分布均匀度：如果 band 内多数 strike 都有实质 OI，加分；否则打折
-            band_oi_values = band_group["open_interest"].fillna(0).tolist()
-            if len(band_oi_values) >= 2:
-                oi_max_in_band = max(band_oi_values) if max(band_oi_values) > 0 else 1.0
-                uniformity = min(band_oi_values) / oi_max_in_band
-                # uniformity 0→1: 0 表示极度集中, 1 表示完全均匀
-                # 均匀度 < 0.1 时打 7 折（有量的只有一两个 strike）
-                if uniformity < 0.10:
-                    score *= 0.70
-                elif uniformity >= 0.30:
-                    score = min(score + 5.0, 100.0)
             band_key = f"{ticker}|{expiration}|{option_type}|{band[0]}|{band[-1]}"
             mask = (
                 (out["ticker"] == ticker)
@@ -1159,7 +1431,7 @@ def assign_continuity(today_df: pd.DataFrame, prior_dfs: List[pd.DataFrame]) -> 
                 days = 2
             if len(positive_maps) >= 2 and row_key in positive_maps[0] and row_key in positive_maps[1]:
                 days = 3
-        score = 20.0 if days >= 3 else (10.0 if days == 2 else 0.0)
+        score = 40.0 if days >= 3 else (20.0 if days == 2 else 0.0)
         days_list.append(days)
         score_list.append(score)
 
@@ -1192,7 +1464,7 @@ def assign_continuity(today_df: pd.DataFrame, prior_dfs: List[pd.DataFrame]) -> 
                 zone_days += 1
             else:
                 break
-        zone_score = 20.0 if zone_days >= 3 else (10.0 if zone_days == 2 else 0.0)
+        zone_score = 40.0 if zone_days >= 3 else (20.0 if zone_days == 2 else 0.0)
         zone_days_by_band[band["band_id"]] = zone_days
         zone_score_by_band[band["band_id"]] = zone_score
 
@@ -1205,12 +1477,9 @@ def assign_continuity(today_df: pd.DataFrame, prior_dfs: List[pd.DataFrame]) -> 
 
 def score_contracts(df: pd.DataFrame, bootstrap_mode: bool) -> pd.DataFrame:
     out = df.copy()
-    # positioning: 提高天花板，用 log 归一化区分 NVDA/TSLA 大 OI 合约
-    _oi_log_norm = (out["open_interest"].clip(lower=1).apply(math.log10) / math.log10(40000)).clip(upper=1.0)
-    _oi_notional_log_norm = (out["open_interest_notional"].clip(lower=1).apply(math.log10) / math.log10(4000000)).clip(upper=1.0)
     out["positioning_score"] = (
-        _oi_log_norm * 55.0
-        + _oi_notional_log_norm * 45.0
+        (out["open_interest"] / 15000.0).clip(upper=1.0) * 55.0
+        + (out["open_interest_notional"].clip(lower=0) / 1500000.0).clip(upper=1.0) * 45.0
     )
     out["confirmation_score"] = (
         (out["oi_change"].clip(lower=0) / 3000.0).clip(upper=1.0) * 40.0
@@ -1218,11 +1487,10 @@ def score_contracts(df: pd.DataFrame, bootstrap_mode: bool) -> pd.DataFrame:
         + (out["oi_change_notional"].clip(lower=0) / 300000.0).clip(upper=1.0) * 25.0
     )
     out["oi_score"] = out["confirmation_score"]
-    # flow: 提高天花板适配 NVDA/TSLA 量级
     out["flow_score"] = (
-        (out["volume"] / 5000.0).clip(upper=1.0) * 30.0
+        (out["volume"] / 2000.0).clip(upper=1.0) * 30.0
         + (out["volume_oi_ratio"] / 0.80).clip(upper=1.0) * 30.0
-        + (out["premium_notional"].clip(lower=0) / 1500000.0).clip(upper=1.0) * 40.0
+        + (out["premium_notional"].clip(lower=0) / 500000.0).clip(upper=1.0) * 40.0
     )
     out["liquidity_score"] = (
         (out["open_interest"] / 5000.0).clip(upper=1.0) * 50.0
@@ -1238,27 +1506,57 @@ def score_contracts(df: pd.DataFrame, bootstrap_mode: bool) -> pd.DataFrame:
         for option_type, chg_pct in zip(out["option_type"], out["underlying_change_pct"])
     ]
 
+    has_blocks = "block_score" in out.columns and out["block_score"].sum() > 0
+    if not has_blocks:
+        if "block_score" not in out.columns:
+            out["block_score"] = 0.0
+
     if bootstrap_mode:
-        base = (
-            out["positioning_score"] * 0.30
-            + out["flow_score"] * 0.22
-            + out["liquidity_score"] * 0.12
-            + out["location_score"] * 0.12
-            + out["structure_score"] * 0.10
-            + out["expiration_pref_score"] * 0.08
-            + out["tape_score"] * 0.06
-        )
+        if has_blocks:
+            base = (
+                out["positioning_score"] * 0.26
+                + out["flow_score"] * 0.18
+                + out["liquidity_score"] * 0.10
+                + out["location_score"] * 0.10
+                + out["structure_score"] * 0.08
+                + out["expiration_pref_score"] * 0.07
+                + out["tape_score"] * 0.06
+                + out["block_score"] * 0.15
+            )
+        else:
+            base = (
+                out["positioning_score"] * 0.30
+                + out["flow_score"] * 0.22
+                + out["liquidity_score"] * 0.12
+                + out["location_score"] * 0.12
+                + out["structure_score"] * 0.10
+                + out["expiration_pref_score"] * 0.08
+                + out["tape_score"] * 0.06
+            )
     else:
-        base = (
-            out["positioning_score"] * 0.24
-            + out["confirmation_score"] * 0.16
-            + out["flow_score"] * 0.20
-            + out["liquidity_score"] * 0.10
-            + out["location_score"] * 0.10
-            + out["structure_score"] * 0.08
-            + out["expiration_pref_score"] * 0.07
-            + out["tape_score"] * 0.05
-        )
+        if has_blocks:
+            base = (
+                out["positioning_score"] * 0.20
+                + out["confirmation_score"] * 0.14
+                + out["flow_score"] * 0.16
+                + out["liquidity_score"] * 0.08
+                + out["location_score"] * 0.08
+                + out["structure_score"] * 0.07
+                + out["expiration_pref_score"] * 0.06
+                + out["tape_score"] * 0.06
+                + out["block_score"] * 0.15
+            )
+        else:
+            base = (
+                out["positioning_score"] * 0.24
+                + out["confirmation_score"] * 0.16
+                + out["flow_score"] * 0.20
+                + out["liquidity_score"] * 0.10
+                + out["location_score"] * 0.10
+                + out["structure_score"] * 0.08
+                + out["expiration_pref_score"] * 0.07
+                + out["tape_score"] * 0.05
+            )
 
     out["raw_rank_score"] = (
         out["positioning_score"] * 0.52
@@ -1561,11 +1859,14 @@ def compact_contract_text(row: pd.Series) -> str:
 
 
 def contract_delta_brief(row: pd.Series) -> str:
+    block_label = str(row.get("block_label", "") or "")
+    block_tag = f" [{block_label}]" if block_label else ""
     return (
         f"{compact_contract_text(row)} "
-        f"OI {safe_float(row.get('open_interest'), 0.0):.0f} ({safe_float(row.get('oi_change'), 0.0):+.0f}) "
-        f"Vol {safe_float(row.get('volume'), 0.0):.0f} ({safe_float(row.get('volume_change'), 0.0):+.0f}) "
-        f"Amt {safe_float(row.get('premium_notional'), 0.0)/1000:.0f}K ({safe_float(row.get('premium_notional_change'), 0.0)/1000:+.0f}K)"
+        f"OI {safe_float(row.get('open_interest'), 0.0):.0f}({safe_float(row.get('oi_change'), 0.0):+.0f}) "
+        f"Vol {safe_float(row.get('volume'), 0.0):.0f} "
+        f"Amt {safe_float(row.get('premium_notional'), 0.0)/1000:.0f}K"
+        f"{block_tag}"
     )
 
 
@@ -1668,6 +1969,7 @@ def build_daily_summary(
     direction_info: Dict[str, Any],
     cfg: argparse.Namespace,
     bootstrap_mode: bool,
+    block_summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, str]:
     ticker_exp_df = expiration_df[expiration_df["ticker"] == ticker].copy()
     if contracts_df.empty or ticker_exp_df.empty:
@@ -1763,6 +2065,35 @@ def build_daily_summary(
     opposite_zone = strongest_opposite_zone(contracts_df, main_side, preferred_expiration=main_exp)
     next_watch = " / ".join([x for x in [focus_contracts, opposite_zone] if x]) or strongest_contract
     monthly_text = monthly_sections_text(contracts_df)
+    # 大单摘要文本
+    block_text = "无大单数据"
+    if block_summary:
+        bs = block_summary
+        net_k = bs["block_net_notional"] / 1000
+        block_text = (
+            f"大单 {bs['total_block_volume']}张 "
+            f"(买{bs['block_buy_volume']}/卖{bs['block_sell_volume']}) "
+            f"净额{net_k:+.0f}K"
+        )
+        if bs["sweep_count"] > 0:
+            block_text += f" | Sweep {bs['sweep_count']}笔"
+        block_text += f"\n  主力合约 {bs['top_block_contract']} [{bs['top_block_label']}]"
+
+    # 合约大单标注
+    block_contracts_text = ""
+    if not contracts_df.empty and "block_label" in contracts_df.columns:
+        block_rows = contracts_df[contracts_df["block_label"].astype(str).str.len() > 0].head(3)
+        if not block_rows.empty:
+            parts = []
+            for _, r in block_rows.iterrows():
+                parts.append(
+                    f"  {fmt_strike(r['strike'])}{r['option_type']} "
+                    f"[{r['block_label']}] "
+                    f"买{safe_int(r.get('block_buy_volume'))}/"
+                    f"卖{safe_int(r.get('block_sell_volume'))}"
+                )
+            block_contracts_text = "\n".join(parts)
+
     bootstrap_note = "初始化模式：缺少前一日快照，OI 增减仅供预热参考。\n" if bootstrap_mode else ""
     text = (
         f"{ticker} 盘后期权雷达\n"
@@ -1775,7 +2106,9 @@ def build_daily_summary(
         f"新增确认单合约：{new_strongest_contract}\n"
         f"月度变化：{comparison_detail}\n"
         f"连续性：{continuity_text}\n"
-        f"次日重点观察：{next_watch}\n"
+        f"大单动向：{block_text}\n"
+        + (f"大单合约：\n{block_contracts_text}\n" if block_contracts_text else "")
+        + f"次日重点观察：{next_watch}\n"
         f"\n月度前五合约\n{monthly_text}\n"
         f"{bootstrap_note}".rstrip()
     )
@@ -1797,6 +2130,8 @@ def build_daily_summary(
         "next_watch": str(next_watch),
         "direction_reason": str(direction_info.get("reason_text", "")),
         "monthly_sections_text": str(monthly_text),
+        "block_text": str(block_text),
+        "block_contracts_text": str(block_contracts_text),
         "summary_text": text,
     }
 
@@ -1972,31 +2307,30 @@ def render_contract_table(df: pd.DataFrame, limit: int, score_col: str) -> str:
     if table.empty:
         return "无"
 
-    render = pd.DataFrame(
-        {
-            "Exp": table["expiration"].str[5:],
-            "Strk": table["strike"].map(fmt_strike),
-            "T": table["option_type"],
-            "Vol": table["volume"].round(0).astype(int),
-            "OI": table["open_interest"].round(0).astype(int),
-            "dOI": table["oi_change"].round(0).astype(int),
-            "dOI%": table["oi_change_pct"].map(lambda x: f"{x * 100:.0f}%"),
-            "NotlK": table["premium_notional"].map(lambda x: f"{x / 1000:.0f}"),
-            "Attr": [
-                confirmation_label(
-                    safe_float(open_interest, 0.0),
-                    safe_float(oi_change, 0.0),
-                    safe_float(oi_change_pct, 0.0),
-                )
-                for open_interest, oi_change, oi_change_pct in zip(
-                    table["open_interest"], table["oi_change"], table["oi_change_pct"]
-                )
-            ],
-            "IV": table["implied_volatility"].map(lambda x: f"{x * 100:.0f}%"),
-            "Spr": table["spread_pct"].map(lambda x: f"{x * 100:.0f}%"),
-            "Score": table[score_col].map(lambda x: f"{x:.1f}"),
-        }
-    )
+    render_dict = {
+        "Exp": table["expiration"].str[5:],
+        "Strk": table["strike"].map(fmt_strike),
+        "T": table["option_type"],
+        "Vol": table["volume"].round(0).astype(int),
+        "OI": table["open_interest"].round(0).astype(int),
+        "dOI": table["oi_change"].round(0).astype(int),
+        "NotlK": table["premium_notional"].map(lambda x: f"{x / 1000:.0f}"),
+        "Attr": [
+            confirmation_label(
+                safe_float(open_interest, 0.0),
+                safe_float(oi_change, 0.0),
+                safe_float(oi_change_pct, 0.0),
+            )
+            for open_interest, oi_change, oi_change_pct in zip(
+                table["open_interest"], table["oi_change"], table["oi_change_pct"]
+            )
+        ],
+        "IV": table["implied_volatility"].map(lambda x: f"{x * 100:.0f}%"),
+        "Score": table[score_col].map(lambda x: f"{x:.1f}"),
+    }
+    if "block_label" in table.columns:
+        render_dict["大单"] = table["block_label"].fillna("").astype(str)
+    render = pd.DataFrame(render_dict)
     return render.to_string(index=False)
 
 
@@ -2053,6 +2387,14 @@ def telegram_validation_brief(validation_df: pd.DataFrame) -> str:
 
 
 def telegram_ticker_brief(ticker: str, meta: Dict[str, Any], summary: Dict[str, str]) -> str:
+    """生成适合手机查看的 Telegram 消息。
+
+    设计原则:
+    - 最重要的信息在前 3 行 (方向/置信/主力合约)
+    - 大单信息紧跟方向之后 (盘后核心增量数据)
+    - 月度合约用 monospace 保持对齐
+    - 每行控制在 40 字符以内适配手机屏幕
+    """
     price = safe_float(meta.get("underlying_close"), 0.0)
     chg = safe_float(meta.get("underlying_change_pct"), 0.0)
     direction = html.escape(summary.get("direction_text", "无方向"))
@@ -2060,28 +2402,41 @@ def telegram_ticker_brief(ticker: str, meta: Dict[str, Any], summary: Dict[str, 
     score = html.escape(summary.get("confidence_score", "0"))
     main_exp = html.escape(summary.get("main_expiration", "无"))
     main_band = html.escape(summary.get("main_band", "无"))
-    direction_reason = html.escape(summary.get("direction_reason", ""))
     raw_contract = html.escape(summary.get("raw_strongest_contract", "无"))
     new_contract = html.escape(summary.get("new_strongest_contract", "无"))
     compare_detail = html.escape(summary.get("comparison_detail", "无"))
     continuity = html.escape(summary.get("continuity_text", "无"))
     next_watch = html.escape(summary.get("next_watch", "无"))
+    block_text = html.escape(summary.get("block_text", "无大单数据"))
+    block_contracts = html.escape(summary.get("block_contracts_text", ""))
     monthly_lines = html.escape(summary.get("monthly_sections_text", "无"))
 
-    return (
-        f"<b>{ticker}</b>\n"
-        f"收盘 {price:.2f} ({chg:+.2f}%)\n"
-        f"方向 {direction} | {confidence}置信 ({score}分)\n"
-        f"方向依据 {direction_reason}\n"
-        f"主月到期 {main_exp}\n"
-        f"主月重点 {main_band}\n"
-        f"主战单合约 {raw_contract}\n"
-        f"新增变化 {new_contract}\n"
-        f"月度变化 {compare_detail}\n"
-        f"连续性 {continuity}\n"
-        f"次日观察 {next_watch}\n\n"
-        f"<pre>{monthly_lines}</pre>"
-    )
+    # 方向 emoji
+    dir_icon = "🟢" if "多" in direction else ("🔴" if "空" in direction else "⚪")
+
+    lines = [
+        f"<b>{dir_icon} {ticker} {price:.2f} ({chg:+.2f}%)</b>",
+        f"方向 {direction} | {confidence} ({score}分)",
+        f"主力 {main_band}",
+        "",
+        f"📊 <b>大单</b>",
+        block_text,
+    ]
+    if block_contracts:
+        lines.append(block_contracts)
+    lines += [
+        "",
+        f"📋 <b>持仓</b>",
+        f"主战 {raw_contract}",
+        f"新增 {new_contract}",
+        f"变化 {compare_detail}",
+        f"连续 {continuity}",
+        "",
+        f"👀 次日观察 {next_watch}",
+        "",
+        f"<pre>{monthly_lines}</pre>",
+    ]
+    return "\n".join(lines)
 
 
 def _tg_send(token: str, chat_id: str, text: str) -> bool:
@@ -2126,16 +2481,17 @@ def send_daily_telegram(
     for ticker in cfg.tickers:
         meta = ticker_meta.get(ticker, {})
         summary = summaries.get(ticker, {})
+        dir_text = summary.get('direction_text', '无方向')
+        dir_icon = "🟢" if "多" in dir_text else ("🔴" if "空" in dir_text else "⚪")
         overview_lines.append(
-            f"{ticker}: {summary.get('direction_text', '无方向')} | {summary.get('confidence_text', '观察')} | "
-            f"{summary.get('main_expiration', '无')} | {summary.get('main_band', '无')}"
+            f"{dir_icon} {ticker} {dir_text} "
+            f"{summary.get('confidence_text', '观察')} "
+            f"| {summary.get('main_band', '无')}"
         )
     header = (
-        f"📡 <b>盘后月期权雷达</b>\n"
-        f"交易日: {trade_date}\n"
-        f"标的: {', '.join(cfg.tickers)}\n"
-        f"规则: 仅月期权 | 排除周度 | DTE&gt;10 | 排除最近行权价\n"
-        f"{'提示: 当前处于初始化模式，OI增量为预热状态' if bootstrap_mode else '提示: 以下结论基于前一日快照对比'}\n\n"
+        f"📡 <b>盘后期权雷达</b> {trade_date}\n"
+        f"月期权 | 最近2月 | DTE&gt;10\n"
+        f"{'⚠️ 初始化模式' if bootstrap_mode else '📈 基于前日对比'}\n\n"
         + "\n".join(overview_lines)
     )
     _tg_send(token, chat_id, header)
@@ -2279,15 +2635,39 @@ def daily_pipeline(cfg: argparse.Namespace) -> None:
     if not prior_dfs or all(df.empty for df in prior_dfs):
         prior_dfs = [load_snapshot(p) for p in latest_n_snapshots_before(snapshot_dir, trade_date, 2)]
 
+    # --- Databento 大单数据 (yf 没有逐笔数据，此部分必须用 Databento) ---
+    block_raw = fetch_block_trades(cfg.tickers, trade_date)
+    block_agg = aggregate_block_trades(block_raw)
+
     storage_parts: List[pd.DataFrame] = []
     selected_parts: List[pd.DataFrame] = []
     expiration_parts: List[pd.DataFrame] = []
     ticker_contracts: Dict[str, pd.DataFrame] = {}
     ticker_bootstrap: Dict[str, bool] = {}
     ticker_direction: Dict[str, Dict[str, Any]] = {}
+    ticker_block_summary: Dict[str, Dict[str, Any]] = {}
     for ticker in cfg.tickers:
         prev_ticker_df = prev_df[prev_df["ticker"] == ticker] if not prev_df.empty else pd.DataFrame()
         merged, is_bootstrap = merge_previous_oi(ticker_raw[ticker], prev_ticker_df)
+        # 合并大单数据
+        ticker_block = block_agg[block_agg["ticker"] == ticker] if not block_agg.empty else pd.DataFrame()
+        merged = merge_block_data(merged, ticker_block)
+        # 计算该 ticker 的大单摘要
+        if not ticker_block.empty:
+            tb = ticker_block
+            ticker_block_summary[ticker] = {
+                "total_block_volume": int(tb["block_buy_volume"].sum() + tb["block_sell_volume"].sum()),
+                "block_buy_volume": int(tb["block_buy_volume"].sum()),
+                "block_sell_volume": int(tb["block_sell_volume"].sum()),
+                "block_net_notional": float(tb["block_net_notional"].sum()),
+                "sweep_count": int(tb["sweep_count"].sum()),
+                "top_block_label": tb.sort_values("block_score", ascending=False).iloc[0]["block_label"],
+                "top_block_contract": (
+                    f"{tb.sort_values('block_score', ascending=False).iloc[0]['expiration']} "
+                    f"{fmt_strike(tb.sort_values('block_score', ascending=False).iloc[0]['strike'])}"
+                    f"{tb.sort_values('block_score', ascending=False).iloc[0]['option_type']}"
+                ),
+            }
         monthly_base = filter_monthly_universe(merged, cfg)
         direction_info = compute_direction_strength(monthly_base, is_bootstrap)
         directional_rows = rank_directional_contracts(monthly_base, str(direction_info["side"]), cfg, is_bootstrap)
@@ -2336,6 +2716,7 @@ def daily_pipeline(cfg: argparse.Namespace) -> None:
             direction_info=ticker_direction.get(ticker, {}),
             cfg=cfg,
             bootstrap_mode=ticker_bootstrap.get(ticker, False),
+            block_summary=ticker_block_summary.get(ticker),
         )
 
     trade_date_str = trade_date.isoformat()
@@ -2679,14 +3060,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sqlite-db-path", type=str, default="data/options_history.sqlite")
 
     parser.add_argument("--min-raw-oi", type=int, default=500)
-    parser.add_argument("--min-raw-volume", type=int, default=50)
+    parser.add_argument("--min-raw-volume", type=int, default=10)
     parser.add_argument("--max-raw-spread-pct", type=float, default=0.60)
     parser.add_argument("--min-new-oi", type=int, default=500)
     parser.add_argument("--min-new-volume", type=int, default=200)
     parser.add_argument("--min-new-oi-change", type=int, default=100)
     parser.add_argument("--min-dte", type=int, default=10)
     parser.add_argument("--max-dte", type=int, default=120)
-    parser.add_argument("--monthly-count", type=int, default=3)
+    parser.add_argument("--monthly-count", type=int, default=2)
 
     parser.add_argument("--top-contracts", type=int, default=5)
     parser.add_argument("--top-expirations", type=int, default=5)
@@ -2698,6 +3079,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--tg-token", type=str, default=os.environ.get("TELEGRAM_TOKEN", ""))
     parser.add_argument("--tg-chat", type=str, default=os.environ.get("TELEGRAM_CHAT_ID", ""))
+    parser.add_argument("--databento-api-key", type=str, default=os.environ.get("DATABENTO_API_KEY", ""))
 
     args = parser.parse_args()
     args.tickers = [x.strip().upper() for x in args.tickers.split(",") if x.strip()]
@@ -2708,6 +3090,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     cfg = parse_args()
+    # 确保 Databento API key 可用于 fetch_block_trades
+    if getattr(cfg, "databento_api_key", "") and not os.environ.get("DATABENTO_API_KEY"):
+        os.environ["DATABENTO_API_KEY"] = cfg.databento_api_key
     mode = mode_from_args(cfg.mode)
 
     if mode == "daily":
