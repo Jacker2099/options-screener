@@ -663,16 +663,29 @@ def fetch_block_trades(
     for symbol in symbols:
         try:
             client = db.Historical(key=api_key)
-            # 查询 OPRA 当日逐笔成交，按标的过滤
-            data = client.timeseries.get_range(
-                dataset="OPRA.PILLAR",
-                schema="trades",
-                stype_in="parent",
-                symbols=[symbol],
-                start=f"{trade_date}T00:00",
-                end=f"{trade_date}T23:59",
-            )
-            df = data.to_df()
+            start_dt = datetime(trade_date.year, trade_date.month, trade_date.day, 0, 0, tzinfo=ZoneInfo("UTC"))
+            end_dt = datetime(trade_date.year, trade_date.month, trade_date.day, 23, 59, tzinfo=ZoneInfo("UTC"))
+            # 查询 OPRA 当日逐笔成交
+            # 尝试 parent stype 先; 如果失败尝试 smart
+            df = None
+            for stype in ("parent", "smart"):
+                try:
+                    data = client.timeseries.get_range(
+                        dataset="OPRA.PILLAR",
+                        schema="trades",
+                        stype_in=stype,
+                        symbols=[symbol],
+                        start=start_dt,
+                        end=end_dt,
+                    )
+                    df = data.to_df()
+                    if df is not None and not df.empty:
+                        log.info("Databento %s 成功 (stype=%s), %d 笔成交", symbol, stype, len(df))
+                        break
+                except Exception as e:
+                    log.info("Databento %s stype=%s 失败: %s, 尝试下一个", symbol, stype, e)
+                    continue
+
             if df is None or df.empty:
                 log.info("Databento %s %s 无成交数据", symbol, trade_date)
                 continue
@@ -680,23 +693,24 @@ def fetch_block_trades(
             # 只保留大单
             df = df[df["size"] >= BLOCK_THRESHOLD].copy()
             if df.empty:
+                log.info("Databento %s 无 >=%d 张大单", symbol, BLOCK_THRESHOLD)
                 continue
 
             # 解析 instrument_id -> 合约信息
             # Databento OPRA 的 symbol 格式: NVDA  250418C00120000
             for _, row in df.iterrows():
-                raw_sym = str(row.get("symbol", ""))
+                raw_sym = str(row.get("symbol", row.get("raw_symbol", "")))
                 parsed = _parse_opra_symbol(raw_sym, symbol)
                 if parsed is None:
                     continue
                 trade_price = safe_float(row.get("price"), 0.0)
                 trade_size = safe_int(row.get("size"), 0)
                 # 判定买卖方向: Databento side 字段
-                # 'A' = aggressor buy (at ask), 'B' = aggressor sell (at bid)
-                raw_side = str(row.get("side", ""))
-                if raw_side == "A":
+                # aggressor side: 'A'/'Ask' = buy at ask, 'B'/'Bid' = sell at bid
+                raw_side = str(row.get("side", row.get("aggressor_side", "")))
+                if raw_side in ("A", "Ask", "1"):
                     side = "B"  # aggressive buy
-                elif raw_side == "B":
+                elif raw_side in ("B", "Bid", "2"):
                     side = "S"  # aggressive sell
                 else:
                     side = "U"  # unknown
@@ -712,7 +726,7 @@ def fetch_block_trades(
                     "price": trade_price,
                     "notional": trade_price * trade_size * 100,
                     "side": side,
-                    "exchange": str(row.get("venue", "")),
+                    "exchange": str(row.get("venue", row.get("publisher_id", ""))),
                     "raw_symbol": raw_sym,
                 })
         except Exception as e:
