@@ -1,17 +1,8 @@
-15:22:20 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-15:22:21 [INFO] Databento NVDA symbology 解析失败: 400 symbology_invalid_symbol
-Invalid format for `parent` symbol 'NVDA', expected format: '[ROOT].OPT', '[ROOT].SPOT', or '[ROOT].FUT'
-documentation: https://databento.com/docs/api-reference-historical/basics/symbology, 尝试直接 parent 查询
-15:22:21 [INFO] Databento NVDA parent 查询失败: 400 symbology_invalid_symbol
-Invalid format for `parent` symbol 'NVDA', expected format: '[ROOT].SPOT', '[ROOT].FUT', or '[ROOT].OPT'
-documentation: https://databento.com/docs/api-reference-historical/basics/symbology
-15:22:21 [INFO] Databento NVDA 2026-03-20 无成交数据
-15:22:21 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-15:22:22 [INFO] Databento TSLA symbology 解析失败: 400 symbology_invalid_symbol
-Invalid format for `parent` symbol 'TSLA', expected format: '[ROOT].FUT', '[ROOT].OPT', or '[ROOT].SPOT'
-documentation: https://databento.com/docs/api-reference-historical/basics/symbology, 尝试直接 parent 查询
-15:22:22 [INFO] Databento TSLA parent 查询失败: 400 symbology_invalid_symbol
-Invalid format for `parent` symbol 'TSLA', expected format: '[ROOT].FUT', '[ROOT].SPOT', or '[ROOT].OPT'
-documentation: https://databento.com/docs/api-reference-historical/basics/symbology
-15:22:22 [INFO] Databento TSLA 2026-03-20 无成交数据
-15:22:26 [INFO] 盘后雷达完成: trade_date=2026-03-20 prev_snapshot=2026-03-19
+15:25:30 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+15:25:44 [INFO] Databento NVDA 成功, 345068 笔成交
+15:25:44 [INFO] Databento NVDA 大单 11278 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags']
+15:25:45 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+15:25:51 [INFO] Databento TSLA 成功, 550756 笔成交
+15:25:51 [INFO] Databento TSLA 大单 8290 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags']
+15:26:07 [INFO] Databento 大单: 19568 笔 (sweep 5432 笔)
+15:26:12 [INFO] 盘后雷达完成: trade_date=2026-03-20 prev_snapshot=2026-03-19
