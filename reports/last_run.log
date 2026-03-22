@@ -1,17 +1,25 @@
-15:08:46 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-15:08:46 [INFO] Databento NVDA dataset=OPRA.PILLAR 失败: 400 symbology_invalid_symbol
-Invalid format for `parent` symbol 'NVDA', expected format: '[ROOT].OPT', '[ROOT].SPOT', or '[ROOT].FUT'
+15:17:10 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+15:17:10 [INFO] Databento 可用数据集: ['ARCX.PILLAR', 'BATS.PITCH', 'BATY.PITCH', 'DBEQ.BASIC', 'EDGA.PITCH', 'EDGX.PITCH', 'EPRL.DOM', 'EQUS.MINI', 'EQUS.SUMMARY', 'GLBX.MDP3', 'IEXG.TOPS', 'IFEU.IMPACT', 'IFLL.IMPACT', 'IFUS.IMPACT', 'MEMX.MEMOIR', 'NDEX.IMPACT', 'OPRA.PILLAR', 'XASE.PILLAR', 'XBOS.ITCH', 'XCHI.PILLAR', 'XCIS.TRADESBBO', 'XEEE.EOBI', 'XEUR.EOBI', 'XNAS.BASIC', 'XNAS.ITCH', 'XNYS.PILLAR', 'XPSX.ITCH']
+15:17:10 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+15:17:10 [INFO] Databento NVDA dataset=OPRA.PILLAR 失败: 400 symbology_invalid_symbol
+Invalid format for `parent` symbol 'NVDA', expected format: '[ROOT].SPOT', '[ROOT].FUT', or '[ROOT].OPT'
 documentation: https://databento.com/docs/api-reference-historical/basics/symbology
-15:08:46 [INFO] Databento NVDA dataset=DBEQ.BASIC 失败: 400 symbology_invalid_symbol
+15:17:11 [INFO] Databento NVDA dataset=DBEQ.BASIC 失败: 400 symbology_invalid_symbol
 Invalid format for `parent` symbol 'NVDA', expected format: '[ROOT].SPOT', '[ROOT].OPT', or '[ROOT].FUT'
 documentation: https://databento.com/docs/api-reference-historical/basics/symbology
-15:08:46 [INFO] Databento NVDA 2026-03-20 无成交数据
-15:08:46 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-15:08:50 [INFO] Databento TSLA dataset=OPRA.PILLAR 失败: 400 symbology_invalid_symbol
-Invalid format for `parent` symbol 'TSLA', expected format: '[ROOT].OPT', '[ROOT].SPOT', or '[ROOT].FUT'
+15:17:11 [INFO] Databento NVDA dataset=XNAS.ITCH 失败: 400 symbology_invalid_symbol
+Invalid format for `parent` symbol 'NVDA', expected format: '[ROOT].SPOT', '[ROOT].FUT', or '[ROOT].OPT'
 documentation: https://databento.com/docs/api-reference-historical/basics/symbology
-15:08:50 [INFO] Databento TSLA dataset=DBEQ.BASIC 失败: 400 symbology_invalid_symbol
-Invalid format for `parent` symbol 'TSLA', expected format: '[ROOT].FUT', '[ROOT].OPT', or '[ROOT].SPOT'
+15:17:11 [INFO] Databento NVDA 2026-03-20 无成交数据
+15:17:11 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+15:17:11 [INFO] Databento TSLA dataset=OPRA.PILLAR 失败: 400 symbology_invalid_symbol
+Invalid format for `parent` symbol 'TSLA', expected format: '[ROOT].FUT', '[ROOT].SPOT', or '[ROOT].OPT'
 documentation: https://databento.com/docs/api-reference-historical/basics/symbology
-15:08:50 [INFO] Databento TSLA 2026-03-20 无成交数据
-15:08:53 [INFO] 盘后雷达完成: trade_date=2026-03-20 prev_snapshot=2026-03-19
+15:17:12 [INFO] Databento TSLA dataset=DBEQ.BASIC 失败: 400 symbology_invalid_symbol
+Invalid format for `parent` symbol 'TSLA', expected format: '[ROOT].FUT', '[ROOT].SPOT', or '[ROOT].OPT'
+documentation: https://databento.com/docs/api-reference-historical/basics/symbology
+15:17:12 [INFO] Databento TSLA dataset=XNAS.ITCH 失败: 400 symbology_invalid_symbol
+Invalid format for `parent` symbol 'TSLA', expected format: '[ROOT].OPT', '[ROOT].FUT', or '[ROOT].SPOT'
+documentation: https://databento.com/docs/api-reference-historical/basics/symbology
+15:17:12 [INFO] Databento TSLA 2026-03-20 无成交数据
+15:17:15 [INFO] 盘后雷达完成: trade_date=2026-03-20 prev_snapshot=2026-03-19
