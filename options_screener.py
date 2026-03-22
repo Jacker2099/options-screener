@@ -665,25 +665,28 @@ def fetch_block_trades(
             client = db.Historical(key=api_key)
             start_dt = datetime(trade_date.year, trade_date.month, trade_date.day, 0, 0, tzinfo=ZoneInfo("UTC"))
             end_dt = datetime(trade_date.year, trade_date.month, trade_date.day, 23, 59, tzinfo=ZoneInfo("UTC"))
-            # 查询 OPRA 当日逐笔成交
-            # 尝试 parent stype 先; 如果失败尝试 smart
+
+            # Databento OPRA: 先尝试 OPRA.PILLAR, 再尝试 DBEQ.BASIC (含期权)
+            # parent stype 用于按标的查所有期权
             df = None
-            for stype in ("parent", "smart"):
+            for dataset in ("OPRA.PILLAR", "DBEQ.BASIC"):
                 try:
                     data = client.timeseries.get_range(
-                        dataset="OPRA.PILLAR",
+                        dataset=dataset,
                         schema="trades",
-                        stype_in=stype,
+                        stype_in="parent",
                         symbols=[symbol],
                         start=start_dt,
                         end=end_dt,
                     )
                     df = data.to_df()
                     if df is not None and not df.empty:
-                        log.info("Databento %s 成功 (stype=%s), %d 笔成交", symbol, stype, len(df))
+                        log.info("Databento %s 成功 (dataset=%s), %d 笔成交", symbol, dataset, len(df))
                         break
+                    else:
+                        log.info("Databento %s dataset=%s 无数据", symbol, dataset)
                 except Exception as e:
-                    log.info("Databento %s stype=%s 失败: %s, 尝试下一个", symbol, stype, e)
+                    log.info("Databento %s dataset=%s 失败: %s", symbol, dataset, e)
                     continue
 
             if df is None or df.empty:
@@ -691,26 +694,40 @@ def fetch_block_trades(
                 continue
 
             # 只保留大单
-            df = df[df["size"] >= BLOCK_THRESHOLD].copy()
+            size_col = "size" if "size" in df.columns else "quantity"
+            if size_col not in df.columns:
+                log.info("Databento %s 无 size/quantity 列, 列名: %s", symbol, list(df.columns))
+                continue
+            df = df[df[size_col] >= BLOCK_THRESHOLD].copy()
             if df.empty:
                 log.info("Databento %s 无 >=%d 张大单", symbol, BLOCK_THRESHOLD)
                 continue
 
-            # 解析 instrument_id -> 合约信息
-            # Databento OPRA 的 symbol 格式: NVDA  250418C00120000
+            log.info("Databento %s 大单 %d 笔, 列: %s", symbol, len(df), list(df.columns)[:10])
+
             for _, row in df.iterrows():
-                raw_sym = str(row.get("symbol", row.get("raw_symbol", "")))
+                # 合约符号可能在不同列名
+                raw_sym = ""
+                for col_name in ("symbol", "raw_symbol", "instrument_id"):
+                    val = str(row.get(col_name, ""))
+                    if val and val != "nan":
+                        raw_sym = val
+                        break
                 parsed = _parse_opra_symbol(raw_sym, symbol)
                 if parsed is None:
                     continue
                 trade_price = safe_float(row.get("price"), 0.0)
-                trade_size = safe_int(row.get("size"), 0)
-                # 判定买卖方向: Databento side 字段
-                # aggressor side: 'A'/'Ask' = buy at ask, 'B'/'Bid' = sell at bid
-                raw_side = str(row.get("side", row.get("aggressor_side", "")))
-                if raw_side in ("A", "Ask", "1"):
+                trade_size = safe_int(row.get(size_col), 0)
+                # 判定买卖方向
+                raw_side = ""
+                for side_col in ("side", "aggressor_side", "action"):
+                    val = str(row.get(side_col, ""))
+                    if val and val != "nan":
+                        raw_side = val
+                        break
+                if raw_side in ("A", "Ask", "1", "Buy"):
                     side = "B"  # aggressive buy
-                elif raw_side in ("B", "Bid", "2"):
+                elif raw_side in ("B", "Bid", "2", "Sell"):
                     side = "S"  # aggressive sell
                 else:
                     side = "U"  # unknown
