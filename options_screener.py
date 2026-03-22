@@ -936,6 +936,57 @@ def _block_label(buy_vol: int, sell_vol: int, sweep_count: int, net_notional: fl
         return "大单均衡"
 
 
+def build_block_strike_analysis(block_agg: pd.DataFrame, ticker: str) -> str:
+    """生成按类别分组的 strike 级别大单分析文本，适合 Telegram 推送。
+
+    输出示例:
+      🔥扫货买入: 130C(买520/卖80) 135C(买300)
+      📈主买: 125C(买400) 128C(买350)
+      📉主卖: 120P(卖600) 115P(卖450)
+    """
+    tb = block_agg[block_agg["ticker"] == ticker].copy()
+    if tb.empty:
+        return ""
+
+    # 分类: 扫货买入/卖出, 主买/偏买, 主卖/偏卖, 其他
+    category_map = {
+        "主动扫货买入": ("🔥扫货买入", 1),
+        "主动扫货卖出": ("🔥扫货卖出", 2),
+        "扫单偏买": ("🔥扫单偏买", 3),
+        "扫单偏卖": ("🔥扫单偏卖", 4),
+        "扫单混合": ("⚡扫单混合", 5),
+        "扫单对冲": ("⚡扫单对冲", 6),
+        "大单主买": ("📈主买", 7),
+        "大单偏买": ("📈偏买", 8),
+        "大单主卖": ("📉主卖", 9),
+        "大单偏卖": ("📉偏卖", 10),
+        "大单均衡": ("⚖️均衡", 11),
+    }
+
+    tb["_cat_label"] = tb["block_label"].map(lambda x: category_map.get(x, ("其他", 99))[0])
+    tb["_cat_order"] = tb["block_label"].map(lambda x: category_map.get(x, ("其他", 99))[1])
+    tb = tb.sort_values(["_cat_order", "block_score"], ascending=[True, False])
+
+    lines: List[str] = []
+    for cat_label, grp in tb.groupby("_cat_label", sort=False):
+        items: List[str] = []
+        for _, r in grp.head(4).iterrows():  # 每类最多4个strike
+            strike_str = fmt_strike(r["strike"])
+            ot = r["option_type"]
+            buy_v = int(r["block_buy_volume"])
+            sell_v = int(r["block_sell_volume"])
+            parts = []
+            if buy_v > 0:
+                parts.append(f"买{buy_v}")
+            if sell_v > 0:
+                parts.append(f"卖{sell_v}")
+            vol_str = "/".join(parts) if parts else "0"
+            items.append(f"{strike_str}{ot}({vol_str})")
+        lines.append(f"{cat_label}: {' '.join(items)}")
+
+    return "\n".join(lines)
+
+
 def merge_block_data(contracts_df: pd.DataFrame, block_agg: pd.DataFrame) -> pd.DataFrame:
     """将聚合后的大单数据合并到合约 DataFrame。"""
     if block_agg.empty or contracts_df.empty:
@@ -2035,6 +2086,7 @@ def build_daily_summary(
     cfg: argparse.Namespace,
     bootstrap_mode: bool,
     block_summary: Optional[Dict[str, Any]] = None,
+    block_agg: Optional[pd.DataFrame] = None,
 ) -> Dict[str, str]:
     ticker_exp_df = expiration_df[expiration_df["ticker"] == ticker].copy()
     if contracts_df.empty or ticker_exp_df.empty:
@@ -2159,6 +2211,11 @@ def build_daily_summary(
                 )
             block_contracts_text = "\n".join(parts)
 
+    # 按价位分类的大单分析
+    block_strike_analysis = ""
+    if block_agg is not None and not block_agg.empty:
+        block_strike_analysis = build_block_strike_analysis(block_agg, ticker)
+
     bootstrap_note = "初始化模式：缺少前一日快照，OI 增减仅供预热参考。\n" if bootstrap_mode else ""
     text = (
         f"{ticker} 盘后期权雷达\n"
@@ -2173,6 +2230,7 @@ def build_daily_summary(
         f"连续性：{continuity_text}\n"
         f"大单动向：{block_text}\n"
         + (f"大单合约：\n{block_contracts_text}\n" if block_contracts_text else "")
+        + (f"大单价位分析：\n{block_strike_analysis}\n" if block_strike_analysis else "")
         + f"次日重点观察：{next_watch}\n"
         f"\n月度前五合约\n{monthly_text}\n"
         f"{bootstrap_note}".rstrip()
@@ -2197,6 +2255,7 @@ def build_daily_summary(
         "monthly_sections_text": str(monthly_text),
         "block_text": str(block_text),
         "block_contracts_text": str(block_contracts_text),
+        "block_strike_analysis": str(block_strike_analysis),
         "summary_text": text,
     }
 
@@ -2474,6 +2533,7 @@ def telegram_ticker_brief(ticker: str, meta: Dict[str, Any], summary: Dict[str, 
     next_watch = html.escape(summary.get("next_watch", "无"))
     block_text = html.escape(summary.get("block_text", "无大单数据"))
     block_contracts = html.escape(summary.get("block_contracts_text", ""))
+    block_strike = html.escape(summary.get("block_strike_analysis", ""))
     monthly_lines = html.escape(summary.get("monthly_sections_text", "无"))
 
     # 方向 emoji
@@ -2489,6 +2549,10 @@ def telegram_ticker_brief(ticker: str, meta: Dict[str, Any], summary: Dict[str, 
     ]
     if block_contracts:
         lines.append(block_contracts)
+    if block_strike:
+        lines.append("")
+        lines.append("<b>价位分析</b>")
+        lines.append(f"<pre>{block_strike}</pre>")
     lines += [
         "",
         f"📋 <b>持仓</b>",
@@ -2782,6 +2846,7 @@ def daily_pipeline(cfg: argparse.Namespace) -> None:
             cfg=cfg,
             bootstrap_mode=ticker_bootstrap.get(ticker, False),
             block_summary=ticker_block_summary.get(ticker),
+            block_agg=block_agg,
         )
 
     trade_date_str = trade_date.isoformat()
