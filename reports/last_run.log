@@ -1,12 +1,12 @@
-15:38:39 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-15:38:55 [INFO] Databento NVDA definitions: 4006 个合约映射
-15:38:55 [INFO] Databento NVDA 成功, 345068 笔成交, 映射 4006 个合约
-15:38:55 [INFO] Databento NVDA 大单 11278 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags']
-15:38:55 [INFO] Databento NVDA 大单 11278 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags', 'ts_in_delta', 'sequence']
-15:38:56 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-15:39:11 [INFO] Databento TSLA definitions: 6360 个合约映射
-15:39:11 [INFO] Databento TSLA 成功, 550756 笔成交, 映射 6360 个合约
-15:39:11 [INFO] Databento TSLA 大单 8290 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags']
-15:39:11 [INFO] Databento TSLA 大单 8290 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags', 'ts_in_delta', 'sequence']
-15:39:27 [INFO] Databento 大单: 19568 笔 (sweep 5432 笔)
-15:39:33 [INFO] 盘后雷达完成: trade_date=2026-03-20 prev_snapshot=2026-03-19
+15:59:52 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+16:00:00 [INFO] Databento NVDA definitions: 4006 个合约映射
+16:00:00 [INFO] Databento NVDA 成功, 345068 笔成交, 映射 4006 个合约
+16:00:00 [INFO] Databento NVDA 大单 11278 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags']
+16:00:00 [INFO] Databento NVDA 大单 11278 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags', 'ts_in_delta', 'sequence']
+16:00:01 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+16:00:11 [INFO] Databento TSLA definitions: 6360 个合约映射
+16:00:11 [INFO] Databento TSLA 成功, 550756 笔成交, 映射 6360 个合约
+16:00:11 [INFO] Databento TSLA 大单 8290 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags']
+16:00:11 [INFO] Databento TSLA 大单 8290 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags', 'ts_in_delta', 'sequence']
+16:00:28 [INFO] Databento 大单: 19568 笔 (sweep 5432 笔)
+16:00:33 [INFO] 盘后雷达完成: trade_date=2026-03-20 prev_snapshot=2026-03-19
