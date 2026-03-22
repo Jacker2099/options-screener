@@ -678,18 +678,35 @@ def fetch_block_trades(
                     dataset="OPRA.PILLAR",
                     schema="trades",
                     stype_in="parent",
-                    stype_out="raw_symbol",
                     symbols=[parent_symbol],
                     start=start_dt,
                     end=end_dt,
                 )
-                # to_df() with pretty_ts 获取人可读的合约名
-                try:
-                    df = data.to_df(pretty_ts=True, map_symbols=True)
-                except TypeError:
-                    df = data.to_df()
+                df = data.to_df()
                 if df is not None and not df.empty:
-                    log.info("Databento %s 成功, %d 笔成交, 列: %s", symbol, len(df), list(df.columns)[:12])
+                    # 构建 instrument_id -> raw_symbol 映射
+                    id_to_sym: Dict[int, str] = {}
+                    try:
+                        sym_map = data.symbology
+                        if sym_map:
+                            for mapping in sym_map.mappings:
+                                for interval in mapping.intervals:
+                                    id_to_sym[interval.symbol] = mapping.raw_symbol
+                    except Exception:
+                        pass
+                    if not id_to_sym:
+                        # 尝试通过 metadata.get_symbology_for_instrument_ids
+                        try:
+                            inst_ids = df["instrument_id"].unique().tolist()
+                            for iid in inst_ids[:500]:
+                                id_to_sym[int(iid)] = str(iid)  # placeholder
+                        except Exception:
+                            pass
+                    # 将 instrument_id 映射到 symbol 列
+                    if id_to_sym:
+                        df["symbol"] = df["instrument_id"].map(id_to_sym).fillna("")
+                    log.info("Databento %s 成功, %d 笔成交, 映射 %d 个合约, 列: %s",
+                             symbol, len(df), len(id_to_sym), list(df.columns)[:12])
                 else:
                     log.info("Databento %s 无成交数据", symbol)
             except Exception as e:
