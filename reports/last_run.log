@@ -1,23 +1,28 @@
-00:36:53 [INFO] 交易日: 2026-03-20
-00:36:53 [INFO] 月度到期日: ['2026-04-17', '2026-05-15']
-00:36:54 [INFO] NVDA $172.93 (-3.15%)
-00:36:54 [INFO] TSLA $367.96 (-3.24%)
-00:36:54 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-00:36:54 [INFO] Databento NVDA trades ...
-00:37:00 [INFO] Databento NVDA definitions ...
-00:37:02 [INFO] Databento NVDA: 4006 个合约映射
-00:37:02 [INFO] Databento NVDA: 345068 笔成交
-00:37:20 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-00:37:20 [INFO] Databento TSLA trades ...
-00:37:26 [INFO] Databento TSLA definitions ...
-00:37:30 [INFO] Databento TSLA: 6360 个合约映射
-00:37:30 [INFO] Databento TSLA: 550756 笔成交
-00:38:00 [INFO] 大单: 380 笔 (sweep 70), 名义 $412.0M
-00:38:00 [INFO] OI: 900 条
-00:38:00 [INFO] NVDA 2026-04-17: 偏看涨 | Call $18.2M / Put $11.7M | Sweep 22
-00:38:00 [INFO] NVDA 2026-05-15: 偏看涨 | Call $20.8M / Put $8.1M | Sweep 8
-00:38:00 [INFO] TSLA 2026-04-17: 强看跌 | Call $26.9M / Put $311.4M | Sweep 29
-00:38:00 [INFO] TSLA 2026-05-15: 多空均衡 | Call $7.1M / Put $7.9M | Sweep 11
-00:38:00 [INFO] 报告: reports/daily/NVDA_2026-03-20.md
-00:38:00 [INFO] 报告: reports/daily/TSLA_2026-03-20.md
-00:38:02 [INFO] Pipeline 完成 ✓
+01:20:12 [INFO] 交易日: 2026-03-20
+01:20:12 [INFO] 月度到期日: ['2026-04-17', '2026-05-15']
+01:20:13 [INFO] NVDA $172.93 (-3.15%)
+01:20:13 [INFO] TSLA $367.96 (-3.24%)
+01:20:13 [INFO] 期权链: 128 条 (moneyness 过滤后)
+01:20:13 [INFO] OI 快照写入 128 条 (2026-03-20)
+01:20:13 [INFO] OI 快照: 128 条
+01:20:13 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+01:20:13 [INFO] Databento NVDA trades ...
+01:20:19 [INFO] Databento NVDA definitions ...
+01:20:23 [INFO] Databento NVDA: 4006 个合约映射
+01:20:23 [INFO] Databento NVDA: 345068 笔成交
+01:20:42 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+01:20:42 [INFO] Databento TSLA trades ...
+01:20:48 [INFO] Databento TSLA definitions ...
+01:20:55 [INFO] Databento TSLA: 6360 个合约映射
+01:20:55 [INFO] Databento TSLA: 550756 笔成交
+01:21:24 [INFO] 大单: 380 笔 (sweep 70), 名义 $412,029,139
+01:21:24 [INFO] 大单: 380 笔
+01:21:25 [INFO] 报告: reports/daily/NVDA_2026-03-20.md
+01:21:25 [INFO] NVDA 2026-04-17: Call 51% | Call $38.7M / Put $37.1M | Top Call: 180C / Top Put: 180P
+01:21:25 [INFO] 报告: reports/daily/NVDA_2026-03-20.md
+01:21:25 [INFO] NVDA 2026-05-15: Call 61% | Call $33.4M / Put $21.7M | Top Call: 180C / Top Put: 180P
+01:21:25 [INFO] 报告: reports/daily/TSLA_2026-03-20.md
+01:21:25 [INFO] TSLA 2026-04-17: Call 45% | Call $38.2M / Put $46.9M | Top Call: 400C / Top Put: 380P
+01:21:25 [INFO] 报告: reports/daily/TSLA_2026-03-20.md
+01:21:25 [INFO] TSLA 2026-05-15: Call 43% | Call $22.2M / Put $28.9M | Top Call: 400C / Top Put: 400P
+01:21:28 [INFO] Pipeline 完成 ✓
