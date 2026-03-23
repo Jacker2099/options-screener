@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-NVDA / TSLA 月度期权大单雷达 v2.1
+NVDA / TSLA 月度期权大单雷达 v3
 
-架构:
-1. Databento OPRA.PILLAR → 盘后逐笔 trades
-2. yfinance → 标的价格 + OI (用于 Vol/OI + 支撑压力位)
-3. 仅监控未来 60 天标准月度期权 (每月第三个周五, 排除已过期)
-4. 大单定义: 单笔名义价值 > $100,000
+核心逻辑:
+  通过期权大单买卖行为判断后市走势, 资金集中在哪些合约
 
-输出板块:
-  [月度资金总览] 表格: 到期月/标的/净金流/主力行权价/情绪
-  [月度大宗成交] 金额 > $200K 逐笔, 含时间/side/vol_oi/解读
-  [关键支撑压力位] 基于月度 OI 聚集
-  [交易建议] 今日信号 + 操作建议
+数据源:
+  Databento OPRA.PILLAR → 盘后逐笔 trades (大单筛选)
+  yfinance → 标的价格 + OI (支撑压力位 + Vol/OI)
+
+规则:
+  1. 仅监控未来 60 天标准月度期权 (第三个周五, 排除已过期)
+  2. 大单定义: 单笔名义价值 > $100,000
+  3. 情绪判断: Call大单金额 vs Put大单金额
+  4. 主力Call/Put 分别展示, 不混淆
+
+Telegram 推送:
+  消息1: 月度资金总览 (每个到期月: 净金流/主力Call/主力Put/情绪)
+  消息2: 支撑压力位 + 交易建议
 
 运行:
     python options_screener.py --mode daily
@@ -52,17 +57,16 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 DEFAULT_TICKERS = ["NVDA", "TSLA"]
-NOTIONAL_THRESHOLD = 100_000      # 聚合大单门槛 $100K
-DETAIL_THRESHOLD = 200_000        # 逐笔列示门槛 $200K
+NOTIONAL_THRESHOLD = 100_000  # 大单门槛 $100K
 SWEEP_WINDOW_SEC = 2.0
 SWEEP_MIN_EXCHANGES = 2
 
 ET = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════
 # 工具函数
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════
 
 def safe_float(v: Any, default: float = 0.0) -> float:
     if v is None:
@@ -101,35 +105,32 @@ def fmt_strike(v: float) -> str:
 
 
 def fmt_money(v: float) -> str:
-    """格式化金额: $1.2M / $350K"""
     av = abs(v)
     if av >= 1_000_000:
-        return f"${av/1_000_000:,.1f}M"
+        return f"${av / 1_000_000:,.1f}M"
     if av >= 1_000:
-        return f"${av/1_000:,.0f}K"
+        return f"${av / 1_000:,.0f}K"
     return f"${av:,.0f}"
 
 
 def fmt_money_signed(v: float) -> str:
-    """带正负号的金额"""
     sign = "+" if v >= 0 else "-"
     return f"{sign}{fmt_money(abs(v))}"
 
 
-# ─────────────────────────────────────────────
-# 1. 月度到期日计算
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════
+# 月度到期日
+# ═══════════════════════════════════════════════
 
 def monthly_expiration_dates(ref_date: date, days_ahead: int = 60) -> List[date]:
-    """返回 ref_date 之后 (不含当日) days_ahead 天内的标准月度期权到期日。"""
+    """未来 60 天内的标准月度期权到期日 (不含已过期)。"""
     cutoff = ref_date + timedelta(days=days_ahead)
     results: List[date] = []
     year, month = ref_date.year, ref_date.month
     for _ in range(4):
-        third_friday = _third_friday(year, month)
-        # 严格未来: > ref_date (当日已过期的不要)
-        if third_friday > ref_date and third_friday <= cutoff:
-            results.append(third_friday)
+        tf = _third_friday(year, month)
+        if tf > ref_date and tf <= cutoff:
+            results.append(tf)
         month += 1
         if month > 12:
             month = 1
@@ -140,16 +141,14 @@ def monthly_expiration_dates(ref_date: date, days_ahead: int = 60) -> List[date]
 def _third_friday(year: int, month: int) -> date:
     first_day_weekday = calendar.weekday(year, month, 1)
     first_friday = 1 + (4 - first_day_weekday) % 7
-    third_friday = first_friday + 14
-    return date(year, month, third_friday)
+    return date(year, month, first_friday + 14)
 
 
-# ─────────────────────────────────────────────
-# 2. OPRA 合约符号解析
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════
+# OPRA 合约符号解析
+# ═══════════════════════════════════════════════
 
 def parse_opra_symbol(raw_sym: str, ticker: str) -> Optional[Dict[str, Any]]:
-    """解析 OCC 格式合约符号, 如 'NVDA  250418C00120000'"""
     raw_sym = raw_sym.strip()
     if len(raw_sym) < 15:
         return None
@@ -168,77 +167,28 @@ def parse_opra_symbol(raw_sym: str, ticker: str) -> Optional[Dict[str, Any]]:
         strike_str = raw_sym[idx + 1:]
         exp_date = datetime.strptime("20" + date_str, "%Y%m%d").date()
         strike = int(strike_str) / 1000.0
-        return {
-            "expiration": exp_date,
-            "strike": strike,
-            "option_type": option_type,
-        }
+        return {"expiration": exp_date, "strike": strike, "option_type": option_type}
     except Exception:
         return None
 
 
-# ─────────────────────────────────────────────
-# 3. Side 判定 (Databento OPRA)
-# ─────────────────────────────────────────────
-
-def _classify_side(row: Any) -> str:
-    """从 Databento trades 行判定 aggressor side。
-
-    Databento OPRA trades schema 的 side 字段:
-    - 'A' = Ask side (买方主动, aggressive buy)
-    - 'B' = Bid side (卖方主动, aggressive sell)
-    - 'N' = None/unknown
-
-    注意: Databento Python 库可能将 side 转为枚举对象,
-    需要处理 str(enum) 的各种形式。
-    """
-    # 尝试多个可能的列名
-    for col in ("side", "aggressor_side", "action"):
-        val = row.get(col, None)
-        if val is None:
-            continue
-
-        # 转为字符串并清理
-        s = str(val).strip().upper()
-
-        # Databento 枚举可能显示为 "Side.ASK", "ASK", "A" 等
-        if any(x in s for x in ("ASK", "SIDE.A",)):
-            return "ASK"  # 主动买入
-        if s == "A" and len(s) == 1:
-            return "ASK"
-        if any(x in s for x in ("BID", "SIDE.B",)):
-            return "BID"  # 主动卖出
-        if s == "B" and len(s) == 1:
-            return "BID"
-        if any(x in s for x in ("NONE", "SIDE.N", "N/A", "NAN")):
-            continue  # 跳过, 尝试下一列
-        # 数字编码
-        if s == "1":
-            return "ASK"
-        if s == "2":
-            return "BID"
-
-    return "UNK"
-
-
-# ─────────────────────────────────────────────
-# 4. Databento 数据拉取
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════
+# Databento 数据拉取
+# ═══════════════════════════════════════════════
 
 def fetch_trades(
     symbols: List[str],
     trade_date: date,
     monthly_dates: List[date],
 ) -> pd.DataFrame:
-    """从 Databento OPRA.PILLAR 拉取当日月度期权成交，筛选大单。"""
+    """拉取当日月度期权大单 (notional > $100K)。"""
     api_key = os.environ.get("DATABENTO_API_KEY", "")
     if not api_key or db is None:
-        log.warning("Databento 未配置或未安装, 无法拉取数据")
+        log.warning("Databento 未配置")
         return pd.DataFrame()
 
     all_rows: List[Dict[str, Any]] = []
     monthly_set = set(monthly_dates)
-    side_sample_logged = False
 
     for symbol in symbols:
         try:
@@ -247,181 +197,128 @@ def fetch_trades(
             end_dt = datetime(trade_date.year, trade_date.month, trade_date.day, 23, 59, tzinfo=UTC)
             parent_symbol = f"{symbol}.OPT"
 
-            log.info("Databento %s 拉取 trades ...", symbol)
+            log.info("Databento %s trades ...", symbol)
             data = client.timeseries.get_range(
                 dataset="OPRA.PILLAR",
                 schema="trades",
                 stype_in="parent",
                 symbols=[parent_symbol],
-                start=start_dt,
-                end=end_dt,
+                start=start_dt, end=end_dt,
             )
             df = data.to_df()
             if df is None or df.empty:
-                log.info("Databento %s 无成交数据", symbol)
                 continue
 
-            # 构建 instrument_id → raw_symbol 映射
+            # instrument_id → raw_symbol 映射
             id_to_sym: Dict[int, str] = {}
             try:
-                log.info("Databento %s 拉取 definitions ...", symbol)
-                defs_data = client.timeseries.get_range(
+                log.info("Databento %s definitions ...", symbol)
+                defs = client.timeseries.get_range(
                     dataset="OPRA.PILLAR",
                     schema="definition",
                     stype_in="parent",
                     symbols=[parent_symbol],
-                    start=start_dt,
-                    end=end_dt,
+                    start=start_dt, end=end_dt,
                 )
-                defs_df = defs_data.to_df()
+                defs_df = defs.to_df()
                 if defs_df is not None and not defs_df.empty:
                     for _, drow in defs_df.iterrows():
                         iid = int(drow.get("instrument_id", 0))
                         raw = str(drow.get("raw_symbol", ""))
                         if iid and raw and raw != "nan":
                             id_to_sym[iid] = raw
-                    log.info("Databento %s definitions: %d 个合约映射", symbol, len(id_to_sym))
+                    log.info("Databento %s: %d 个合约映射", symbol, len(id_to_sym))
             except Exception as e:
                 log.warning("Databento %s definitions 失败: %s", symbol, e)
 
             if not id_to_sym:
-                log.warning("Databento %s 无合约映射, 跳过", symbol)
                 continue
 
             df["symbol"] = df["instrument_id"].map(id_to_sym).fillna("")
-            log.info("Databento %s 原始成交: %d 笔, 列: %s", symbol, len(df), list(df.columns))
+            log.info("Databento %s: %d 笔成交", symbol, len(df))
 
             size_col = "size" if "size" in df.columns else "quantity"
             if size_col not in df.columns:
-                log.warning("Databento %s 无 size 列", symbol)
                 continue
-
-            # 日志: 打印 side 字段样本以帮助调试
-            if not side_sample_logged and "side" in df.columns:
-                sample_sides = df["side"].head(20).tolist()
-                log.info("Databento side 字段样本: %s (type=%s)", sample_sides[:5], type(sample_sides[0]) if sample_sides else "N/A")
-                side_sample_logged = True
 
             for _, row in df.iterrows():
                 raw_sym = str(row.get("symbol", ""))
                 if not raw_sym or raw_sym == "nan" or raw_sym.isdigit():
                     continue
-
                 parsed = parse_opra_symbol(raw_sym, symbol)
-                if parsed is None:
-                    continue
-
-                # 仅保留月度合约
-                if parsed["expiration"] not in monthly_set:
+                if parsed is None or parsed["expiration"] not in monthly_set:
                     continue
 
                 trade_price = safe_float(row.get("price"), 0.0)
                 trade_size = safe_int(row.get(size_col), 0)
                 notional = trade_price * trade_size * 100
-
-                # 仅保留大单
                 if notional < NOTIONAL_THRESHOLD:
                     continue
 
-                side = _classify_side(row)
-
                 ts = row.name if hasattr(row.name, "timestamp") else row.get("ts_event")
-                # 转换为美东时间用于显示
-                ts_et = None
-                try:
-                    if hasattr(ts, "astimezone"):
-                        ts_et = ts.astimezone(ET)
-                    elif ts is not None:
-                        ts_et = pd.Timestamp(ts).tz_convert(ET) if pd.Timestamp(ts).tz is not None else pd.Timestamp(ts, tz=UTC).tz_convert(ET)
-                except Exception:
-                    pass
-
                 all_rows.append({
                     "ticker": symbol,
                     "expiration": parsed["expiration"],
                     "strike": parsed["strike"],
                     "option_type": parsed["option_type"],
                     "ts_event": ts,
-                    "ts_et": ts_et,
-                    "time_str": ts_et.strftime("%H:%M") if ts_et else "",
                     "size": trade_size,
                     "price": trade_price,
                     "notional": notional,
-                    "side": side,
                     "exchange": str(row.get("venue", row.get("publisher_id", ""))),
                     "raw_symbol": raw_sym,
                 })
-
         except Exception as e:
-            log.warning("Databento %s 拉取失败: %s", symbol, e)
-            continue
+            log.warning("Databento %s 失败: %s", symbol, e)
 
     if not all_rows:
-        log.warning("未获取到任何大单数据")
         return pd.DataFrame()
 
     result = pd.DataFrame(all_rows)
 
-    # Side 统计
-    side_counts = result["side"].value_counts().to_dict()
-    log.info("Side 分布: %s", side_counts)
-
     # Sweep 检测
     result["is_sweep"] = False
-    if not result.empty:
-        result = result.sort_values(["ticker", "raw_symbol", "ts_event"]).reset_index(drop=True)
-        for _, grp in result.groupby("raw_symbol"):
-            if len(grp) < 2:
+    result = result.sort_values(["ticker", "raw_symbol", "ts_event"]).reset_index(drop=True)
+    for _, grp in result.groupby("raw_symbol"):
+        if len(grp) < 2:
+            continue
+        times = pd.to_datetime(grp["ts_event"], errors="coerce")
+        for i in grp.index:
+            t = times.get(i)
+            if pd.isna(t):
                 continue
-            times = pd.to_datetime(grp["ts_event"], errors="coerce")
-            for i in grp.index:
-                t = times.get(i)
-                if pd.isna(t):
-                    continue
-                window = grp[
-                    (times >= t) & (times <= t + pd.Timedelta(seconds=SWEEP_WINDOW_SEC))
-                ]
-                if window["exchange"].nunique() >= SWEEP_MIN_EXCHANGES:
-                    result.loc[window.index, "is_sweep"] = True
+            window = grp[(times >= t) & (times <= t + pd.Timedelta(seconds=SWEEP_WINDOW_SEC))]
+            if window["exchange"].nunique() >= SWEEP_MIN_EXCHANGES:
+                result.loc[window.index, "is_sweep"] = True
 
-    sweep_count = int(result["is_sweep"].sum())
-    log.info("大单总计: %d 笔 (sweep %d 笔), 总名义 %s",
-             len(result), sweep_count, fmt_money(result["notional"].sum()))
+    log.info("大单: %d 笔 (sweep %d), 名义 %s",
+             len(result), int(result["is_sweep"].sum()), fmt_money(result["notional"].sum()))
     return result
 
 
-# ─────────────────────────────────────────────
-# 5. yfinance: 标的价格 + OI
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════
+# yfinance: 标的价格 + OI
+# ═══════════════════════════════════════════════
 
 def fetch_underlying_info(symbols: List[str]) -> Dict[str, Dict[str, float]]:
     info: Dict[str, Dict[str, float]] = {}
     if yf is None:
-        for s in symbols:
-            info[s] = {"close": 0.0, "change_pct": 0.0}
-        return info
+        return {s: {"close": 0.0, "change_pct": 0.0} for s in symbols}
     for symbol in symbols:
         try:
-            tk = yf.Ticker(symbol)
-            hist = tk.history(period="2d")
+            hist = yf.Ticker(symbol).history(period="2d")
             if hist.empty:
                 info[symbol] = {"close": 0.0, "change_pct": 0.0}
                 continue
             close = float(hist["Close"].iloc[-1])
-            prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else close
-            change_pct = (close / prev_close - 1) * 100 if prev_close else 0.0
-            info[symbol] = {"close": close, "change_pct": change_pct}
-        except Exception as e:
-            log.warning("yfinance %s 失败: %s", symbol, e)
+            prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else close
+            info[symbol] = {"close": close, "change_pct": (close / prev - 1) * 100 if prev else 0.0}
+        except Exception:
             info[symbol] = {"close": 0.0, "change_pct": 0.0}
     return info
 
 
-def fetch_oi_data(
-    symbols: List[str],
-    monthly_dates: List[date],
-) -> pd.DataFrame:
-    """从 yfinance 获取月度合约 OI, 用于 Vol/OI 和支撑压力位。"""
+def fetch_oi_data(symbols: List[str], monthly_dates: List[date]) -> pd.DataFrame:
     if yf is None:
         return pd.DataFrame()
     rows: List[Dict[str, Any]] = []
@@ -430,158 +327,181 @@ def fetch_oi_data(
         try:
             tk = yf.Ticker(symbol)
             for exp_str in tk.options:
+                if exp_str not in monthly_strs:
+                    continue
                 try:
                     exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
                 except Exception:
-                    continue
-                if exp_str not in monthly_strs:
                     continue
                 chain = tk.option_chain(exp_str)
                 for ot, df_part in [("C", chain.calls), ("P", chain.puts)]:
                     if df_part is None or df_part.empty:
                         continue
                     for _, r in df_part.iterrows():
-                        oi = safe_int(r.get("openInterest"), 0)
-                        vol = safe_int(r.get("volume"), 0)
-                        strike = safe_float(r.get("strike"), 0.0)
                         rows.append({
                             "ticker": symbol,
                             "expiration": exp_date,
-                            "strike": strike,
+                            "strike": safe_float(r.get("strike"), 0.0),
                             "option_type": ot,
-                            "open_interest": oi,
-                            "yf_volume": vol,
+                            "open_interest": safe_int(r.get("openInterest"), 0),
                         })
         except Exception as e:
-            log.warning("yfinance OI %s 失败: %s", symbol, e)
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows)
+            log.warning("yfinance OI %s: %s", symbol, e)
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
-# ─────────────────────────────────────────────
-# 6. 分析指标
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════
+# 分析引擎
+# ═══════════════════════════════════════════════
 
-def compute_net_flow(trades: pd.DataFrame) -> pd.DataFrame:
-    """按 (ticker, expiration) 计算 Net Flow。
+def analyze_expiration(
+    trades: pd.DataFrame,
+    oi_df: pd.DataFrame,
+    ticker: str,
+    expiration: date,
+) -> Dict[str, Any]:
+    """分析单个到期日的大单行为, 返回完整分析结果。"""
+    grp = trades[(trades["ticker"] == ticker) & (trades["expiration"] == expiration)]
+    if grp.empty:
+        return {}
 
-    OPRA 不提供 aggressor side, 所以使用 Call/Put 金额差估算:
-    Net Flow = Call大单金额 - Put大单金额
-    正 = 看涨资金占优, 负 = 看跌资金占优
-    """
-    if trades.empty:
-        return pd.DataFrame()
+    # ── Call / Put 分开统计 ──
+    calls = grp[grp["option_type"] == "C"]
+    puts = grp[grp["option_type"] == "P"]
 
-    rows: List[Dict[str, Any]] = []
-    for (ticker, exp), grp in trades.groupby(["ticker", "expiration"]):
-        call_notional = grp[grp["option_type"] == "C"]["notional"].sum()
-        put_notional = grp[grp["option_type"] == "P"]["notional"].sum()
-        net_flow = call_notional - put_notional
+    call_notional = calls["notional"].sum()
+    put_notional = puts["notional"].sum()
+    call_volume = int(calls["size"].sum())
+    put_volume = int(puts["size"].sum())
+    call_trades = len(calls)
+    put_trades = len(puts)
+    total_notional = call_notional + put_notional
+    total_volume = call_volume + put_volume
+    total_trades = call_trades + put_trades
+    sweep_count = int(grp["is_sweep"].sum())
 
-        total_notional = grp["notional"].sum()
-        total_volume = int(grp["size"].sum())
-        trade_count = len(grp)
-        sweep_count = int(grp["is_sweep"].sum())
+    # ── 净金流: Call - Put ──
+    net_flow = call_notional - put_notional
 
-        call_vol = int(grp[grp["option_type"] == "C"]["size"].sum())
-        put_vol = int(grp[grp["option_type"] == "P"]["size"].sum())
-        call_trades = int((grp["option_type"] == "C").sum())
-        put_trades = int((grp["option_type"] == "P").sum())
+    # ── 情绪判断 ──
+    call_pct = call_notional / total_notional * 100 if total_notional > 0 else 50
+    if call_pct >= 75:
+        sentiment_emoji, sentiment_label = "🟢", "强看涨"
+    elif call_pct >= 60:
+        sentiment_emoji, sentiment_label = "🟢", "偏看涨"
+    elif call_pct <= 25:
+        sentiment_emoji, sentiment_label = "🔴", "强看跌"
+    elif call_pct <= 40:
+        sentiment_emoji, sentiment_label = "🔴", "偏看跌"
+    else:
+        sentiment_emoji, sentiment_label = "⚪", "多空均衡"
 
-        rows.append({
-            "ticker": ticker,
-            "expiration": exp,
-            "net_flow": net_flow,
-            "call_notional": call_notional,
-            "put_notional": put_notional,
-            "total_notional": total_notional,
-            "total_volume": total_volume,
-            "call_volume": call_vol,
-            "put_volume": put_vol,
-            "call_trades": call_trades,
-            "put_trades": put_trades,
-            "trade_count": trade_count,
-            "sweep_count": sweep_count,
-        })
+    # ── 主力 Call Strike (金额 Top 3) ──
+    call_strikes = _top_strikes(calls, oi_df, ticker, expiration, top_n=3)
+    # ── 主力 Put Strike (金额 Top 3) ──
+    put_strikes = _top_strikes(puts, oi_df, ticker, expiration, top_n=3)
 
-    return pd.DataFrame(rows).sort_values(["ticker", "expiration"]).reset_index(drop=True)
+    return {
+        "ticker": ticker,
+        "expiration": expiration,
+        "call_notional": call_notional,
+        "put_notional": put_notional,
+        "call_volume": call_volume,
+        "put_volume": put_volume,
+        "call_trades": call_trades,
+        "put_trades": put_trades,
+        "total_notional": total_notional,
+        "total_volume": total_volume,
+        "total_trades": total_trades,
+        "sweep_count": sweep_count,
+        "net_flow": net_flow,
+        "call_pct": call_pct,
+        "sentiment_emoji": sentiment_emoji,
+        "sentiment_label": sentiment_label,
+        "call_strikes": call_strikes,
+        "put_strikes": put_strikes,
+    }
 
 
-def compute_strike_summary(trades: pd.DataFrame, oi_df: pd.DataFrame) -> pd.DataFrame:
-    """按 (ticker, expiration, strike, option_type) 聚合, 计算 VWAP + Vol/OI。"""
-    if trades.empty:
-        return pd.DataFrame()
+def _top_strikes(
+    trades_side: pd.DataFrame,
+    oi_df: pd.DataFrame,
+    ticker: str,
+    expiration: date,
+    top_n: int = 3,
+) -> List[Dict[str, Any]]:
+    """按金额排序, 返回 Top N strike 信息。"""
+    if trades_side.empty:
+        return []
 
-    rows: List[Dict[str, Any]] = []
-    keys = ["ticker", "expiration", "strike", "option_type"]
-    for key, grp in trades.groupby(keys):
-        ticker, exp, strike, ot = key
-        total_vol = int(grp["size"].sum())
-        total_notional = grp["notional"].sum()
-        vwap = total_notional / (total_vol * 100) if total_vol > 0 else 0.0
-
-        ask_vol = int(grp[grp["side"] == "ASK"]["size"].sum())
-        bid_vol = int(grp[grp["side"] == "BID"]["size"].sum())
-        unk_vol = total_vol - ask_vol - bid_vol
-        sweep_count = int(grp["is_sweep"].sum())
-        trade_count = len(grp)
-
-        rows.append({
-            "ticker": ticker,
-            "expiration": exp,
-            "strike": strike,
-            "option_type": ot,
-            "vwap": round(vwap, 2),
-            "total_volume": total_vol,
-            "total_notional": total_notional,
-            "ask_volume": ask_vol,
-            "bid_volume": bid_vol,
-            "unk_volume": unk_vol,
-            "sweep_count": sweep_count,
-            "trade_count": trade_count,
-        })
-
-    result = pd.DataFrame(rows)
-
-    # 合并 OI
-    if not oi_df.empty and not result.empty:
-        result = result.merge(
-            oi_df[keys + ["open_interest"]],
-            on=keys,
-            how="left",
+    agg = (
+        trades_side.groupby("strike")
+        .agg(
+            total_notional=("notional", "sum"),
+            total_volume=("size", "sum"),
+            trade_count=("notional", "count"),
+            avg_price=("price", "mean"),
+            sweep_count=("is_sweep", "sum"),
         )
-    if "open_interest" not in result.columns:
-        result["open_interest"] = 0
-    result["open_interest"] = result["open_interest"].fillna(0).astype(int)
-    result["vol_oi_ratio"] = result.apply(
-        lambda r: round(r["total_volume"] / r["open_interest"], 1) if r["open_interest"] > 0 else 0.0,
-        axis=1,
+        .sort_values("total_notional", ascending=False)
+        .head(top_n)
     )
 
-    return result.sort_values(["ticker", "total_notional"], ascending=[True, False]).reset_index(drop=True)
+    results: List[Dict[str, Any]] = []
+    ot = trades_side["option_type"].iloc[0] if not trades_side.empty else "C"
+
+    for strike, row in agg.iterrows():
+        vol = int(row["total_volume"])
+        notional = row["total_notional"]
+        vwap = notional / (vol * 100) if vol > 0 else row["avg_price"]
+        sweep = int(row["sweep_count"])
+
+        # 查 OI
+        oi = 0
+        if not oi_df.empty:
+            oi_match = oi_df[
+                (oi_df["ticker"] == ticker)
+                & (oi_df["expiration"] == expiration)
+                & (oi_df["strike"] == strike)
+                & (oi_df["option_type"] == ot)
+            ]
+            if not oi_match.empty:
+                oi = int(oi_match["open_interest"].iloc[0])
+
+        vol_oi = round(vol / oi, 1) if oi > 0 else 0.0
+
+        results.append({
+            "strike": strike,
+            "option_type": ot,
+            "total_volume": vol,
+            "total_notional": notional,
+            "vwap": round(vwap, 2),
+            "sweep_count": sweep,
+            "open_interest": oi,
+            "vol_oi_ratio": vol_oi,
+        })
+
+    return results
 
 
-def compute_support_resistance(oi_df: pd.DataFrame, ticker: str, underlying_close: float) -> Dict[str, Any]:
-    """基于月度合约 OI 聚集计算支撑/压力位。
-
-    强支撑 = 标的价格附近 Put OI 最大的行权价
-    强压力 = 标的价格附近 Call OI 最大的行权价
-    """
-    result = {"support": [], "resistance": []}
-    if oi_df.empty:
+def compute_support_resistance(
+    oi_df: pd.DataFrame,
+    ticker: str,
+    underlying_close: float,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """基于月度 OI 计算支撑/压力位。"""
+    result: Dict[str, List[Dict[str, Any]]] = {"support": [], "resistance": []}
+    if oi_df.empty or underlying_close <= 0:
         return result
 
     td = oi_df[oi_df["ticker"] == ticker].copy()
     if td.empty:
         return result
 
-    # 限制范围: 标的价格 ±30%
-    low = underlying_close * 0.7
-    high = underlying_close * 1.3
+    low, high = underlying_close * 0.7, underlying_close * 1.3
     td = td[(td["strike"] >= low) & (td["strike"] <= high)]
 
-    # Put OI → 支撑 (below current price)
+    # Put OI 最大 = 支撑 (价格下方)
     puts = td[(td["option_type"] == "P") & (td["strike"] <= underlying_close)]
     if not puts.empty:
         put_agg = puts.groupby("strike")["open_interest"].sum().sort_values(ascending=False)
@@ -589,7 +509,7 @@ def compute_support_resistance(oi_df: pd.DataFrame, ticker: str, underlying_clos
             if oi > 0:
                 result["support"].append({"strike": strike, "oi": int(oi)})
 
-    # Call OI → 压力 (above current price)
+    # Call OI 最大 = 压力 (价格上方)
     calls = td[(td["option_type"] == "C") & (td["strike"] >= underlying_close)]
     if not calls.empty:
         call_agg = calls.groupby("strike")["open_interest"].sum().sort_values(ascending=False)
@@ -600,87 +520,9 @@ def compute_support_resistance(oi_df: pd.DataFrame, ticker: str, underlying_clos
     return result
 
 
-# ─────────────────────────────────────────────
-# 7. 情绪 & 标签
-# ─────────────────────────────────────────────
-
-def _sentiment(net_flow: float, total_notional: float, call_notional: float = 0, put_notional: float = 0) -> Tuple[str, str]:
-    """根据 Call/Put 大单金额比返回 (emoji, 文字标签)。
-
-    OPRA 不提供 aggressor side, 所以用 Call vs Put 金额判断情绪:
-    - Call 金额远 > Put → 看涨布局
-    - Put 金额远 > Call → 看跌布局
-    """
-    if total_notional <= 0:
-        return ("⚪", "无数据")
-
-    total_cp = call_notional + put_notional
-    if total_cp <= 0:
-        return ("⚪", "无数据")
-
-    call_pct = call_notional / total_cp
-
-    if call_pct >= 0.75:
-        return ("🟢", "强看涨布局")
-    elif call_pct >= 0.60:
-        return ("🟢", "偏多布局")
-    elif call_pct <= 0.25:
-        return ("🔴", "强看跌布局")
-    elif call_pct <= 0.40:
-        return ("🔴", "偏空布局")
-    else:
-        return ("⚪", "多空均衡")
-
-
-def _trade_commentary(row: Dict[str, Any], oi: int, vol_oi: float) -> str:
-    """为单笔大宗成交生成智能解读。"""
-    ot = row["option_type"]
-    notional = row["notional"]
-    is_sweep = row.get("is_sweep", False)
-    ot_name = "看涨" if ot == "C" else "看跌"
-
-    parts: List[str] = []
-    parts.append(f"大额{ot_name}期权成交")
-
-    if is_sweep:
-        parts.append("跨所扫单(急于成交)")
-
-    if vol_oi > 5.0:
-        parts.append("全新建仓")
-    elif vol_oi > 1.0:
-        parts.append("新仓为主")
-
-    if notional >= 10_000_000:
-        parts.append("巨额交易")
-    elif notional >= 5_000_000:
-        parts.append("大额交易")
-
-    return ", ".join(parts)
-
-
-def _top_strike_label(strike_df: pd.DataFrame, ticker: str, expiration: date) -> str:
-    """找到某个到期日金额最大的行权价。"""
-    td = strike_df[
-        (strike_df["ticker"] == ticker) & (strike_df["expiration"] == expiration)
-    ]
-    if td.empty:
-        return "N/A"
-
-    top = td.sort_values("total_notional", ascending=False).iloc[0]
-    strike = fmt_strike(top["strike"])
-    ot = top["option_type"]
-    vol = top["total_volume"]
-    notional = top["total_notional"]
-    vol_oi = safe_float(top.get("vol_oi_ratio"), 0.0)
-
-    tag = "看涨" if ot == "C" else "看跌"
-    new_flag = " 新仓" if vol_oi > 1.0 else ""
-    return f"{strike}{ot}({tag}{new_flag})"
-
-
-# ─────────────────────────────────────────────
-# 8. Telegram 输出
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════
+# Telegram 输出
+# ═══════════════════════════════════════════════
 
 def _tg_send(token: str, chat_id: str, text: str) -> bool:
     if not token or not chat_id:
@@ -690,263 +532,192 @@ def _tg_send(token: str, chat_id: str, text: str) -> bool:
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=20,
         )
         if resp.status_code != 200:
-            log.warning("Telegram 发送失败: %s", resp.text[:200])
+            log.warning("TG 失败: %s", resp.text[:200])
         return resp.status_code == 200
     except Exception as e:
-        log.warning("Telegram 发送异常: %s", e)
+        log.warning("TG 异常: %s", e)
         return False
 
 
-def build_overview_message(
-    trade_date: date,
-    tickers: List[str],
-    underlying_info: Dict[str, Dict[str, float]],
-    flow_df: pd.DataFrame,
-    strike_df: pd.DataFrame,
+def _strike_line(s: Dict[str, Any]) -> str:
+    """格式化单个 strike 行。"""
+    strike = fmt_strike(s["strike"])
+    ot = s["option_type"]
+    vol = s["total_volume"]
+    notional = s["total_notional"]
+    vwap = s["vwap"]
+    sweep = s["sweep_count"]
+    oi = s["open_interest"]
+    vol_oi = s["vol_oi_ratio"]
+
+    parts = [f"{strike}{ot}"]
+    parts.append(f"{fmt_money(notional)}")
+    parts.append(f"{vol:,}张")
+    parts.append(f"VWAP${vwap:.2f}")
+    if sweep > 0:
+        parts.append(f"⚡S{sweep}")
+    if oi > 0:
+        parts.append(f"V/OI:{vol_oi}")
+        if vol_oi > 1.0:
+            parts.append("🆕新仓")
+    return " ".join(parts)
+
+
+def build_ticker_message(
+    ticker: str,
+    underlying_info: Dict[str, float],
+    expirations: List[Dict[str, Any]],
 ) -> str:
-    """板块1: 月度资金总览 (表格格式)。"""
+    """为单个标的生成 Telegram 消息。"""
+    close = underlying_info.get("close", 0.0)
+    chg = underlying_info.get("change_pct", 0.0)
+    price_icon = "🟢" if chg > 0 else ("🔴" if chg < 0 else "⚪")
+
     lines: List[str] = []
-    lines.append(f"📡 <b>月度大单雷达</b> {trade_date}")
+    lines.append(f"{price_icon} <b>{ticker}</b> ${close:.2f} ({chg:+.2f}%)")
     lines.append("")
 
-    # 表头
-    lines.append("<b>📊 月度资金总览</b>")
-
-    for ticker in tickers:
-        info = underlying_info.get(ticker, {})
-        close = info.get("close", 0.0)
-        chg = info.get("change_pct", 0.0)
-        dir_icon = "🟢" if chg > 0 else ("🔴" if chg < 0 else "⚪")
-        lines.append(f"\n{dir_icon} <b>{ticker}</b> ${close:.2f} ({chg:+.2f}%)")
-
-        tf = flow_df[flow_df["ticker"] == ticker]
-        if tf.empty:
-            lines.append("  无大单数据")
+    for exp_data in expirations:
+        if not exp_data:
             continue
 
-        for _, r in tf.iterrows():
-            exp = r["expiration"]
-            exp_str = exp.strftime("%Y-%m-%d") if hasattr(exp, "strftime") else str(exp)
-            net = r["net_flow"]
-            total = r["total_notional"]
-            call_n = r.get("call_notional", 0)
-            put_n = r.get("put_notional", 0)
-            emoji, sentiment = _sentiment(net, total, call_n, put_n)
-            top_strike = _top_strike_label(strike_df, ticker, exp)
+        exp = exp_data["expiration"]
+        exp_str = exp.strftime("%Y-%m-%d")
+        emoji = exp_data["sentiment_emoji"]
+        label = exp_data["sentiment_label"]
+        net = exp_data["net_flow"]
+        call_n = exp_data["call_notional"]
+        put_n = exp_data["put_notional"]
+        call_pct = exp_data["call_pct"]
+        sweep = exp_data["sweep_count"]
 
-            # 净金流: Call - Put 差额
-            flow_icon = "🟢" if net > 0 else ("🔴" if net < 0 else "⚪")
-            flow_str = fmt_money_signed(net)
+        flow_icon = "🟢" if net > 0 else "🔴"
 
-            lines.append(
-                f"  📅 <b>{exp_str}</b>\n"
-                f"     净金流: {flow_icon}{flow_str}\n"
-                f"     Call: {fmt_money(call_n)} / Put: {fmt_money(put_n)}\n"
-                f"     主力Strike: {top_strike}\n"
-                f"     情绪: {emoji} {sentiment}\n"
-                f"     成交: {r['total_volume']:,}张/{r['trade_count']}笔"
-                + (f" ⚡Sweep:{r['sweep_count']}" if r['sweep_count'] > 0 else "")
-            )
-
-    return "\n".join(lines)
-
-
-def build_block_trades_message(
-    ticker: str,
-    trades: pd.DataFrame,
-    strike_df: pd.DataFrame,
-    underlying_info: Dict[str, Dict[str, float]],
-) -> str:
-    """板块2: 月度大宗成交 (>$200K 逐笔)。"""
-    info = underlying_info.get(ticker, {})
-    close = info.get("close", 0.0)
-
-    tt = trades[
-        (trades["ticker"] == ticker) & (trades["notional"] >= DETAIL_THRESHOLD)
-    ].sort_values("notional", ascending=False)
-
-    lines: List[str] = []
-    lines.append(f"🏆 <b>{ticker} 月度大宗成交</b> (≥{fmt_money(DETAIL_THRESHOLD)})")
-
-    if tt.empty:
-        lines.append("  无符合条件的大宗成交")
-        return "\n".join(lines)
-
-    # 限制显示数量
-    display_df = tt.head(10)
-
-    for i, (_, r) in enumerate(display_df.iterrows(), 1):
-        exp = r["expiration"]
-        exp_str = exp.strftime("%m/%d") if hasattr(exp, "strftime") else str(exp)
-        strike = fmt_strike(r["strike"])
-        ot = r["option_type"]
-        time_str = r.get("time_str", "")
-        sweep_tag = "⚡" if r.get("is_sweep") else ""
-
-        # 查找该 strike 的 OI 和 vol/oi
-        sd = strike_df[
-            (strike_df["ticker"] == ticker)
-            & (strike_df["expiration"] == r["expiration"])
-            & (strike_df["strike"] == r["strike"])
-            & (strike_df["option_type"] == ot)
-        ]
-        oi = int(sd["open_interest"].iloc[0]) if not sd.empty else 0
-        vol_oi = float(sd["vol_oi_ratio"].iloc[0]) if not sd.empty else 0.0
-        oi_text = f"OI:{oi:,}" if oi > 0 else ""
-        vol_oi_text = f"V/OI:{vol_oi}" if vol_oi > 0 else ""
-
-        commentary = _trade_commentary(r, oi, vol_oi)
-
-        ot_label = "Call看涨" if ot == "C" else "Put看跌"
+        lines.append(f"📅 <b>{exp_str}</b>  {emoji} {label}")
         lines.append(
-            f"\n  #{i} {sweep_tag}{fmt_money(r['notional'])}"
-            f"\n     {exp_str} {strike}{ot} ({ot_label}) | {r['size']:,}张×${r['price']:.2f}"
-            + (f"\n     {time_str}" if time_str else "")
-            + (f" | {oi_text} {vol_oi_text}" if oi_text or vol_oi_text else "")
-            + f"\n     💬 {commentary}"
+            f"   净金流 {flow_icon}{fmt_money_signed(net)}"
+            f" (Call {call_pct:.0f}%)"
         )
+        lines.append(
+            f"   Call {fmt_money(call_n)} {exp_data['call_trades']}笔"
+            f" / Put {fmt_money(put_n)} {exp_data['put_trades']}笔"
+        )
+        if sweep > 0:
+            lines.append(f"   ⚡ Sweep {sweep}笔")
 
-    # 汇总
-    call_count = len(tt[tt["option_type"] == "C"])
-    put_count = len(tt[tt["option_type"] == "P"])
-    call_total = tt[tt["option_type"] == "C"]["notional"].sum()
-    put_total = tt[tt["option_type"] == "P"]["notional"].sum()
-    sweep_total = int(tt["is_sweep"].sum())
-    lines.append(
-        f"\n📊 汇总: {len(tt)}笔大宗成交\n"
-        f"   Call: {call_count}笔 {fmt_money(call_total)} / Put: {put_count}笔 {fmt_money(put_total)}"
-        + (f"\n   ⚡ Sweep: {sweep_total}笔" if sweep_total > 0 else "")
-    )
+        # 主力 Call
+        if exp_data["call_strikes"]:
+            lines.append("   <b>📈 主力Call:</b>")
+            for s in exp_data["call_strikes"]:
+                lines.append(f"      {_strike_line(s)}")
 
-    return "\n".join(lines)
+        # 主力 Put
+        if exp_data["put_strikes"]:
+            lines.append("   <b>📉 主力Put:</b>")
+            for s in exp_data["put_strikes"]:
+                lines.append(f"      {_strike_line(s)}")
 
-
-def build_support_resistance_message(
-    tickers: List[str],
-    oi_df: pd.DataFrame,
-    underlying_info: Dict[str, Dict[str, float]],
-) -> str:
-    """板块3: 关键支撑压力位。"""
-    lines: List[str] = []
-    lines.append("<b>🎯 关键支撑/压力位</b> (基于月度OI)")
-
-    for ticker in tickers:
-        close = underlying_info.get(ticker, {}).get("close", 0.0)
-        sr = compute_support_resistance(oi_df, ticker, close)
-        lines.append(f"\n<b>{ticker}</b> (当前 ${close:.2f})")
-
-        if sr["support"]:
-            sup_parts = []
-            for s in sr["support"][:3]:
-                sup_parts.append(f"{fmt_strike(s['strike'])} (OI:{s['oi']:,})")
-            lines.append(f"  🟢 强支撑: {' > '.join(sup_parts)}")
-        else:
-            lines.append("  🟢 强支撑: 数据不足")
-
-        if sr["resistance"]:
-            res_parts = []
-            for s in sr["resistance"][:3]:
-                res_parts.append(f"{fmt_strike(s['strike'])} (OI:{s['oi']:,})")
-            lines.append(f"  🔴 强压力: {' > '.join(res_parts)}")
-        else:
-            lines.append("  🔴 强压力: 数据不足")
+        lines.append("")
 
     return "\n".join(lines)
 
 
 def build_advice_message(
     tickers: List[str],
-    flow_df: pd.DataFrame,
-    strike_df: pd.DataFrame,
-    trades: pd.DataFrame,
     underlying_info: Dict[str, Dict[str, float]],
+    ticker_analysis: Dict[str, List[Dict[str, Any]]],
     oi_df: pd.DataFrame,
 ) -> str:
-    """板块4: 交易建议。"""
+    """支撑压力 + 交易建议。"""
     lines: List[str] = []
-    lines.append("<b>💡 交易建议</b>")
 
+    # ── 支撑压力位 ──
+    lines.append("<b>🎯 关键支撑/压力位</b> (月度OI)")
     for ticker in tickers:
         close = underlying_info.get(ticker, {}).get("close", 0.0)
-        tf = flow_df[flow_df["ticker"] == ticker]
-        if tf.empty:
+        sr = compute_support_resistance(oi_df, ticker, close)
+        lines.append(f"\n<b>{ticker}</b> (${close:.2f})")
+        if sr["support"]:
+            parts = [f"{fmt_strike(s['strike'])}(OI:{s['oi']:,})" for s in sr["support"]]
+            lines.append(f"  🟢 支撑: {' > '.join(parts)}")
+        if sr["resistance"]:
+            parts = [f"{fmt_strike(s['strike'])}(OI:{s['oi']:,})" for s in sr["resistance"]]
+            lines.append(f"  🔴 压力: {' > '.join(parts)}")
+
+    lines.append("")
+    lines.append("<b>💡 交易建议</b>")
+
+    # ── 交易建议 ──
+    for ticker in tickers:
+        close = underlying_info.get(ticker, {}).get("close", 0.0)
+        exp_list = ticker_analysis.get(ticker, [])
+        if not exp_list:
             lines.append(f"\n<b>{ticker}</b>: 数据不足, 观望")
             continue
 
-        total_net = tf["net_flow"].sum()
-        total_notional = tf["total_notional"].sum()
-        total_sweep = int(tf["sweep_count"].sum())
-        total_call_n = tf["call_notional"].sum()
-        total_put_n = tf["put_notional"].sum()
+        # 合计所有到期日
+        total_call_n = sum(e.get("call_notional", 0) for e in exp_list)
+        total_put_n = sum(e.get("put_notional", 0) for e in exp_list)
+        total_n = total_call_n + total_put_n
+        total_sweep = sum(e.get("sweep_count", 0) for e in exp_list)
+        call_pct = total_call_n / total_n * 100 if total_n > 0 else 50
 
-        # 找到金流最大的到期日
-        main_exp_row = tf.sort_values("total_notional", ascending=False).iloc[0]
-        main_exp = main_exp_row["expiration"]
-        main_exp_str = main_exp.strftime("%m/%d") if hasattr(main_exp, "strftime") else str(main_exp)
+        # 资金最集中的到期日
+        main_exp = max(exp_list, key=lambda e: e.get("total_notional", 0))
+        main_exp_str = main_exp["expiration"].strftime("%m/%d")
 
-        # 找到该到期日 top 2 strike
-        td = strike_df[
-            (strike_df["ticker"] == ticker) & (strike_df["expiration"] == main_exp)
-        ].sort_values("total_notional", ascending=False).head(2)
+        # 关注的合约
+        focus_contracts: List[str] = []
+        if call_pct >= 55:
+            # 偏多 → 关注 top call
+            for e in exp_list:
+                for s in e.get("call_strikes", [])[:2]:
+                    exp_short = e["expiration"].strftime("%m/%d")
+                    focus_contracts.append(f"{exp_short} {fmt_strike(s['strike'])}C")
+        elif call_pct <= 45:
+            # 偏空 → 关注 top put
+            for e in exp_list:
+                for s in e.get("put_strikes", [])[:2]:
+                    exp_short = e["expiration"].strftime("%m/%d")
+                    focus_contracts.append(f"{exp_short} {fmt_strike(s['strike'])}P")
+        else:
+            for e in exp_list:
+                for s in (e.get("call_strikes", [])[:1] + e.get("put_strikes", [])[:1]):
+                    exp_short = e["expiration"].strftime("%m/%d")
+                    focus_contracts.append(f"{exp_short} {fmt_strike(s['strike'])}{s['option_type']}")
 
-        top_strikes_text = ""
-        if not td.empty:
-            parts = []
-            for _, r in td.iterrows():
-                parts.append(f"{fmt_strike(r['strike'])}{r['option_type']}")
-            top_strikes_text = "/".join(parts)
-
-        # 情绪判断
-        _, sentiment = _sentiment(total_net, total_notional, total_call_n, total_put_n)
+        focus_text = " / ".join(focus_contracts[:4])
 
         lines.append(f"\n<b>{ticker}</b>")
 
-        # Call/Put 金额比较
-        total_cp = total_call_n + total_put_n
-        call_pct = total_call_n / total_cp * 100 if total_cp > 0 else 50
-        if call_pct >= 60:
-            flow_desc = f"Call大单金额占{call_pct:.0f}%, 资金向{main_exp_str}月期权看涨倾斜"
-        elif call_pct <= 40:
-            flow_desc = f"Put大单金额占{100-call_pct:.0f}%, 资金向{main_exp_str}月期权看跌倾斜"
+        # 信号描述
+        sweep_text = f", {total_sweep}笔Sweep" if total_sweep > 0 else ""
+        if call_pct >= 70:
+            lines.append(f"  📌 信号: Call大单金额占{call_pct:.0f}%, 资金强烈看涨{sweep_text}")
+            lines.append(f"  🎯 建议: 跟随大单看涨, 关注 {focus_text}")
+        elif call_pct >= 58:
+            lines.append(f"  📌 信号: Call大单金额占{call_pct:.0f}%, 资金偏多{sweep_text}")
+            lines.append(f"  🎯 建议: 可偏多布局, 关注 {focus_text}")
+        elif call_pct <= 30:
+            lines.append(f"  📌 信号: Put大单金额占{100-call_pct:.0f}%, 资金强烈看跌{sweep_text}")
+            lines.append(f"  🎯 建议: 风险防控优先, 关注 {focus_text}")
+        elif call_pct <= 42:
+            lines.append(f"  📌 信号: Put大单金额占{100-call_pct:.0f}%, 资金偏空{sweep_text}")
+            lines.append(f"  🎯 建议: 谨慎偏空, 关注 {focus_text}")
         else:
-            flow_desc = f"Call/Put大单金额接近, 资金集中在{main_exp_str}月期权"
+            lines.append(f"  📌 信号: Call/Put大单金额接近{sweep_text}")
+            lines.append(f"  🎯 建议: 多空均衡, 等待方向明确, 关注 {focus_text}")
 
-        sweep_desc = f", 含{total_sweep}笔Sweep扫单" if total_sweep > 0 else ""
-
-        lines.append(f"  📌 今日信号: {flow_desc}{sweep_desc}")
-        lines.append(f"  📊 情绪: {sentiment}")
-
-        # 操作建议
-        if call_pct >= 65:
-            advice = f"建议跟随大单看涨布局, 关注{main_exp_str} {top_strikes_text}" if top_strikes_text else "建议跟随大单布局"
-        elif call_pct <= 35:
-            advice = f"Put大单集中, 注意下行风险, 控制仓位"
-        elif call_pct >= 55:
-            advice = f"偏多但信号不强, 可轻仓跟随, 关注{main_exp_str} {top_strikes_text}" if top_strikes_text else "偏多可轻仓试探"
-        elif call_pct <= 45:
-            advice = "偏空但信号不强, 保持谨慎"
-        else:
-            advice = f"多空均衡, 等待方向明确, 关注{main_exp_str}月度合约变化"
-
-        # 支撑压力提示
+        # 支撑压力提醒
         sr = compute_support_resistance(oi_df, ticker, close)
-        if sr["support"]:
-            top_sup = fmt_strike(sr["support"][0]["strike"])
-            advice += f", 支撑位{top_sup}"
-        if sr["resistance"]:
-            top_res = fmt_strike(sr["resistance"][0]["strike"])
-            advice += f", 压力位{top_res}"
-
-        lines.append(f"  🎯 操作建议: {advice}")
+        if sr["support"] and sr["resistance"]:
+            sup = fmt_strike(sr["support"][0]["strike"])
+            res = fmt_strike(sr["resistance"][0]["strike"])
+            lines.append(f"  📍 区间: 支撑{sup} ~ 压力{res}")
 
     return "\n".join(lines)
 
@@ -955,48 +726,36 @@ def send_telegram(
     trade_date: date,
     tickers: List[str],
     underlying_info: Dict[str, Dict[str, float]],
-    flow_df: pd.DataFrame,
-    strike_df: pd.DataFrame,
-    trades: pd.DataFrame,
+    ticker_analysis: Dict[str, List[Dict[str, Any]]],
     oi_df: pd.DataFrame,
     token: str,
     chat_id: str,
 ) -> None:
     if not token or not chat_id:
-        log.info("未配置 Telegram, 跳过推送")
+        log.info("未配置 Telegram")
         return
 
-    # 消息1: 月度资金总览
-    msg1 = build_overview_message(trade_date, tickers, underlying_info, flow_df, strike_df)
-    _tg_send(token, chat_id, msg1)
-    time.sleep(0.3)
-
-    # 消息2-N: 每个 ticker 的大宗成交
+    # 消息1: 每个 ticker 的月度资金总览
     for ticker in tickers:
-        msg = build_block_trades_message(ticker, trades, strike_df, underlying_info)
+        info = underlying_info.get(ticker, {})
+        msg = build_ticker_message(ticker, info, ticker_analysis.get(ticker, []))
         _tg_send(token, chat_id, msg)
         time.sleep(0.3)
 
-    # 消息N+1: 支撑压力位
-    msg_sr = build_support_resistance_message(tickers, oi_df, underlying_info)
-    _tg_send(token, chat_id, msg_sr)
-    time.sleep(0.3)
-
-    # 消息N+2: 交易建议
-    msg_adv = build_advice_message(tickers, flow_df, strike_df, trades, underlying_info, oi_df)
+    # 消息2: 支撑压力 + 交易建议
+    msg_adv = build_advice_message(tickers, underlying_info, ticker_analysis, oi_df)
     _tg_send(token, chat_id, msg_adv)
 
 
-# ─────────────────────────────────────────────
-# 9. 报告保存 (Markdown)
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════
+# 报告保存
+# ═══════════════════════════════════════════════
 
-def save_markdown_report(
+def save_report(
     trade_date: date,
     tickers: List[str],
     underlying_info: Dict[str, Dict[str, float]],
-    flow_df: pd.DataFrame,
-    strike_df: pd.DataFrame,
+    ticker_analysis: Dict[str, List[Dict[str, Any]]],
     trades: pd.DataFrame,
     oi_df: pd.DataFrame,
     report_dir: Path,
@@ -1007,176 +766,151 @@ def save_markdown_report(
         info = underlying_info.get(ticker, {})
         close = info.get("close", 0.0)
         chg = info.get("change_pct", 0.0)
+        exp_list = ticker_analysis.get(ticker, [])
 
-        tf = flow_df[flow_df["ticker"] == ticker]
-        sr = compute_support_resistance(oi_df, ticker, close)
+        lines: List[str] = []
+        lines.append(f"# {ticker} 月度大单雷达 {trade_date}")
+        lines.append(f"收盘 ${close:.2f} ({chg:+.2f}%)\n")
 
-        sections: List[str] = []
-        sections.append(f"# {ticker} 月度大单雷达 {trade_date}")
-        sections.append(f"收盘 ${close:.2f} ({chg:+.2f}%)\n")
+        for exp_data in exp_list:
+            exp_str = exp_data["expiration"].strftime("%Y-%m-%d")
+            emoji = exp_data["sentiment_emoji"]
+            label = exp_data["sentiment_label"]
 
-        # 月度资金总览
-        sections.append("## 月度资金总览")
-        if not tf.empty:
-            sections.append("| 到期日 | 净金流 | 主力Strike | 情绪 | 成交量 |")
-            sections.append("|--------|--------|-----------|------|--------|")
-            for _, r in tf.iterrows():
-                exp_str = r["expiration"].strftime("%Y-%m-%d") if hasattr(r["expiration"], "strftime") else str(r["expiration"])
-                net = r["net_flow"]
-                total = r["total_notional"]
-                call_n = r.get("call_notional", 0)
-                put_n = r.get("put_notional", 0)
-                _, sentiment = _sentiment(net, total, call_n, put_n)
-                top_strike = _top_strike_label(strike_df, ticker, r["expiration"])
-                flow_str = fmt_money_signed(net)
-                sections.append(f"| {exp_str} | {flow_str} | {top_strike} | {sentiment} | {r['total_volume']:,}张 |")
-        sections.append("")
+            lines.append(f"## {exp_str} {emoji} {label}")
+            lines.append(f"- 净金流: {fmt_money_signed(exp_data['net_flow'])} (Call {exp_data['call_pct']:.0f}%)")
+            lines.append(f"- Call: {fmt_money(exp_data['call_notional'])} {exp_data['call_volume']:,}张 {exp_data['call_trades']}笔")
+            lines.append(f"- Put: {fmt_money(exp_data['put_notional'])} {exp_data['put_volume']:,}张 {exp_data['put_trades']}笔")
+            if exp_data["sweep_count"] > 0:
+                lines.append(f"- Sweep: {exp_data['sweep_count']}笔")
 
-        # 大宗成交
-        sections.append("## 月度大宗成交 (≥$200K)")
-        tt = trades[
-            (trades["ticker"] == ticker) & (trades["notional"] >= DETAIL_THRESHOLD)
-        ].sort_values("notional", ascending=False).head(10)
-        if not tt.empty:
-            for i, (_, r) in enumerate(tt.iterrows(), 1):
-                exp_str = r["expiration"].strftime("%m/%d") if hasattr(r["expiration"], "strftime") else str(r["expiration"])
-                strike = fmt_strike(r["strike"])
-                ot = r["option_type"]
-                ot_label = "Call" if ot == "C" else "Put"
-                sweep_mark = " ⚡Sweep" if r.get("is_sweep") else ""
-                sections.append(
-                    f"{i}. {fmt_money(r['notional'])} | {exp_str} {strike}{ot} ({ot_label}) | "
-                    f"{r['size']:,}张×${r['price']:.2f}{sweep_mark}"
-                )
-        sections.append("")
+            if exp_data["call_strikes"]:
+                lines.append("### 主力 Call")
+                for s in exp_data["call_strikes"]:
+                    lines.append(f"- {_strike_line(s)}")
+            if exp_data["put_strikes"]:
+                lines.append("### 主力 Put")
+                for s in exp_data["put_strikes"]:
+                    lines.append(f"- {_strike_line(s)}")
+            lines.append("")
 
         # 支撑压力
-        sections.append("## 关键支撑/压力位")
+        sr = compute_support_resistance(oi_df, ticker, close)
+        lines.append("## 支撑/压力位")
         if sr["support"]:
-            parts = [f"{fmt_strike(s['strike'])}(OI:{s['oi']:,})" for s in sr["support"][:3]]
-            sections.append(f"- 强支撑: {' > '.join(parts)}")
+            parts = [f"{fmt_strike(s['strike'])}(OI:{s['oi']:,})" for s in sr["support"]]
+            lines.append(f"- 支撑: {' > '.join(parts)}")
         if sr["resistance"]:
-            parts = [f"{fmt_strike(s['strike'])}(OI:{s['oi']:,})" for s in sr["resistance"][:3]]
-            sections.append(f"- 强压力: {' > '.join(parts)}")
-        sections.append("")
+            parts = [f"{fmt_strike(s['strike'])}(OI:{s['oi']:,})" for s in sr["resistance"]]
+            lines.append(f"- 压力: {' > '.join(parts)}")
 
-        report_path = report_dir / f"{ticker}_{trade_date}.md"
-        report_path.write_text("\n".join(sections), encoding="utf-8")
-        log.info("报告已保存: %s", report_path)
+        # 大宗成交明细 (后台保存, 不推送)
+        tt = trades[
+            (trades["ticker"] == ticker) & (trades["notional"] >= 200_000)
+        ].sort_values("notional", ascending=False).head(15)
+        if not tt.empty:
+            lines.append("\n## 大宗成交明细 (≥$200K)")
+            for i, (_, r) in enumerate(tt.iterrows(), 1):
+                exp_s = r["expiration"].strftime("%m/%d")
+                strike = fmt_strike(r["strike"])
+                ot = r["option_type"]
+                sweep = " ⚡Sweep" if r.get("is_sweep") else ""
+                lines.append(
+                    f"{i}. {fmt_money(r['notional'])} | {exp_s} {strike}{ot} | "
+                    f"{r['size']:,}张×${r['price']:.2f}{sweep}"
+                )
+
+        path = report_dir / f"{ticker}_{trade_date}.md"
+        path.write_text("\n".join(lines), encoding="utf-8")
+        log.info("报告: %s", path)
 
 
-# ─────────────────────────────────────────────
-# 10. 盘后窗口
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════
+# 盘后窗口
+# ═══════════════════════════════════════════════
 
 def get_us_trade_date() -> date:
     now_et = datetime.now(ET)
-    if now_et.hour < 20:
-        trade_date = (now_et - timedelta(days=1)).date()
-    else:
-        trade_date = now_et.date()
-    while trade_date.weekday() >= 5:
-        trade_date -= timedelta(days=1)
-    return trade_date
+    td = now_et.date() if now_et.hour >= 20 else (now_et - timedelta(days=1)).date()
+    while td.weekday() >= 5:
+        td -= timedelta(days=1)
+    return td
 
 
 def in_postclose_window() -> bool:
-    now_et = datetime.now(ET)
-    return 20 <= now_et.hour <= 23
+    return 20 <= datetime.now(ET).hour <= 23
 
 
-# ─────────────────────────────────────────────
-# 11. 主 Pipeline
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════
+# Pipeline
+# ═══════════════════════════════════════════════
 
 def daily_pipeline(cfg: argparse.Namespace) -> None:
     trade_date = get_us_trade_date()
     log.info("交易日: %s", trade_date)
 
-    # 1. 月度到期日 (仅未来)
     monthly_dates = monthly_expiration_dates(trade_date)
-    log.info("监控月度到期日: %s", [d.isoformat() for d in monthly_dates])
+    log.info("月度到期日: %s", [d.isoformat() for d in monthly_dates])
     if not monthly_dates:
-        log.warning("未来 60 天无标准月度到期日")
+        log.warning("无月度到期日")
         return
 
-    # 2. 标的价格
     underlying_info = fetch_underlying_info(cfg.tickers)
     for t, info in underlying_info.items():
-        log.info("%s 收盘 $%.2f (%+.2f%%)", t, info["close"], info["change_pct"])
+        log.info("%s $%.2f (%+.2f%%)", t, info["close"], info["change_pct"])
 
-    # 3. Databento 大单
     trades = fetch_trades(cfg.tickers, trade_date, monthly_dates)
     if trades.empty:
-        log.warning("未获取到大单数据")
         if cfg.tg_token and cfg.tg_chat:
-            msg = f"📡 <b>月度大单雷达</b> {trade_date}\n\n⚠️ 今日未获取到月度期权大单数据 (阈值: {fmt_money(NOTIONAL_THRESHOLD)})"
-            _tg_send(cfg.tg_token, cfg.tg_chat, msg)
+            _tg_send(cfg.tg_token, cfg.tg_chat,
+                     f"📡 <b>月度大单雷达</b> {trade_date}\n⚠️ 今日无月度期权大单 (≥{fmt_money(NOTIONAL_THRESHOLD)})")
         return
 
-    # 4. OI 数据
     oi_df = fetch_oi_data(cfg.tickers, monthly_dates)
-    log.info("OI 数据: %d 条", len(oi_df))
+    log.info("OI: %d 条", len(oi_df))
 
-    # 5. 计算指标
-    flow_df = compute_net_flow(trades)
-    strike_df = compute_strike_summary(trades, oi_df)
-
-    # 6. 保存报告
-    report_dir = Path(cfg.report_dir)
-    save_markdown_report(trade_date, cfg.tickers, underlying_info, flow_df, strike_df, trades, oi_df, report_dir)
-
-    # 7. 打印摘要
+    # 分析
+    ticker_analysis: Dict[str, List[Dict[str, Any]]] = {}
     for ticker in cfg.tickers:
-        tf = flow_df[flow_df["ticker"] == ticker]
-        if not tf.empty:
-            total_net = tf["net_flow"].sum()
-            total_notional = tf["total_notional"].sum()
-            total_sweep = int(tf["sweep_count"].sum())
-            print(f"\n{'='*50}")
-            print(f"{ticker}: 大单 {fmt_money(total_notional)} | Sweep {total_sweep}笔")
-            for _, r in tf.iterrows():
-                exp_str = r["expiration"].strftime("%Y-%m-%d")
-                print(f"  {exp_str}: {r['total_volume']:,}张 {r['trade_count']}笔")
-            print(f"{'='*50}")
+        exp_results: List[Dict[str, Any]] = []
+        for exp_date in monthly_dates:
+            result = analyze_expiration(trades, oi_df, ticker, exp_date)
+            if result:
+                exp_results.append(result)
+        ticker_analysis[ticker] = exp_results
 
-    # 8. Telegram 推送
-    send_telegram(
-        trade_date=trade_date,
-        tickers=cfg.tickers,
-        underlying_info=underlying_info,
-        flow_df=flow_df,
-        strike_df=strike_df,
-        trades=trades,
-        oi_df=oi_df,
-        token=cfg.tg_token,
-        chat_id=cfg.tg_chat,
-    )
+        # 打印摘要
+        for e in exp_results:
+            log.info("%s %s: %s | Call %s / Put %s | Sweep %d",
+                     ticker, e["expiration"], e["sentiment_label"],
+                     fmt_money(e["call_notional"]), fmt_money(e["put_notional"]),
+                     e["sweep_count"])
+
+    # 保存
+    save_report(trade_date, cfg.tickers, underlying_info, ticker_analysis, trades, oi_df, Path(cfg.report_dir))
+
+    # Telegram
+    send_telegram(trade_date, cfg.tickers, underlying_info, ticker_analysis, oi_df, cfg.tg_token, cfg.tg_chat)
+
     log.info("Pipeline 完成 ✓")
 
 
-# ─────────────────────────────────────────────
-# 12. CLI
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="NVDA/TSLA 月度期权大单雷达 v2.1",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument("--mode", choices=["auto", "daily"], default="auto")
-    parser.add_argument("--tickers", type=str, default=",".join(DEFAULT_TICKERS))
-    parser.add_argument("--report-dir", type=str, default="reports/daily")
-    parser.add_argument("--enforce-postclose-window", action="store_true")
-    parser.add_argument("--skip-if-exists", action="store_true")
-    parser.add_argument("--tg-token", type=str, default=os.environ.get("TELEGRAM_TOKEN", ""))
-    parser.add_argument("--tg-chat", type=str, default=os.environ.get("TELEGRAM_CHAT_ID", ""))
-    parser.add_argument("--databento-api-key", type=str, default=os.environ.get("DATABENTO_API_KEY", ""))
-
-    args = parser.parse_args()
-    args.tickers = [x.strip().upper() for x in args.tickers.split(",") if x.strip()]
-    if not args.tickers:
-        args.tickers = DEFAULT_TICKERS.copy()
+    p = argparse.ArgumentParser(description="NVDA/TSLA 月度大单雷达 v3")
+    p.add_argument("--mode", choices=["auto", "daily"], default="auto")
+    p.add_argument("--tickers", type=str, default=",".join(DEFAULT_TICKERS))
+    p.add_argument("--report-dir", type=str, default="reports/daily")
+    p.add_argument("--enforce-postclose-window", action="store_true")
+    p.add_argument("--skip-if-exists", action="store_true")
+    p.add_argument("--tg-token", type=str, default=os.environ.get("TELEGRAM_TOKEN", ""))
+    p.add_argument("--tg-chat", type=str, default=os.environ.get("TELEGRAM_CHAT_ID", ""))
+    p.add_argument("--databento-api-key", type=str, default=os.environ.get("DATABENTO_API_KEY", ""))
+    args = p.parse_args()
+    args.tickers = [x.strip().upper() for x in args.tickers.split(",") if x.strip()] or DEFAULT_TICKERS.copy()
     return args
 
 
@@ -1184,19 +918,14 @@ def main() -> None:
     cfg = parse_args()
     if cfg.databento_api_key and not os.environ.get("DATABENTO_API_KEY"):
         os.environ["DATABENTO_API_KEY"] = cfg.databento_api_key
-
     if cfg.enforce_postclose_window and not in_postclose_window():
-        log.info("跳过: 当前不在美东盘后 20:00-23:59 窗口")
+        log.info("跳过: 不在盘后窗口")
         return
-
     if cfg.skip_if_exists:
-        trade_date = get_us_trade_date()
-        report_dir = Path(cfg.report_dir)
-        existing = list(report_dir.glob(f"*_{trade_date}.md"))
-        if existing:
-            log.info("跳过: %s 已有报告", trade_date)
+        td = get_us_trade_date()
+        if list(Path(cfg.report_dir).glob(f"*_{td}.md")):
+            log.info("跳过: %s 已有报告", td)
             return
-
     daily_pipeline(cfg)
 
 
