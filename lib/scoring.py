@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from .config import (
+    OTM_CALL_MIN,
+    OTM_PUT_MAX,
     TOP_N,
     WEIGHT_BLOCK_SWEEP,
     WEIGHT_IV,
@@ -33,6 +35,7 @@ def score_contracts(
     block_df: pd.DataFrame,
     ticker: str,
     expiration: date,
+    underlying_price: float = 0.0,
 ) -> pd.DataFrame:
     """对单个 (ticker, expiration) 的合约评分。
 
@@ -40,6 +43,7 @@ def score_contracts(
         chain_df: 期权链数据 (含 moneyness 过滤后的)
         oi_delta_df: OI 变化数据 (来自 oi_history.get_oi_delta)
         block_df: 大单/sweep 汇总 (来自 data_databento.aggregate_block_sweep)
+        underlying_price: 标的现价, 用于 OTM 过滤
 
     返回: DataFrame, 按 option_type 分组, 含 composite_score 列, 降序排列
     """
@@ -48,6 +52,20 @@ def score_contracts(
         (chain_df["ticker"] == ticker)
         & (chain_df["expiration"] == expiration)
     ].copy()
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # ── OTM 过滤: 排除实值和太靠近现价的合约 ──
+    if underlying_price > 0:
+        call_min = underlying_price * OTM_CALL_MIN
+        put_max = underlying_price * OTM_PUT_MAX
+        df = df[
+            ((df["option_type"] == "C") & (df["strike"] >= call_min))
+            | ((df["option_type"] == "P") & (df["strike"] <= put_max))
+        ].copy()
+        log.info("%s %s OTM过滤: Call≥%.0f, Put≤%.0f, 剩余%d条",
+                 ticker, expiration, call_min, put_max, len(df))
 
     if df.empty:
         return pd.DataFrame()

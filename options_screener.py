@@ -154,7 +154,7 @@ def daily_pipeline(cfg: argparse.Namespace) -> None:
             block_df = aggregate_block_sweep(trades_df, ticker, exp_date)
 
             # 评分
-            scored = score_contracts(chain_df, oi_delta_df, block_df, ticker, exp_date)
+            scored = score_contracts(chain_df, oi_delta_df, block_df, ticker, exp_date, close)
             if scored.empty:
                 log.info("%s %s: 无有效合约", ticker, exp_date)
                 continue
