@@ -1,33 +1,23 @@
-00:17:12 [INFO] 交易日: 2026-03-20
-00:17:12 [INFO] 监控月度到期日: ['2026-04-17', '2026-05-15']
-00:17:13 [INFO] NVDA 收盘 $172.93 (-3.15%)
-00:17:13 [INFO] TSLA 收盘 $367.96 (-3.24%)
-00:17:13 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-00:17:13 [INFO] Databento NVDA 拉取 trades ...
-00:17:19 [INFO] Databento NVDA 拉取 definitions ...
-00:17:23 [INFO] Databento NVDA definitions: 4006 个合约映射
-00:17:23 [INFO] Databento NVDA 原始成交: 345068 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags', 'ts_in_delta', 'sequence', 'symbol']
-00:17:23 [INFO] Databento side 字段样本: ['N', 'N', 'N', 'N', 'N'] (type=<class 'str'>)
-00:17:33 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-00:17:33 [INFO] Databento TSLA 拉取 trades ...
-00:17:43 [INFO] Databento TSLA 拉取 definitions ...
-00:17:49 [INFO] Databento TSLA definitions: 6360 个合约映射
-00:17:49 [INFO] Databento TSLA 原始成交: 550756 笔, 列: ['ts_event', 'rtype', 'publisher_id', 'instrument_id', 'action', 'side', 'depth', 'price', 'size', 'flags', 'ts_in_delta', 'sequence', 'symbol']
-00:18:05 [INFO] Side 分布: {'UNK': 380}
-00:18:05 [INFO] 大单总计: 380 笔 (sweep 70 笔), 总名义 $412.0M
-00:18:06 [INFO] OI 数据: 900 条
-00:18:06 [INFO] 报告已保存: reports/daily/NVDA_2026-03-20.md
-00:18:06 [INFO] 报告已保存: reports/daily/TSLA_2026-03-20.md
-
-==================================================
-NVDA: 大单 $58.8M | Sweep 30笔
-  2026-04-17: 33,901张 95笔
-  2026-05-15: 32,545张 60笔
-==================================================
-
-==================================================
-TSLA: 大单 $353.3M | Sweep 40笔
-  2026-04-17: 45,970张 153笔
-  2026-05-15: 6,515张 72笔
-==================================================
-00:18:10 [INFO] Pipeline 完成 ✓
+00:36:53 [INFO] 交易日: 2026-03-20
+00:36:53 [INFO] 月度到期日: ['2026-04-17', '2026-05-15']
+00:36:54 [INFO] NVDA $172.93 (-3.15%)
+00:36:54 [INFO] TSLA $367.96 (-3.24%)
+00:36:54 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+00:36:54 [INFO] Databento NVDA trades ...
+00:37:00 [INFO] Databento NVDA definitions ...
+00:37:02 [INFO] Databento NVDA: 4006 个合约映射
+00:37:02 [INFO] Databento NVDA: 345068 笔成交
+00:37:20 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+00:37:20 [INFO] Databento TSLA trades ...
+00:37:26 [INFO] Databento TSLA definitions ...
+00:37:30 [INFO] Databento TSLA: 6360 个合约映射
+00:37:30 [INFO] Databento TSLA: 550756 笔成交
+00:38:00 [INFO] 大单: 380 笔 (sweep 70), 名义 $412.0M
+00:38:00 [INFO] OI: 900 条
+00:38:00 [INFO] NVDA 2026-04-17: 偏看涨 | Call $18.2M / Put $11.7M | Sweep 22
+00:38:00 [INFO] NVDA 2026-05-15: 偏看涨 | Call $20.8M / Put $8.1M | Sweep 8
+00:38:00 [INFO] TSLA 2026-04-17: 强看跌 | Call $26.9M / Put $311.4M | Sweep 29
+00:38:00 [INFO] TSLA 2026-05-15: 多空均衡 | Call $7.1M / Put $7.9M | Sweep 11
+00:38:00 [INFO] 报告: reports/daily/NVDA_2026-03-20.md
+00:38:00 [INFO] 报告: reports/daily/TSLA_2026-03-20.md
+00:38:02 [INFO] Pipeline 完成 ✓
