@@ -42,10 +42,62 @@ REPORT_DIR = "reports/daily"
 # ── 新闻关键词 (利多/利空) ──
 BULLISH_KEYWORDS = [
     "beat", "upgrade", "raised", "bullish", "surge", "record",
-    "growth", "partnership", "buyback", "dividend",
+    "growth", "partnership", "buyback", "dividend", "rally",
+    "breakout", "outperform", "exceeded", "strong demand",
+    "rate cut", "dovish", "ceasefire", "peace", "deal",
+    "stimulus", "easing",
 ]
 BEARISH_KEYWORDS = [
     "miss", "downgrade", "cut", "bearish", "decline", "warning",
     "tariff", "sanction", "layoff", "investigation", "recall",
-    "lawsuit", "ban", "restriction",
+    "lawsuit", "ban", "restriction", "crash", "selloff", "sell-off",
+    "war", "invasion", "missile", "attack", "conflict", "escalat",
+    "rate hike", "hawkish", "inflation", "recession",
+    "oil spike", "oil surge", "crude jump",
+    "default", "debt ceiling", "shutdown", "crisis",
+]
+
+# ── 财报预期关键词 ──
+EARNINGS_BULLISH = [
+    "beat", "exceeded", "strong earnings", "record revenue",
+    "raised guidance", "above expectations", "blowout",
+    "upside surprise", "earnings surge",
+]
+EARNINGS_BEARISH = [
+    "miss", "disappoint", "weak earnings", "revenue decline",
+    "lowered guidance", "below expectations", "earnings warning",
+    "profit drop", "margin pressure", "weak outlook",
+]
+
+# ── 宏观指标 Ticker ──
+MACRO_TICKERS = {
+    "^VIX": "VIX恐慌指数",
+    "^TNX": "10Y美债利率",
+    "CL=F": "原油",
+    "GC=F": "黄金",
+    "DX-Y.NYB": "美元指数",
+}
+
+# ── 宏观形势关键词分类 ──
+GEOPOLITICAL_KEYWORDS = [
+    "war", "invasion", "missile", "attack", "conflict", "military",
+    "nato", "nuclear", "troops", "bomb", "strike", "escalat",
+    "sanctions", "embargo", "ceasefire", "peace talk",
+    "israel", "gaza", "ukraine", "russia", "china", "taiwan", "iran",
+    "north korea",
+]
+MONETARY_KEYWORDS = [
+    "fed", "federal reserve", "rate cut", "rate hike", "interest rate",
+    "hawkish", "dovish", "inflation", "cpi", "pce", "fomc",
+    "quantitative", "tightening", "easing", "pivot", "pause",
+    "treasury", "yield", "bond",
+]
+TRADE_POLICY_KEYWORDS = [
+    "tariff", "trade war", "import duty", "export ban", "chip ban",
+    "restriction", "sanction", "embargo", "trade deal", "trade tension",
+    "supply chain", "reshoring", "nearshoring",
+]
+ENERGY_KEYWORDS = [
+    "oil", "crude", "opec", "natural gas", "energy", "gasoline",
+    "petroleum", "pipeline", "refinery",
 ]

@@ -30,6 +30,7 @@ from lib.config import DEFAULT_TICKERS, ET, REPORT_DIR
 from lib.data_databento import aggregate_block_sweep, fetch_trades
 from lib.data_yfinance import (
     fetch_earnings_date,
+    fetch_macro_indicators,
     fetch_news,
     fetch_option_chain,
     fetch_underlying_info,
@@ -127,10 +128,15 @@ def daily_pipeline(cfg: argparse.Namespace) -> None:
     trades_df = fetch_trades(cfg.tickers, trade_date, monthly_dates)
     log.info("大单: %d 笔", len(trades_df))
 
-    # 6. 新闻 + 财报日期
+    # 6. 宏观指标 + 新闻 + 财报日期
+    macro_indicators = fetch_macro_indicators()
+    log.info("宏观指标: %s", ", ".join(
+        f"{d['name']} {d['close']:.1f}({d['change_pct']:+.1f}%)"
+        for d in macro_indicators.values()
+    ))
     news_data = fetch_news(cfg.tickers)
     earnings_dates = fetch_earnings_date(cfg.tickers)
-    macro_analysis = analyze_news(news_data, earnings_dates)
+    macro_analysis = analyze_news(news_data, earnings_dates, macro_indicators)
 
     # 7. 逐 ticker 逐到期日评分 + 生成消息
     messages: List[str] = []

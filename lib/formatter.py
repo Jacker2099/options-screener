@@ -132,13 +132,46 @@ def build_ticker_message(
         lines.append(f"支撑位: ${sup_str} | 阻力位: ${res_str}")
     lines.append("")
 
-    # ── 宏观因素 ──
+    # ── 财报预期 ──
     if macro_info:
-        lines.append("🌍 <b>宏观因素</b>")
-        for event in macro_info.get("events", [])[:3]:
-            lines.append(f"• {event}")
-        if macro_info.get("summary"):
-            lines.append(f"→ {macro_info['summary']}")
+        earnings = macro_info.get("earnings_sentiment", {})
+        if earnings.get("has_upcoming"):
+            e_sentiment = earnings.get("sentiment", "中性")
+            e_icon = "🟢" if e_sentiment == "看多" else ("🔴" if e_sentiment == "利空" else "⚪")
+            lines.append(f"📋 <b>财报预期: {e_icon} {e_sentiment}</b>")
+            lines.append(f"• {earnings.get('detail', '')}")
+            lines.append("")
+
+    # ── 宏观形势 ──
+    if macro_info:
+        macro = macro_info.get("macro", {})
+        macro_dir = macro.get("direction", "中性")
+        m_icon = "🟢" if macro_dir in ("利多", "偏多") else ("🔴" if macro_dir in ("利空", "偏空") else "⚪")
+        lines.append(f"🌍 <b>宏观形势: {m_icon} {macro_dir}</b>")
+
+        # 宏观指标一行展示
+        details = macro.get("details", [])
+        if details:
+            lines.append(f"• {' | '.join(details)}")
+
+        # 关键信号
+        signals = macro.get("signals", [])
+        if signals:
+            for sig in signals[:4]:
+                lines.append(f"  → {sig}")
+
+        # 分类事件
+        cats = macro_info.get("news_categories", {})
+        geo = cats.get("geopolitical", [])
+        mon = cats.get("monetary", [])
+        trade = cats.get("trade", [])
+        if geo:
+            lines.append(f"• 地缘政治: {geo[0]}")
+        if mon:
+            lines.append(f"• 货币政策: {mon[0]}")
+        if trade:
+            lines.append(f"• 贸易政策: {trade[0]}")
+
         lines.append("")
 
     # ── 策略建议 ──
@@ -154,15 +187,24 @@ def build_ticker_message(
     else:
         lines.append("• 主力方向: 多空均衡, 等待方向明确")
 
-    # 宏观风险
+    # 综合风险提示
     if macro_info:
         direction = macro_info.get("direction", "中性")
-        if direction == "利空":
-            lines.append("• 风险提示: 宏观面偏空, 控制仓位")
-        elif macro_info.get("earnings_date"):
-            lines.append(f"• 风险提示: 财报({macro_info['earnings_date']})前波动加大")
-        else:
-            lines.append("• 风险提示: 注意止损, 控制仓位")
+        earnings = macro_info.get("earnings_sentiment", {})
+        macro = macro_info.get("macro", {})
+        macro_dir = macro.get("direction", "中性")
+
+        risk_parts: List[str] = []
+        if direction in ("利空", "偏空"):
+            risk_parts.append("综合面偏空")
+        if macro_dir in ("利空", "偏空"):
+            risk_parts.append("宏观承压")
+        if earnings.get("has_upcoming"):
+            risk_parts.append(f"财报({macro_info.get('earnings_date','')})前波动加大")
+        if not risk_parts:
+            risk_parts.append("注意止损")
+        risk_parts.append("控制仓位")
+        lines.append(f"• 风险提示: {', '.join(risk_parts)}")
 
     return "\n".join(lines)
 

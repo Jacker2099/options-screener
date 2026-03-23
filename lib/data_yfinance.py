@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-from .config import DAYS_AHEAD, MONEYNESS_HIGH, MONEYNESS_LOW
+from .config import DAYS_AHEAD, MACRO_TICKERS, MONEYNESS_HIGH, MONEYNESS_LOW
 
 try:
     import yfinance as yf
@@ -212,4 +212,38 @@ def fetch_earnings_date(symbols: List[str]) -> Dict[str, Optional[str]]:
                 result[symbol] = None
         except Exception:
             result[symbol] = None
+    return result
+
+
+# ═══════════════════════════════════════════════
+# 宏观指标获取
+# ═══════════════════════════════════════════════
+
+def fetch_macro_indicators() -> Dict[str, Dict[str, Any]]:
+    """获取宏观指标: VIX, 10Y利率, 原油, 黄金, 美元指数。
+
+    返回:
+        {ticker: {"name": 中文名, "close": 价格, "change_pct": 涨跌幅, "prev_close": 前收}}
+    """
+    result: Dict[str, Dict[str, Any]] = {}
+    if yf is None:
+        return result
+
+    for symbol, name in MACRO_TICKERS.items():
+        try:
+            hist = yf.Ticker(symbol).history(period="5d")
+            if hist.empty or len(hist) < 2:
+                continue
+            close = float(hist["Close"].iloc[-1])
+            prev = float(hist["Close"].iloc[-2])
+            change_pct = (close / prev - 1) * 100 if prev else 0.0
+            result[symbol] = {
+                "name": name,
+                "close": close,
+                "prev_close": prev,
+                "change_pct": change_pct,
+            }
+        except Exception as e:
+            log.warning("宏观指标 %s: %s", symbol, e)
+
     return result
