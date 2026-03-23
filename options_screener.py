@@ -466,47 +466,42 @@ def fetch_oi_data(
 def compute_net_flow(trades: pd.DataFrame) -> pd.DataFrame:
     """按 (ticker, expiration) 计算 Net Flow。
 
-    Net Flow = (Call_at_Ask + Put_at_Bid) - (Put_at_Ask + Call_at_Bid)
-    正 = 看多资金, 负 = 看空资金
+    OPRA 不提供 aggressor side, 所以使用 Call/Put 金额差估算:
+    Net Flow = Call大单金额 - Put大单金额
+    正 = 看涨资金占优, 负 = 看跌资金占优
     """
     if trades.empty:
         return pd.DataFrame()
 
     rows: List[Dict[str, Any]] = []
     for (ticker, exp), grp in trades.groupby(["ticker", "expiration"]):
-        call_ask = grp[(grp["option_type"] == "C") & (grp["side"] == "ASK")]["notional"].sum()
-        put_bid = grp[(grp["option_type"] == "P") & (grp["side"] == "BID")]["notional"].sum()
-        put_ask = grp[(grp["option_type"] == "P") & (grp["side"] == "ASK")]["notional"].sum()
-        call_bid = grp[(grp["option_type"] == "C") & (grp["side"] == "BID")]["notional"].sum()
-
-        bullish = call_ask + put_bid
-        bearish = put_ask + call_bid
-        net_flow = bullish - bearish
+        call_notional = grp[grp["option_type"] == "C"]["notional"].sum()
+        put_notional = grp[grp["option_type"] == "P"]["notional"].sum()
+        net_flow = call_notional - put_notional
 
         total_notional = grp["notional"].sum()
         total_volume = int(grp["size"].sum())
         trade_count = len(grp)
         sweep_count = int(grp["is_sweep"].sum())
 
-        # 各类型成交统计
         call_vol = int(grp[grp["option_type"] == "C"]["size"].sum())
         put_vol = int(grp[grp["option_type"] == "P"]["size"].sum())
-        ask_count = int((grp["side"] == "ASK").sum())
-        bid_count = int((grp["side"] == "BID").sum())
+        call_trades = int((grp["option_type"] == "C").sum())
+        put_trades = int((grp["option_type"] == "P").sum())
 
         rows.append({
             "ticker": ticker,
             "expiration": exp,
             "net_flow": net_flow,
-            "bullish_flow": bullish,
-            "bearish_flow": bearish,
+            "call_notional": call_notional,
+            "put_notional": put_notional,
             "total_notional": total_notional,
             "total_volume": total_volume,
             "call_volume": call_vol,
             "put_volume": put_vol,
+            "call_trades": call_trades,
+            "put_trades": put_trades,
             "trade_count": trade_count,
-            "ask_count": ask_count,
-            "bid_count": bid_count,
             "sweep_count": sweep_count,
         })
 
@@ -609,79 +604,52 @@ def compute_support_resistance(oi_df: pd.DataFrame, ticker: str, underlying_clos
 # 7. 情绪 & 标签
 # ─────────────────────────────────────────────
 
-def _sentiment(net_flow: float, total_notional: float, ask_count: int = 0, bid_count: int = 0) -> Tuple[str, str]:
-    """返回 (emoji, 文字标签)。"""
+def _sentiment(net_flow: float, total_notional: float, call_notional: float = 0, put_notional: float = 0) -> Tuple[str, str]:
+    """根据 Call/Put 大单金额比返回 (emoji, 文字标签)。
+
+    OPRA 不提供 aggressor side, 所以用 Call vs Put 金额判断情绪:
+    - Call 金额远 > Put → 看涨布局
+    - Put 金额远 > Call → 看跌布局
+    """
     if total_notional <= 0:
         return ("⚪", "无数据")
 
-    # 如果有方向数据, 按 net flow 判断
-    directed = ask_count + bid_count
-    if directed > 0:
-        ratio = net_flow / total_notional if total_notional > 0 else 0
-        if ratio > 0.3:
-            return ("🟢", "强看涨布局")
-        elif ratio > 0.1:
-            return ("🟢", "偏多布局")
-        elif ratio < -0.3:
-            return ("🔴", "强看跌布局")
-        elif ratio < -0.1:
-            return ("🔴", "偏空布局")
-        else:
-            return ("⚪", "多空均衡")
+    total_cp = call_notional + put_notional
+    if total_cp <= 0:
+        return ("⚪", "无数据")
 
-    # 无方向数据时, 用 call/put 成交量比
-    return ("⚪", "方向待定")
+    call_pct = call_notional / total_cp
 
-
-def _side_label(side: str) -> str:
-    if side == "ASK":
-        return "Ask(主动买入)"
-    elif side == "BID":
-        return "Bid(主动卖出)"
-    return "方向未知"
-
-
-def _side_short(side: str) -> str:
-    if side == "ASK":
-        return "买入"
-    elif side == "BID":
-        return "卖出"
-    return ""
+    if call_pct >= 0.75:
+        return ("🟢", "强看涨布局")
+    elif call_pct >= 0.60:
+        return ("🟢", "偏多布局")
+    elif call_pct <= 0.25:
+        return ("🔴", "强看跌布局")
+    elif call_pct <= 0.40:
+        return ("🔴", "偏空布局")
+    else:
+        return ("⚪", "多空均衡")
 
 
 def _trade_commentary(row: Dict[str, Any], oi: int, vol_oi: float) -> str:
     """为单笔大宗成交生成智能解读。"""
     ot = row["option_type"]
-    side = row["side"]
     notional = row["notional"]
     is_sweep = row.get("is_sweep", False)
     ot_name = "看涨" if ot == "C" else "看跌"
 
     parts: List[str] = []
+    parts.append(f"大额{ot_name}期权成交")
 
-    # 方向判断
-    if side == "ASK" and ot == "C":
-        parts.append(f"主动买入{ot_name}期权")
-    elif side == "BID" and ot == "P":
-        parts.append(f"主动卖出{ot_name}期权(看涨信号)")
-    elif side == "ASK" and ot == "P":
-        parts.append(f"主动买入{ot_name}期权(看跌)")
-    elif side == "BID" and ot == "C":
-        parts.append(f"主动卖出{ot_name}期权(看跌信号)")
-    else:
-        parts.append(f"大额{ot_name}期权成交")
-
-    # Sweep 标记
     if is_sweep:
-        parts.append("跨所扫单,急于成交")
+        parts.append("跨所扫单(急于成交)")
 
-    # Vol/OI 解读
     if vol_oi > 5.0:
         parts.append("全新建仓")
     elif vol_oi > 1.0:
         parts.append("新仓为主")
 
-    # 金额级别
     if notional >= 10_000_000:
         parts.append("巨额交易")
     elif notional >= 5_000_000:
@@ -701,19 +669,13 @@ def _top_strike_label(strike_df: pd.DataFrame, ticker: str, expiration: date) ->
     top = td.sort_values("total_notional", ascending=False).iloc[0]
     strike = fmt_strike(top["strike"])
     ot = top["option_type"]
+    vol = top["total_volume"]
+    notional = top["total_notional"]
+    vol_oi = safe_float(top.get("vol_oi_ratio"), 0.0)
 
-    # 方向
-    ask_v = top["ask_volume"]
-    bid_v = top["bid_volume"]
-    if ask_v > bid_v and ask_v > 0:
-        direction = "买入" if ot == "C" else "卖出"
-    elif bid_v > ask_v and bid_v > 0:
-        direction = "卖出" if ot == "C" else "买入"
-    else:
-        direction = ""
-
-    suffix = f"({direction})" if direction else ""
-    return f"{strike}{ot}{suffix}"
+    tag = "看涨" if ot == "C" else "看跌"
+    new_flag = " 新仓" if vol_oi > 1.0 else ""
+    return f"{strike}{ot}({tag}{new_flag})"
 
 
 # ─────────────────────────────────────────────
@@ -776,18 +738,23 @@ def build_overview_message(
             exp_str = exp.strftime("%Y-%m-%d") if hasattr(exp, "strftime") else str(exp)
             net = r["net_flow"]
             total = r["total_notional"]
-            emoji, sentiment = _sentiment(net, total, r.get("ask_count", 0), r.get("bid_count", 0))
+            call_n = r.get("call_notional", 0)
+            put_n = r.get("put_notional", 0)
+            emoji, sentiment = _sentiment(net, total, call_n, put_n)
             top_strike = _top_strike_label(strike_df, ticker, exp)
 
-            flow_str = fmt_money_signed(net) if (r.get("ask_count", 0) + r.get("bid_count", 0)) > 0 else f"总额{fmt_money(total)}"
+            # 净金流: Call - Put 差额
+            flow_icon = "🟢" if net > 0 else ("🔴" if net < 0 else "⚪")
+            flow_str = fmt_money_signed(net)
 
             lines.append(
-                f"  📅 {exp_str}\n"
-                f"     净金流: {flow_str} {emoji}\n"
+                f"  📅 <b>{exp_str}</b>\n"
+                f"     净金流: {flow_icon}{flow_str}\n"
+                f"     Call: {fmt_money(call_n)} / Put: {fmt_money(put_n)}\n"
                 f"     主力Strike: {top_strike}\n"
-                f"     情绪: {sentiment}\n"
+                f"     情绪: {emoji} {sentiment}\n"
                 f"     成交: {r['total_volume']:,}张/{r['trade_count']}笔"
-                + (f" Sweep:{r['sweep_count']}" if r['sweep_count'] > 0 else "")
+                + (f" ⚡Sweep:{r['sweep_count']}" if r['sweep_count'] > 0 else "")
             )
 
     return "\n".join(lines)
@@ -839,23 +806,25 @@ def build_block_trades_message(
 
         commentary = _trade_commentary(r, oi, vol_oi)
 
-        side_text = _side_label(r["side"])
+        ot_label = "Call看涨" if ot == "C" else "Put看跌"
         lines.append(
             f"\n  #{i} {sweep_tag}{fmt_money(r['notional'])}"
-            f"\n     {exp_str} {strike}{ot} | {r['size']:,}张×${r['price']:.2f}"
-            f"\n     {time_str} {side_text}"
-            + (f"\n     {oi_text} {vol_oi_text}" if oi_text or vol_oi_text else "")
+            f"\n     {exp_str} {strike}{ot} ({ot_label}) | {r['size']:,}张×${r['price']:.2f}"
+            + (f"\n     {time_str}" if time_str else "")
+            + (f" | {oi_text} {vol_oi_text}" if oi_text or vol_oi_text else "")
             + f"\n     💬 {commentary}"
         )
 
     # 汇总
-    total_ask = len(tt[tt["side"] == "ASK"])
-    total_bid = len(tt[tt["side"] == "BID"])
-    total_unk = len(tt) - total_ask - total_bid
+    call_count = len(tt[tt["option_type"] == "C"])
+    put_count = len(tt[tt["option_type"] == "P"])
+    call_total = tt[tt["option_type"] == "C"]["notional"].sum()
+    put_total = tt[tt["option_type"] == "P"]["notional"].sum()
+    sweep_total = int(tt["is_sweep"].sum())
     lines.append(
-        f"\n📊 汇总: {len(tt)}笔 | "
-        f"主动买入{total_ask}笔 / 主动卖出{total_bid}笔"
-        + (f" / 未知{total_unk}笔" if total_unk > 0 else "")
+        f"\n📊 汇总: {len(tt)}笔大宗成交\n"
+        f"   Call: {call_count}笔 {fmt_money(call_total)} / Put: {put_count}笔 {fmt_money(put_total)}"
+        + (f"\n   ⚡ Sweep: {sweep_total}笔" if sweep_total > 0 else "")
     )
 
     return "\n".join(lines)
@@ -916,8 +885,8 @@ def build_advice_message(
         total_net = tf["net_flow"].sum()
         total_notional = tf["total_notional"].sum()
         total_sweep = int(tf["sweep_count"].sum())
-        total_ask = int(tf["ask_count"].sum())
-        total_bid = int(tf["bid_count"].sum())
+        total_call_n = tf["call_notional"].sum()
+        total_put_n = tf["put_notional"].sum()
 
         # 找到金流最大的到期日
         main_exp_row = tf.sort_values("total_notional", ascending=False).iloc[0]
@@ -937,21 +906,19 @@ def build_advice_message(
             top_strikes_text = "/".join(parts)
 
         # 情绪判断
-        _, sentiment = _sentiment(total_net, total_notional, total_ask, total_bid)
+        _, sentiment = _sentiment(total_net, total_notional, total_call_n, total_put_n)
 
-        # 生成今日信号
         lines.append(f"\n<b>{ticker}</b>")
 
-        # 资金倾向描述
-        if total_ask + total_bid > 0:
-            if total_net > 0:
-                flow_desc = f"资金向{main_exp_str}月期权倾斜, 以主动买入为主"
-            elif total_net < 0:
-                flow_desc = f"资金向{main_exp_str}月期权倾斜, 以主动卖出为主"
-            else:
-                flow_desc = f"资金集中在{main_exp_str}月期权, 买卖均衡"
+        # Call/Put 金额比较
+        total_cp = total_call_n + total_put_n
+        call_pct = total_call_n / total_cp * 100 if total_cp > 0 else 50
+        if call_pct >= 60:
+            flow_desc = f"Call大单金额占{call_pct:.0f}%, 资金向{main_exp_str}月期权看涨倾斜"
+        elif call_pct <= 40:
+            flow_desc = f"Put大单金额占{100-call_pct:.0f}%, 资金向{main_exp_str}月期权看跌倾斜"
         else:
-            flow_desc = f"资金集中在{main_exp_str}月期权, 方向待确认"
+            flow_desc = f"Call/Put大单金额接近, 资金集中在{main_exp_str}月期权"
 
         sweep_desc = f", 含{total_sweep}笔Sweep扫单" if total_sweep > 0 else ""
 
@@ -959,26 +926,16 @@ def build_advice_message(
         lines.append(f"  📊 情绪: {sentiment}")
 
         # 操作建议
-        directed = total_ask + total_bid
-        if directed > 0:
-            ratio = total_net / total_notional if total_notional > 0 else 0
-            if ratio > 0.2:
-                advice = f"建议跟随大单, 关注{main_exp_str} {top_strikes_text}" if top_strikes_text else "建议跟随大单布局"
-            elif ratio < -0.2:
-                advice = "大单偏空, 注意控制仓位风险"
-            else:
-                advice = "多空力量接近, 建议观望等待方向明确"
+        if call_pct >= 65:
+            advice = f"建议跟随大单看涨布局, 关注{main_exp_str} {top_strikes_text}" if top_strikes_text else "建议跟随大单布局"
+        elif call_pct <= 35:
+            advice = f"Put大单集中, 注意下行风险, 控制仓位"
+        elif call_pct >= 55:
+            advice = f"偏多但信号不强, 可轻仓跟随, 关注{main_exp_str} {top_strikes_text}" if top_strikes_text else "偏多可轻仓试探"
+        elif call_pct <= 45:
+            advice = "偏空但信号不强, 保持谨慎"
         else:
-            # 无方向数据时用 call/put 比
-            call_vol = int(tf["call_volume"].sum())
-            put_vol = int(tf["put_volume"].sum())
-            total_vol = call_vol + put_vol
-            if total_vol > 0 and call_vol / total_vol > 0.6:
-                advice = f"Call成交占优({call_vol:,}张 vs Put {put_vol:,}张), 关注{main_exp_str} {top_strikes_text}" if top_strikes_text else "Call 成交占优"
-            elif total_vol > 0 and put_vol / total_vol > 0.6:
-                advice = f"Put成交占优({put_vol:,}张 vs Call {call_vol:,}张), 注意下行风险"
-            else:
-                advice = f"大单活跃但方向未明, 关注{main_exp_str}月度合约动向"
+            advice = f"多空均衡, 等待方向明确, 关注{main_exp_str}月度合约变化"
 
         # 支撑压力提示
         sr = compute_support_resistance(oi_df, ticker, close)
@@ -1067,9 +1024,11 @@ def save_markdown_report(
                 exp_str = r["expiration"].strftime("%Y-%m-%d") if hasattr(r["expiration"], "strftime") else str(r["expiration"])
                 net = r["net_flow"]
                 total = r["total_notional"]
-                _, sentiment = _sentiment(net, total, r.get("ask_count", 0), r.get("bid_count", 0))
+                call_n = r.get("call_notional", 0)
+                put_n = r.get("put_notional", 0)
+                _, sentiment = _sentiment(net, total, call_n, put_n)
                 top_strike = _top_strike_label(strike_df, ticker, r["expiration"])
-                flow_str = fmt_money_signed(net) if (r.get("ask_count", 0) + r.get("bid_count", 0)) > 0 else fmt_money(total)
+                flow_str = fmt_money_signed(net)
                 sections.append(f"| {exp_str} | {flow_str} | {top_strike} | {sentiment} | {r['total_volume']:,}张 |")
         sections.append("")
 
@@ -1083,9 +1042,11 @@ def save_markdown_report(
                 exp_str = r["expiration"].strftime("%m/%d") if hasattr(r["expiration"], "strftime") else str(r["expiration"])
                 strike = fmt_strike(r["strike"])
                 ot = r["option_type"]
+                ot_label = "Call" if ot == "C" else "Put"
+                sweep_mark = " ⚡Sweep" if r.get("is_sweep") else ""
                 sections.append(
-                    f"{i}. {fmt_money(r['notional'])} | {exp_str} {strike}{ot} | "
-                    f"{r['size']:,}张×${r['price']:.2f} | {_side_label(r['side'])}"
+                    f"{i}. {fmt_money(r['notional'])} | {exp_str} {strike}{ot} ({ot_label}) | "
+                    f"{r['size']:,}张×${r['price']:.2f}{sweep_mark}"
                 )
         sections.append("")
 
