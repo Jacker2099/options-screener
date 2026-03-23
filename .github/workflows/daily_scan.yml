@@ -1,4 +1,4 @@
-name: NVDA TSLA Monthly Options Radar v2
+name: NVDA TSLA Monthly Options Radar v4
 
 on:
   schedule:
@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: options-radar-v2
+  group: options-radar-v4
   cancel-in-progress: false
 
 env:
@@ -48,7 +48,7 @@ jobs:
           DATABENTO_API_KEY: ${{ secrets.DATABENTO_API_KEY }}
         run: |
           set -euo pipefail
-          mkdir -p reports/daily
+          mkdir -p reports/daily data
 
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             echo "手动触发"
@@ -68,6 +68,7 @@ jobs:
         with:
           name: options-radar-${{ github.run_number }}
           path: |
+            data/oi_history.db
             reports/daily/*
             reports/last_run.log
           retention-days: 30
@@ -79,7 +80,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add reports || true
+          git add reports data || true
           git diff --staged --quiet && echo "无变更, 跳过提交" && exit 0
           git commit -m "radar $(date -u +'%Y-%m-%d %H:%M')"
           for i in 1 2 3; do
