@@ -16,13 +16,15 @@ try:
 except Exception:
     db = None
 
+log = logging.getLogger(__name__)
+
 try:
-    from longport.openapi import QuoteContext, Config as LPConfig, Period, AdjustType
-except Exception:
+    from longport.openapi import QuoteContext, Config as LPConfig
+    log.info("长桥 SDK 导入成功")
+except Exception as _lp_err:
     QuoteContext = None
     LPConfig = None
-
-log = logging.getLogger(__name__)
+    log.info("长桥 SDK 导入失败: %s", _lp_err)
 
 
 # ═══════════════════════════════════════════════
@@ -162,8 +164,16 @@ def _fetch_longbridge(
     app_secret = os.environ.get("LONGBRIDGE_APP_SECRET", "")
     access_token = os.environ.get("LONGBRIDGE_ACCESS_TOKEN", "")
 
-    if not all([app_key, app_secret, access_token]) or QuoteContext is None:
-        raise RuntimeError("长桥 API 未配置")
+    log.info("长桥检查: SDK=%s, key=%s, secret=%s, token=%s",
+             "OK" if QuoteContext else "MISSING",
+             "OK" if app_key else "EMPTY",
+             "OK" if app_secret else "EMPTY",
+             "OK" if access_token else "EMPTY")
+
+    if QuoteContext is None:
+        raise RuntimeError("长桥 SDK 未安装或导入失败")
+    if not all([app_key, app_secret, access_token]):
+        raise RuntimeError("长桥 API 密钥未配置 (检查 LONGBRIDGE_APP_KEY/APP_SECRET/ACCESS_TOKEN)")
 
     config = LPConfig(
         app_key=app_key,
