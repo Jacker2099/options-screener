@@ -195,14 +195,21 @@ def _fetch_longbridge(
                 continue
 
             for exp_info in exp_dates:
-                exp_date = exp_info.date
-                if hasattr(exp_date, "date"):
-                    exp_date = exp_date.date()
+                raw_date = exp_info.date
+                if hasattr(raw_date, "date") and callable(raw_date.date):
+                    exp_date = raw_date.date()
+                elif isinstance(raw_date, date):
+                    exp_date = raw_date
+                else:
+                    try:
+                        exp_date = datetime.strptime(str(raw_date)[:10], "%Y-%m-%d").date()
+                    except Exception:
+                        continue
                 if exp_date not in monthly_set:
                     continue
 
                 # 获取该到期日的行权价列表
-                strike_info_list = ctx.option_chain_info_by_date(lp_symbol, exp_info.date)
+                strike_info_list = ctx.option_chain_info_by_date(lp_symbol, raw_date)
                 if not strike_info_list:
                     continue
 
