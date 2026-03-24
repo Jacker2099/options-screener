@@ -17,10 +17,10 @@ MONEYNESS_LOW = 0.85
 MONEYNESS_HIGH = 1.15
 
 # 评分过滤: 只保留有方向性的 OTM 合约
-# Call: strike/price >= OTM_CALL_MIN (高于现价 3%+)
-# Put:  strike/price <= OTM_PUT_MAX  (低于现价 3%+)
-OTM_CALL_MIN = 1.03
-OTM_PUT_MAX = 0.97
+# Call: strike/price >= OTM_CALL_MIN (高于现价 5%+)
+# Put:  strike/price <= OTM_PUT_MAX  (低于现价 5%+)
+OTM_CALL_MIN = 1.05
+OTM_PUT_MAX = 0.95
 
 # ── Databento 大单 ──
 NOTIONAL_THRESHOLD = 100_000   # 大单门槛 $100K

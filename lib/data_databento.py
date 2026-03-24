@@ -1,4 +1,4 @@
-"""Databento OPRA.PILLAR 大单 + Sweep 获取"""
+"""大单 + Sweep 数据获取 (三级降级: Databento → 长桥 → yfinance)"""
 
 from __future__ import annotations
 
@@ -15,6 +15,12 @@ try:
     import databento as db
 except Exception:
     db = None
+
+try:
+    from longport.openapi import QuoteContext, Config as LPConfig, Period, AdjustType
+except Exception:
+    QuoteContext = None
+    LPConfig = None
 
 log = logging.getLogger(__name__)
 
@@ -48,7 +54,263 @@ def parse_opra_symbol(raw_sym: str, ticker: str) -> Optional[Dict[str, Any]]:
 
 
 # ═══════════════════════════════════════════════
-# Databento 数据拉取
+# 数据源 1: Databento OPRA.PILLAR
+# ═══════════════════════════════════════════════
+
+def _fetch_databento(
+    symbols: List[str],
+    trade_date: date,
+    monthly_dates: List[date],
+) -> pd.DataFrame:
+    """Databento 大单拉取。失败时抛出异常。"""
+    api_key = os.environ.get("DATABENTO_API_KEY", "")
+    if not api_key or db is None:
+        raise RuntimeError("Databento 未配置")
+
+    all_rows: List[Dict[str, Any]] = []
+    monthly_set = set(monthly_dates)
+
+    for symbol in symbols:
+        client = db.Historical(key=api_key)
+        start_dt = datetime(trade_date.year, trade_date.month, trade_date.day, 0, 0, tzinfo=UTC)
+        end_dt = datetime(trade_date.year, trade_date.month, trade_date.day, 23, 59, tzinfo=UTC)
+        parent_symbol = f"{symbol}.OPT"
+
+        log.info("Databento %s trades ...", symbol)
+        data = client.timeseries.get_range(
+            dataset="OPRA.PILLAR",
+            schema="trades",
+            stype_in="parent",
+            symbols=[parent_symbol],
+            start=start_dt, end=end_dt,
+        )
+        df = data.to_df()
+        if df is None or df.empty:
+            continue
+
+        # instrument_id → raw_symbol 映射
+        id_to_sym: Dict[int, str] = {}
+        log.info("Databento %s definitions ...", symbol)
+        defs = client.timeseries.get_range(
+            dataset="OPRA.PILLAR",
+            schema="definition",
+            stype_in="parent",
+            symbols=[parent_symbol],
+            start=start_dt, end=end_dt,
+        )
+        defs_df = defs.to_df()
+        if defs_df is not None and not defs_df.empty:
+            for _, drow in defs_df.iterrows():
+                iid = int(drow.get("instrument_id", 0))
+                raw = str(drow.get("raw_symbol", ""))
+                if iid and raw and raw != "nan":
+                    id_to_sym[iid] = raw
+            log.info("Databento %s: %d 个合约映射", symbol, len(id_to_sym))
+
+        if not id_to_sym:
+            continue
+
+        df["symbol"] = df["instrument_id"].map(id_to_sym).fillna("")
+        size_col = "size" if "size" in df.columns else "quantity"
+        if size_col not in df.columns:
+            continue
+
+        for _, row in df.iterrows():
+            raw_sym = str(row.get("symbol", ""))
+            if not raw_sym or raw_sym == "nan" or raw_sym.isdigit():
+                continue
+            parsed = parse_opra_symbol(raw_sym, symbol)
+            if parsed is None or parsed["expiration"] not in monthly_set:
+                continue
+
+            trade_price = float(row.get("price", 0) or 0)
+            trade_size = int(row.get(size_col, 0) or 0)
+            notional = trade_price * trade_size * 100
+            if notional < NOTIONAL_THRESHOLD:
+                continue
+
+            ts = row.name if hasattr(row.name, "timestamp") else row.get("ts_event")
+            all_rows.append({
+                "ticker": symbol,
+                "expiration": parsed["expiration"],
+                "strike": parsed["strike"],
+                "option_type": parsed["option_type"],
+                "ts_event": ts,
+                "size": trade_size,
+                "price": trade_price,
+                "notional": notional,
+                "exchange": str(row.get("venue", row.get("publisher_id", ""))),
+                "raw_symbol": raw_sym,
+            })
+
+    if not all_rows:
+        return pd.DataFrame()
+    return pd.DataFrame(all_rows)
+
+
+# ═══════════════════════════════════════════════
+# 数据源 2: 长桥 Longbridge
+# ═══════════════════════════════════════════════
+
+def _fetch_longbridge(
+    symbols: List[str],
+    trade_date: date,
+    monthly_dates: List[date],
+) -> pd.DataFrame:
+    """长桥 API 获取期权成交数据。失败时抛出异常。"""
+    app_key = os.environ.get("LONGBRIDGE_APP_KEY", "")
+    app_secret = os.environ.get("LONGBRIDGE_APP_SECRET", "")
+    access_token = os.environ.get("LONGBRIDGE_ACCESS_TOKEN", "")
+
+    if not all([app_key, app_secret, access_token]) or QuoteContext is None:
+        raise RuntimeError("长桥 API 未配置")
+
+    config = LPConfig(
+        app_key=app_key,
+        app_secret=app_secret,
+        access_token=access_token,
+    )
+    ctx = QuoteContext(config)
+
+    all_rows: List[Dict[str, Any]] = []
+    monthly_set = set(monthly_dates)
+
+    for symbol in symbols:
+        try:
+            # 获取期权链到期日列表
+            exp_dates = ctx.option_chain_expiry_date_list(symbol)
+            if not exp_dates:
+                continue
+
+            for exp_info in exp_dates:
+                exp_date = exp_info.date
+                if hasattr(exp_date, "date"):
+                    exp_date = exp_date.date()
+                if exp_date not in monthly_set:
+                    continue
+
+                # 获取该到期日的行权价列表
+                strike_info_list = ctx.option_chain_info_by_date(symbol, exp_info.date)
+                if not strike_info_list:
+                    continue
+
+                # 收集期权合约代码
+                option_symbols = []
+                sym_meta: Dict[str, Dict[str, Any]] = {}
+                for si in strike_info_list:
+                    for opt_sym, ot in [(si.call_symbol, "C"), (si.put_symbol, "P")]:
+                        if opt_sym:
+                            option_symbols.append(opt_sym)
+                            sym_meta[opt_sym] = {
+                                "strike": si.strike_price,
+                                "option_type": ot,
+                                "expiration": exp_date,
+                            }
+
+                if not option_symbols:
+                    continue
+
+                # 批量获取实时行情 (含当日成交量和最新价)
+                batch_size = 50
+                for i in range(0, len(option_symbols), batch_size):
+                    batch = option_symbols[i:i + batch_size]
+                    try:
+                        quotes = ctx.option_quote(batch)
+                        for q in quotes:
+                            opt_sym = q.symbol
+                            meta = sym_meta.get(opt_sym)
+                            if not meta:
+                                continue
+                            vol = int(q.volume or 0)
+                            price = float(q.last_done or 0)
+                            notional = price * vol * 100
+                            if notional < NOTIONAL_THRESHOLD:
+                                continue
+
+                            all_rows.append({
+                                "ticker": symbol,
+                                "expiration": meta["expiration"],
+                                "strike": float(meta["strike"]),
+                                "option_type": meta["option_type"],
+                                "ts_event": datetime.now(),
+                                "size": vol,
+                                "price": price,
+                                "notional": notional,
+                                "exchange": "LB",
+                                "raw_symbol": opt_sym,
+                            })
+                    except Exception as e:
+                        log.debug("长桥 batch quote 异常: %s", e)
+
+            log.info("长桥 %s: %d 条大单", symbol, sum(1 for r in all_rows if r["ticker"] == symbol))
+        except Exception as e:
+            log.warning("长桥 %s 失败: %s", symbol, e)
+
+    if not all_rows:
+        return pd.DataFrame()
+    return pd.DataFrame(all_rows)
+
+
+# ═══════════════════════════════════════════════
+# 数据源 3: yfinance (仅 volume 聚合, 无逐笔)
+# ═══════════════════════════════════════════════
+
+def _fetch_yfinance_volume(
+    symbols: List[str],
+    trade_date: date,
+    monthly_dates: List[date],
+) -> pd.DataFrame:
+    """yfinance 期权成交量作为大单代理。取 volume 前 N 的合约。"""
+    try:
+        import yfinance as yf
+    except Exception:
+        return pd.DataFrame()
+
+    all_rows: List[Dict[str, Any]] = []
+    monthly_strs = {d.isoformat() for d in monthly_dates}
+
+    for symbol in symbols:
+        try:
+            tk = yf.Ticker(symbol)
+            for exp_str in tk.options:
+                if exp_str not in monthly_strs:
+                    continue
+                exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+                chain = tk.option_chain(exp_str)
+
+                for ot, df_part in [("C", chain.calls), ("P", chain.puts)]:
+                    if df_part is None or df_part.empty:
+                        continue
+                    for _, r in df_part.iterrows():
+                        vol = int(r.get("volume", 0) or 0)
+                        price = float(r.get("lastPrice", 0) or 0)
+                        strike = float(r.get("strike", 0) or 0)
+                        notional = price * vol * 100
+                        if notional < NOTIONAL_THRESHOLD:
+                            continue
+
+                        all_rows.append({
+                            "ticker": symbol,
+                            "expiration": exp_date,
+                            "strike": strike,
+                            "option_type": ot,
+                            "ts_event": datetime.now(),
+                            "size": vol,
+                            "price": price,
+                            "notional": notional,
+                            "exchange": "YF",
+                            "raw_symbol": f"{symbol}{exp_str.replace('-','')}{ot}{int(strike*1000):08d}",
+                        })
+        except Exception as e:
+            log.warning("yfinance volume %s: %s", symbol, e)
+
+    if not all_rows:
+        return pd.DataFrame()
+    return pd.DataFrame(all_rows)
+
+
+# ═══════════════════════════════════════════════
+# 统一入口: 三级降级
 # ═══════════════════════════════════════════════
 
 def fetch_trades(
@@ -56,105 +318,56 @@ def fetch_trades(
     trade_date: date,
     monthly_dates: List[date],
 ) -> pd.DataFrame:
-    """拉取当日月度期权大单 (notional > threshold)。"""
-    api_key = os.environ.get("DATABENTO_API_KEY", "")
-    if not api_key or db is None:
-        log.warning("Databento 未配置")
-        return pd.DataFrame()
+    """拉取当日月度期权大单数据。
 
-    all_rows: List[Dict[str, Any]] = []
-    monthly_set = set(monthly_dates)
+    降级顺序: Databento → 长桥 → yfinance
+    """
+    # 1. Databento
+    try:
+        result = _fetch_databento(symbols, trade_date, monthly_dates)
+        if not result.empty:
+            log.info("✓ 数据源: Databento (%d 笔大单)", len(result))
+            result = _detect_sweeps(result)
+            return result
+        log.info("Databento 返回空, 尝试降级...")
+    except Exception as e:
+        log.warning("Databento 失败: %s, 尝试长桥...", e)
 
-    for symbol in symbols:
-        try:
-            client = db.Historical(key=api_key)
-            start_dt = datetime(trade_date.year, trade_date.month, trade_date.day, 0, 0, tzinfo=UTC)
-            end_dt = datetime(trade_date.year, trade_date.month, trade_date.day, 23, 59, tzinfo=UTC)
-            parent_symbol = f"{symbol}.OPT"
+    # 2. 长桥
+    try:
+        result = _fetch_longbridge(symbols, trade_date, monthly_dates)
+        if not result.empty:
+            log.info("✓ 数据源: 长桥 (%d 条)", len(result))
+            # 长桥是聚合数据, 无法做 sweep 检测
+            result["is_sweep"] = False
+            return result
+        log.info("长桥返回空, 尝试 yfinance...")
+    except Exception as e:
+        log.warning("长桥失败: %s, 降级到 yfinance...", e)
 
-            log.info("Databento %s trades ...", symbol)
-            data = client.timeseries.get_range(
-                dataset="OPRA.PILLAR",
-                schema="trades",
-                stype_in="parent",
-                symbols=[parent_symbol],
-                start=start_dt, end=end_dt,
-            )
-            df = data.to_df()
-            if df is None or df.empty:
-                continue
+    # 3. yfinance (最后兜底)
+    try:
+        result = _fetch_yfinance_volume(symbols, trade_date, monthly_dates)
+        if not result.empty:
+            log.info("✓ 数据源: yfinance (%d 条高成交量合约)", len(result))
+            result["is_sweep"] = False
+            return result
+    except Exception as e:
+        log.warning("yfinance volume 也失败: %s", e)
 
-            # instrument_id → raw_symbol 映射
-            id_to_sym: Dict[int, str] = {}
-            try:
-                log.info("Databento %s definitions ...", symbol)
-                defs = client.timeseries.get_range(
-                    dataset="OPRA.PILLAR",
-                    schema="definition",
-                    stype_in="parent",
-                    symbols=[parent_symbol],
-                    start=start_dt, end=end_dt,
-                )
-                defs_df = defs.to_df()
-                if defs_df is not None and not defs_df.empty:
-                    for _, drow in defs_df.iterrows():
-                        iid = int(drow.get("instrument_id", 0))
-                        raw = str(drow.get("raw_symbol", ""))
-                        if iid and raw and raw != "nan":
-                            id_to_sym[iid] = raw
-                    log.info("Databento %s: %d 个合约映射", symbol, len(id_to_sym))
-            except Exception as e:
-                log.warning("Databento %s definitions 失败: %s", symbol, e)
+    log.warning("所有数据源均无大单数据")
+    return pd.DataFrame()
 
-            if not id_to_sym:
-                continue
 
-            df["symbol"] = df["instrument_id"].map(id_to_sym).fillna("")
-            log.info("Databento %s: %d 笔成交", symbol, len(df))
+# ═══════════════════════════════════════════════
+# Sweep 检测 (仅 Databento 逐笔数据适用)
+# ═══════════════════════════════════════════════
 
-            size_col = "size" if "size" in df.columns else "quantity"
-            if size_col not in df.columns:
-                continue
-
-            for _, row in df.iterrows():
-                raw_sym = str(row.get("symbol", ""))
-                if not raw_sym or raw_sym == "nan" or raw_sym.isdigit():
-                    continue
-                parsed = parse_opra_symbol(raw_sym, symbol)
-                if parsed is None or parsed["expiration"] not in monthly_set:
-                    continue
-
-                trade_price = float(row.get("price", 0) or 0)
-                trade_size = int(row.get(size_col, 0) or 0)
-                notional = trade_price * trade_size * 100
-                if notional < NOTIONAL_THRESHOLD:
-                    continue
-
-                ts = row.name if hasattr(row.name, "timestamp") else row.get("ts_event")
-                all_rows.append({
-                    "ticker": symbol,
-                    "expiration": parsed["expiration"],
-                    "strike": parsed["strike"],
-                    "option_type": parsed["option_type"],
-                    "ts_event": ts,
-                    "size": trade_size,
-                    "price": trade_price,
-                    "notional": notional,
-                    "exchange": str(row.get("venue", row.get("publisher_id", ""))),
-                    "raw_symbol": raw_sym,
-                })
-        except Exception as e:
-            log.warning("Databento %s 失败: %s", symbol, e)
-
-    if not all_rows:
-        return pd.DataFrame()
-
-    result = pd.DataFrame(all_rows)
-
-    # Sweep 检测
-    result["is_sweep"] = False
-    result = result.sort_values(["ticker", "raw_symbol", "ts_event"]).reset_index(drop=True)
-    for _, grp in result.groupby("raw_symbol"):
+def _detect_sweeps(df: pd.DataFrame) -> pd.DataFrame:
+    """在 Databento 逐笔数据上检测 sweep order。"""
+    df["is_sweep"] = False
+    df = df.sort_values(["ticker", "raw_symbol", "ts_event"]).reset_index(drop=True)
+    for _, grp in df.groupby("raw_symbol"):
         if len(grp) < 2:
             continue
         times = pd.to_datetime(grp["ts_event"], errors="coerce")
@@ -164,23 +377,24 @@ def fetch_trades(
                 continue
             window = grp[(times >= t) & (times <= t + pd.Timedelta(seconds=SWEEP_WINDOW_SEC))]
             if window["exchange"].nunique() >= SWEEP_MIN_EXCHANGES:
-                result.loc[window.index, "is_sweep"] = True
+                df.loc[window.index, "is_sweep"] = True
 
     log.info("大单: %d 笔 (sweep %d), 名义 $%s",
-             len(result), int(result["is_sweep"].sum()),
-             f"{result['notional'].sum():,.0f}")
-    return result
+             len(df), int(df["is_sweep"].sum()),
+             f"{df['notional'].sum():,.0f}")
+    return df
 
+
+# ═══════════════════════════════════════════════
+# 汇总
+# ═══════════════════════════════════════════════
 
 def aggregate_block_sweep(
     trades: pd.DataFrame,
     ticker: str,
     expiration: date,
 ) -> pd.DataFrame:
-    """按 (strike, option_type) 汇总大单/sweep 统计。
-
-    返回 DataFrame 列: strike, option_type, block_count, sweep_count, block_notional
-    """
+    """按 (strike, option_type) 汇总大单/sweep 统计。"""
     if trades.empty:
         return pd.DataFrame()
 
