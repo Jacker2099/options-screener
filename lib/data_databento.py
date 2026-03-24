@@ -231,7 +231,7 @@ def _fetch_longbridge(
                         if opt_sym:
                             option_symbols.append(opt_sym)
                             sym_meta[opt_sym] = {
-                                "strike": si.strike_price,
+                                "strike": si.price,
                                 "option_type": ot,
                                 "expiration": exp_date,
                             }
