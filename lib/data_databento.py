@@ -282,9 +282,12 @@ def _fetch_yfinance_volume(
                     if df_part is None or df_part.empty:
                         continue
                     for _, r in df_part.iterrows():
-                        vol = int(r.get("volume", 0) or 0)
-                        price = float(r.get("lastPrice", 0) or 0)
-                        strike = float(r.get("strike", 0) or 0)
+                        raw_vol = r.get("volume", 0)
+                        vol = int(raw_vol) if pd.notna(raw_vol) else 0
+                        raw_price = r.get("lastPrice", 0)
+                        price = float(raw_price) if pd.notna(raw_price) else 0.0
+                        raw_strike = r.get("strike", 0)
+                        strike = float(raw_strike) if pd.notna(raw_strike) else 0.0
                         notional = price * vol * 100
                         if notional < NOTIONAL_THRESHOLD:
                             continue
