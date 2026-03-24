@@ -160,9 +160,9 @@ def _fetch_longbridge(
     monthly_dates: List[date],
 ) -> pd.DataFrame:
     """长桥 API 获取期权成交数据。失败时抛出异常。"""
-    app_key = os.environ.get("LONGBRIDGE_APP_KEY", "")
-    app_secret = os.environ.get("LONGBRIDGE_APP_SECRET", "")
-    access_token = os.environ.get("LONGBRIDGE_ACCESS_TOKEN", "")
+    app_key = os.environ.get("LONGPORT_APP_KEY", "")
+    app_secret = os.environ.get("LONGPORT_APP_SECRET", "")
+    access_token = os.environ.get("LONGPORT_ACCESS_TOKEN", "")
 
     log.info("长桥检查: SDK=%s, key=%s, secret=%s, token=%s",
              "OK" if QuoteContext else "MISSING",
@@ -173,7 +173,7 @@ def _fetch_longbridge(
     if QuoteContext is None:
         raise RuntimeError("长桥 SDK 未安装或导入失败")
     if not all([app_key, app_secret, access_token]):
-        raise RuntimeError("长桥 API 密钥未配置 (检查 LONGBRIDGE_APP_KEY/APP_SECRET/ACCESS_TOKEN)")
+        raise RuntimeError("长桥 API 密钥未配置 (检查 LONGPORT_APP_KEY/APP_SECRET/ACCESS_TOKEN)")
 
     config = LPConfig(
         app_key=app_key,
