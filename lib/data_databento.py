@@ -187,8 +187,10 @@ def _fetch_longbridge(
 
     for symbol in symbols:
         try:
+            # 长桥美股 symbol 需要加 .US 后缀
+            lp_symbol = f"{symbol}.US"
             # 获取期权链到期日列表
-            exp_dates = ctx.option_chain_expiry_date_list(symbol)
+            exp_dates = ctx.option_chain_expiry_date_list(lp_symbol)
             if not exp_dates:
                 continue
 
@@ -200,7 +202,7 @@ def _fetch_longbridge(
                     continue
 
                 # 获取该到期日的行权价列表
-                strike_info_list = ctx.option_chain_info_by_date(symbol, exp_info.date)
+                strike_info_list = ctx.option_chain_info_by_date(lp_symbol, exp_info.date)
                 if not strike_info_list:
                     continue
 
@@ -252,7 +254,7 @@ def _fetch_longbridge(
                     except Exception as e:
                         log.debug("长桥 batch quote 异常: %s", e)
 
-            log.info("长桥 %s: %d 条大单", symbol, sum(1 for r in all_rows if r["ticker"] == symbol))
+            log.info("长桥 %s: %d 条大单", lp_symbol, sum(1 for r in all_rows if r["ticker"] == symbol))
         except Exception as e:
             log.warning("长桥 %s 失败: %s", symbol, e)
 
