@@ -195,16 +195,26 @@ def _fetch_longbridge(
                 continue
 
             for exp_info in exp_dates:
-                raw_date = exp_info.date
-                if hasattr(raw_date, "date") and callable(raw_date.date):
-                    exp_date = raw_date.date()
-                elif isinstance(raw_date, date):
-                    exp_date = raw_date
+                # exp_info 可能是 date 对象, 也可能是带 .date 属性的对象
+                if isinstance(exp_info, date):
+                    exp_date = exp_info
+                    raw_date = exp_info
+                elif hasattr(exp_info, "date"):
+                    raw_date = exp_info.date
+                    if isinstance(raw_date, date):
+                        exp_date = raw_date
+                    elif hasattr(raw_date, "date") and callable(raw_date.date):
+                        exp_date = raw_date.date()
+                    else:
+                        exp_date = datetime.strptime(str(raw_date)[:10], "%Y-%m-%d").date()
                 else:
                     try:
-                        exp_date = datetime.strptime(str(raw_date)[:10], "%Y-%m-%d").date()
+                        exp_date = datetime.strptime(str(exp_info)[:10], "%Y-%m-%d").date()
+                        raw_date = exp_info
                     except Exception:
                         continue
+
+                log.debug("长桥到期日: exp_info=%s type=%s -> exp_date=%s", exp_info, type(exp_info).__name__, exp_date)
                 if exp_date not in monthly_set:
                     continue
 
