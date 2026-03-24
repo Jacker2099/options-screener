@@ -1,33 +1,32 @@
-01:39:57 [INFO] 交易日: 2026-03-20
-01:39:57 [INFO] 月度到期日: ['2026-04-17', '2026-05-15']
-01:39:58 [INFO] NVDA $172.93 (-3.15%)
-01:39:58 [INFO] TSLA $367.96 (-3.24%)
-01:39:58 [INFO] 期权链: 128 条 (moneyness 过滤后)
-01:39:58 [INFO] OI 快照写入 128 条 (2026-03-20)
-01:39:58 [INFO] OI 快照: 128 条
-01:39:58 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-01:39:58 [INFO] Databento NVDA trades ...
-01:40:06 [INFO] Databento NVDA definitions ...
-01:40:10 [INFO] Databento NVDA: 4006 个合约映射
-01:40:10 [INFO] Databento NVDA: 345068 笔成交
-01:40:29 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-01:40:29 [INFO] Databento TSLA trades ...
-01:40:41 [INFO] Databento TSLA definitions ...
-01:40:49 [INFO] Databento TSLA: 6360 个合约映射
-01:40:49 [INFO] Databento TSLA: 550756 笔成交
-01:41:18 [INFO] 大单: 380 笔 (sweep 70), 名义 $412,029,139
-01:41:18 [INFO] 大单: 380 笔
-01:41:19 [INFO] 宏观指标: VIX恐慌指数 26.8(+11.3%), 10Y美债利率 4.4(+2.6%), 原油 98.6(+0.2%), 黄金 4440.4(-2.8%), 美元指数 99.6(-0.1%)
-01:41:19 [INFO] NVDA 2026-04-17 OTM过滤: Call≥178, Put≤168, 剩余8条
-01:41:19 [INFO] 报告: reports/daily/NVDA_2026-03-20.md
-01:41:19 [INFO] NVDA 2026-04-17: Call 51% | Call $38.7M / Put $37.1M | Top Call: 185C / Top Put: 165P
-01:41:19 [INFO] NVDA 2026-05-15 OTM过滤: Call≥178, Put≤168, 剩余8条
-01:41:19 [INFO] 报告: reports/daily/NVDA_2026-03-20.md
-01:41:19 [INFO] NVDA 2026-05-15: Call 61% | Call $33.4M / Put $21.7M | Top Call: 180C / Top Put: 150P
-01:41:19 [INFO] TSLA 2026-04-17 OTM过滤: Call≥379, Put≤357, 剩余18条
-01:41:19 [INFO] 报告: reports/daily/TSLA_2026-03-20.md
-01:41:19 [INFO] TSLA 2026-04-17: Call 45% | Call $38.2M / Put $46.9M | Top Call: 400C / Top Put: 350P
-01:41:19 [INFO] TSLA 2026-05-15 OTM过滤: Call≥379, Put≤357, 剩余18条
-01:41:19 [INFO] 报告: reports/daily/TSLA_2026-03-20.md
-01:41:19 [INFO] TSLA 2026-05-15: Call 43% | Call $22.2M / Put $28.9M | Top Call: 400C / Top Put: 350P
-01:41:22 [INFO] Pipeline 完成 ✓
+01:05:50 [INFO] 交易日: 2026-03-23
+01:05:50 [INFO] 月度到期日: ['2026-04-17', '2026-05-15']
+01:05:50 [INFO] NVDA $175.64 (+1.70%)
+01:05:50 [INFO] TSLA $380.85 (+3.50%)
+01:05:51 [INFO] 期权链: 136 条 (moneyness 过滤后)
+01:05:51 [INFO] OI 快照写入 136 条 (2026-03-23)
+01:05:51 [INFO] OI 快照: 136 条
+01:05:51 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+01:05:51 [INFO] Databento NVDA trades ...
+01:05:51 [WARNING] Databento NVDA 失败: 422 data_end_after_available_end
+The dataset OPRA.PILLAR has data available up to '2026-03-23 23:50:00+00:00'. The `end` in the query ('2026-03-23 23:59:00+00:00') is after the available range. Try requesting with an earlier `end`.
+documentation: https://databento.com/docs/api-reference-historical/basics/datasets
+01:05:51 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+01:05:51 [INFO] Databento TSLA trades ...
+01:05:51 [WARNING] Databento TSLA 失败: 422 data_end_after_available_end
+The dataset OPRA.PILLAR has data available up to '2026-03-23 23:50:00+00:00'. The `end` in the query ('2026-03-23 23:59:00+00:00') is after the available range. Try requesting with an earlier `end`.
+documentation: https://databento.com/docs/api-reference-historical/basics/datasets
+01:05:51 [INFO] 大单: 0 笔
+01:05:52 [INFO] 宏观指标: VIX恐慌指数 26.1(-2.4%), 10Y美债利率 4.3(-1.3%), 原油 90.5(-8.0%), 黄金 4385.3(-4.0%), 美元指数 99.3(-0.4%)
+01:05:52 [INFO] NVDA 2026-04-17 OTM过滤: Call≥181, Put≤170, 剩余9条
+01:05:52 [INFO] 报告: reports/daily/NVDA_2026-03-23.md
+01:05:52 [INFO] NVDA 2026-04-17: Call 51% | Call $28.8M / Put $27.4M | Top Call: 190C / Top Put: 165P
+01:05:52 [INFO] NVDA 2026-05-15 OTM过滤: Call≥181, Put≤170, 剩余9条
+01:05:52 [INFO] 报告: reports/daily/NVDA_2026-03-23.md
+01:05:52 [INFO] NVDA 2026-05-15: Call 55% | Call $13.7M / Put $10.9M | Top Call: 200C / Top Put: 160P
+01:05:52 [INFO] TSLA 2026-04-17 OTM过滤: Call≥392, Put≤369, 剩余18条
+01:05:52 [INFO] 报告: reports/daily/TSLA_2026-03-23.md
+01:05:52 [INFO] TSLA 2026-04-17: Call 45% | Call $31.7M / Put $38.9M | Top Call: 430C / Top Put: 330P
+01:05:52 [INFO] TSLA 2026-05-15 OTM过滤: Call≥392, Put≤369, 剩余18条
+01:05:52 [INFO] 报告: reports/daily/TSLA_2026-03-23.md
+01:05:52 [INFO] TSLA 2026-05-15: Call 48% | Call $19.0M / Put $20.9M | Top Call: 420C / Top Put: 340P
+01:05:55 [INFO] Pipeline 完成 ✓
