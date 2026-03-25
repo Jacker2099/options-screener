@@ -2,11 +2,11 @@ name: NVDA TSLA Monthly Options Radar v4
 
 on:
   schedule:
-    # 美股收盘 16:00 ET + 4h = 20:00 ET
-    # EDT (3月-11月): 20:00 ET = 00:00 UTC 次日
-    # EST (11月-3月): 20:00 ET = 01:00 UTC 次日
-    - cron: "0 0 * * 2-6"     # UTC 00:00 (EDT 20:00) 周二到周六
-    - cron: "0 1 * * 2-6"     # UTC 01:00 (EST 20:00) 备份时段
+    # 美股收盘 16:00 ET + 2h = 18:00 ET = 北京时间 6:00 AM
+    # EDT (3月-11月): 18:00 ET = 22:00 UTC
+    # EST (11月-3月): 18:00 ET = 23:00 UTC
+    - cron: "0 22 * * 1-5"    # UTC 22:00 (EDT 18:00) 周一到周五
+    - cron: "0 23 * * 1-5"    # UTC 23:00 (EST 18:00) 冬令时备份
   workflow_dispatch:
 
 concurrency:
