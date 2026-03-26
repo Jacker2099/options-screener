@@ -61,7 +61,7 @@ log = logging.getLogger(__name__)
 
 def get_us_trade_date() -> date:
     now_et = datetime.now(ET)
-    td = now_et.date() if now_et.hour >= 20 else (now_et - timedelta(days=1)).date()
+    td = now_et.date() if now_et.hour >= 16 else (now_et - timedelta(days=1)).date()
     while td.weekday() >= 5:
         td -= timedelta(days=1)
     return td
