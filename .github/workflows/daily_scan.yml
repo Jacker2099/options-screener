@@ -2,11 +2,8 @@ name: NVDA TSLA Monthly Options Radar v4
 
 on:
   schedule:
-    # 美股收盘 16:00 ET + 2h = 18:00 ET = 北京时间 6:00 AM
-    # EDT (3月-11月): 18:00 ET = 22:00 UTC
-    # EST (11月-3月): 18:00 ET = 23:00 UTC
-    - cron: "0 22 * * 1-5"    # UTC 22:00 (EDT 18:00) 周一到周五
-    - cron: "0 23 * * 1-5"    # UTC 23:00 (EST 18:00) 冬令时备份
+    # 美股收盘 16:00 ET + 2h = 18:00 ET = UTC 22:00 = 北京时间次日 06:00
+    - cron: "0 22 * * 1-5"    # UTC 22:00 周一到周五
   workflow_dispatch:
 
 concurrency:
@@ -57,10 +54,9 @@ jobs:
             echo "手动触发"
             python options_screener.py --mode daily 2>&1 | tee reports/last_run.log
           else
-            echo "定时触发, 启用盘后窗口检查和去重"
+            echo "定时触发"
             python options_screener.py \
               --mode daily \
-              --enforce-postclose-window \
               --skip-if-exists \
               2>&1 | tee reports/last_run.log
           fi
