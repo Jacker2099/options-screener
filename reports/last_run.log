@@ -1,40 +1,40 @@
-22:43:31 [INFO] 交易日: 2026-03-30
-22:43:31 [INFO] 月度到期日: ['2026-04-17', '2026-05-15']
-22:43:31 [INFO] NVDA $165.17 (-1.40%)
-22:43:31 [INFO] TSLA $355.28 (-1.81%)
-22:43:32 [INFO] 期权链: 150 条 (moneyness 过滤后)
-22:43:32 [INFO] OI 快照写入 150 条 (2026-03-30)
-22:43:32 [INFO] OI 快照: 150 条
-22:43:32 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-22:43:32 [INFO] Databento NVDA trades ...
-22:43:32 [WARNING] Databento 失败: 422 data_end_after_available_end
-The dataset OPRA.PILLAR has data available up to '2026-03-30 22:30:00+00:00'. The `end` in the query ('2026-03-30 23:59:00+00:00') is after the available range. Try requesting with an earlier `end`.
+22:40:48 [INFO] 交易日: 2026-03-31
+22:40:48 [INFO] 月度到期日: ['2026-04-17', '2026-05-15']
+22:40:48 [INFO] NVDA $174.40 (+5.59%)
+22:40:48 [INFO] TSLA $371.75 (+4.64%)
+22:40:49 [INFO] 期权链: 166 条 (moneyness 过滤后)
+22:40:49 [INFO] OI 快照写入 166 条 (2026-03-31)
+22:40:49 [INFO] OI 快照: 166 条
+22:40:49 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+22:40:49 [INFO] Databento NVDA trades ...
+22:40:49 [WARNING] Databento 失败: 422 data_end_after_available_end
+The dataset OPRA.PILLAR has data available up to '2026-03-31 22:30:00+00:00'. The `end` in the query ('2026-03-31 23:59:00+00:00') is after the available range. Try requesting with an earlier `end`.
 documentation: https://databento.com/docs/api-reference-historical/basics/datasets, 尝试长桥...
-22:43:32 [INFO] 长桥检查: SDK=OK, key=OK, secret=OK, token=OK
+22:40:49 [INFO] 长桥检查: SDK=OK, key=OK, secret=OK, token=OK
 +----------+------------------------------------+
+| CN       | ChinaConnect  LV1 Real-time Quotes |
+|----------+------------------------------------|
 | HK       | LV1 Real-time Quotes               |
 |----------+------------------------------------|
 | USOption | LV1 Real-time Quotes               |
 |----------+------------------------------------|
 | US       | Nasdaq Basic                       |
-|----------+------------------------------------|
-| CN       | ChinaConnect  LV1 Real-time Quotes |
 +----------+------------------------------------+
-22:43:42 [INFO] 长桥 NVDA.US: 78 条大单
-22:43:45 [INFO] 长桥 TSLA.US: 3 条大单
-22:43:45 [INFO] ✓ 数据源: 长桥 (81 条)
-22:43:45 [INFO] 大单: 81 笔
-22:43:46 [INFO] 宏观指标: VIX恐慌指数 30.6(-1.4%), 10Y美债利率 4.3(-2.2%), 原油 104.8(+5.2%), 黄金 4543.6(+1.1%), 美元指数 100.5(+0.3%)
-22:43:46 [INFO] NVDA 2026-04-17 OTM过滤: Call≥173, Put≤157, 剩余10条
-22:43:46 [INFO] 报告: reports/daily/NVDA_2026-03-30.md
-22:43:46 [INFO] NVDA 2026-04-17: Call 36% | Call $18.5M / Put $32.8M | Top Call: 182.5C / Top Put: 150P
-22:43:46 [INFO] NVDA 2026-05-15 OTM过滤: Call≥173, Put≤157, 剩余6条
-22:43:46 [INFO] 报告: reports/daily/NVDA_2026-03-30.md
-22:43:46 [INFO] NVDA 2026-05-15: Call 37% | Call $20.9M / Put $35.0M | Top Call: 180C / Top Put: 150P
-22:43:46 [INFO] TSLA 2026-04-17 OTM过滤: Call≥373, Put≤338, 剩余20条
-22:43:46 [INFO] 报告: reports/daily/TSLA_2026-03-30.md
-22:43:46 [INFO] TSLA 2026-04-17: Call 29% | Call $29.7M / Put $72.5M | Top Call: 375C / Top Put: 330P
-22:43:46 [INFO] TSLA 2026-05-15 OTM过滤: Call≥373, Put≤338, 剩余14条
-22:43:46 [INFO] 报告: reports/daily/TSLA_2026-03-30.md
-22:43:46 [INFO] TSLA 2026-05-15: Call 34% | Call $23.6M / Put $46.7M | Top Call: 400C / Top Put: 310P
-22:43:49 [INFO] Pipeline 完成 ✓
+22:40:56 [INFO] 长桥 NVDA.US: 70 条大单
+22:41:00 [INFO] 长桥 TSLA.US: 2 条大单
+22:41:00 [INFO] ✓ 数据源: 长桥 (72 条)
+22:41:00 [INFO] 大单: 72 笔
+22:41:00 [INFO] 宏观指标: VIX恐慌指数 25.2(-17.5%), 10Y美债利率 4.3(-0.7%), 原油 102.5(-0.4%), 黄金 4702.9(+3.9%), 美元指数 99.9(-0.6%)
+22:41:01 [INFO] NVDA 2026-04-17 OTM过滤: Call≥183, Put≤166, 剩余14条
+22:41:01 [INFO] 报告: reports/daily/NVDA_2026-03-31.md
+22:41:01 [INFO] NVDA 2026-04-17: Call 60% | Call $41.1M / Put $27.0M | Top Call: 190C / Top Put: 155P
+22:41:01 [INFO] NVDA 2026-05-15 OTM过滤: Call≥183, Put≤166, 剩余8条
+22:41:01 [INFO] 报告: reports/daily/NVDA_2026-03-31.md
+22:41:01 [INFO] NVDA 2026-05-15: Call 68% | Call $46.9M / Put $22.4M | Top Call: 200C / Top Put: 160P
+22:41:01 [INFO] TSLA 2026-04-17 OTM过滤: Call≥390, Put≤353, 剩余17条
+22:41:01 [INFO] 报告: reports/daily/TSLA_2026-03-31.md
+22:41:01 [INFO] TSLA 2026-04-17: Call 59% | Call $69.5M / Put $47.5M | Top Call: 420C / Top Put: 330P
+22:41:01 [INFO] TSLA 2026-05-15 OTM过滤: Call≥390, Put≤353, 剩余14条
+22:41:01 [INFO] 报告: reports/daily/TSLA_2026-03-31.md
+22:41:01 [INFO] TSLA 2026-05-15: Call 66% | Call $60.4M / Put $31.1M | Top Call: 420C / Top Put: 345P
+22:41:05 [INFO] Pipeline 完成 ✓
