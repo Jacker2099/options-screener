@@ -1,36 +1,5 @@
-23:02:26 [INFO] 交易日: 2026-05-14
-23:02:26 [INFO] 月度到期日: ['2026-05-15', '2026-06-19']
-23:02:27 [INFO] NVDA $235.74 (+4.39%)
-23:02:27 [INFO] TSLA $443.30 (-0.44%)
-23:02:27 [INFO] 期权链: 133 条 (moneyness 过滤后)
-23:02:27 [INFO] OI 快照写入 133 条 (2026-05-14)
-23:02:27 [INFO] OI 快照: 133 条
-23:02:27 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-23:02:27 [INFO] Databento NVDA trades ...
-23:02:28 [WARNING] Databento 失败: 422 data_end_after_available_end
-The dataset OPRA.PILLAR has data available up to '2026-05-14 22:30:00+00:00'. The `end` in the query ('2026-05-14 23:59:00+00:00') is after the available range. Try requesting with an earlier `end`.
-documentation: https://databento.com/docs/api-reference-historical/basics/datasets, 尝试长桥...
-23:02:28 [INFO] 长桥检查: SDK=OK, key=OK, secret=OK, token=OK
-+----------+------------------------------------+
-| HK       | LV1 Real-time Quotes               |
-|----------+------------------------------------|
-| CN       | ChinaConnect  LV1 Real-time Quotes |
-|----------+------------------------------------|
-| US       | Nasdaq Basic                       |
-|----------+------------------------------------|
-| USOption | LV1 Real-time Quotes               |
-+----------+------------------------------------+
-23:02:36 [INFO] 长桥 NVDA.US: 71 条大单
-23:02:39 [INFO] 长桥 TSLA.US: 117 条大单
-23:02:39 [INFO] ✓ 数据源: 长桥 (188 条)
-23:02:39 [INFO] 大单: 188 笔
-23:02:40 [INFO] 宏观指标: VIX恐慌指数 17.3(-3.4%), 10Y美债利率 4.5(-0.4%), 原油 101.8(+0.8%), 黄金 4665.5(-0.7%), 美元指数 98.9(+0.4%)
-23:02:41 [INFO] NVDA 2026-05-15 OTM过滤: Call≥248, Put≤224, 剩余14条
-23:02:41 [INFO] 报告: reports/daily/NVDA_2026-05-14.md
-23:02:41 [INFO] NVDA 2026-05-15: Call 91% | Call $524.3M / Put $52.8M | Top Call: 250C / Top Put: 222.5P
-23:02:41 [INFO] NVDA 2026-06-19: 无有效合约
-23:02:41 [INFO] TSLA 2026-05-15 OTM过滤: Call≥465, Put≤421, 剩余28条
-23:02:41 [INFO] 报告: reports/daily/TSLA_2026-05-14.md
-23:02:41 [INFO] TSLA 2026-05-15: Call 58% | Call $351.5M / Put $257.4M | Top Call: 467.5C / Top Put: 417.5P
-23:02:41 [INFO] TSLA 2026-06-19: 无有效合约
-23:02:42 [INFO] Pipeline 完成 ✓
+23:01:08 [INFO] 交易日: 2026-05-15
+23:01:08 [INFO] 月度到期日: ['2026-06-19']
+23:01:09 [INFO] NVDA $225.32 (-4.42%)
+23:01:09 [INFO] TSLA $422.24 (-4.75%)
+23:01:09 [INFO] 期权链: 0 条 (moneyness 过滤后)
