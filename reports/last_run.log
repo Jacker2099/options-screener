@@ -1,36 +1,36 @@
-23:08:01 [INFO] 交易日: 2026-05-21
-23:08:01 [INFO] 月度到期日: ['2026-06-19', '2026-07-17']
-23:08:02 [INFO] NVDA $219.51 (-1.77%)
-23:08:02 [INFO] TSLA $417.85 (+0.14%)
-23:08:03 [INFO] 期权链: 76 条 (moneyness 过滤后)
-23:08:03 [INFO] OI 快照写入 76 条 (2026-05-21)
-23:08:03 [INFO] OI 快照: 76 条
-23:08:03 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-23:08:03 [INFO] Databento NVDA trades ...
-23:08:03 [WARNING] Databento 失败: 422 data_end_after_available_end
-The dataset OPRA.PILLAR has data available up to '2026-05-21 22:30:00+00:00'. The `end` in the query ('2026-05-21 23:59:00+00:00') is after the available range. Try requesting with an earlier `end`.
+23:07:36 [INFO] 交易日: 2026-05-22
+23:07:36 [INFO] 月度到期日: ['2026-06-19', '2026-07-17']
+23:07:37 [INFO] NVDA $215.33 (-1.90%)
+23:07:37 [INFO] TSLA $426.01 (+1.95%)
+23:07:37 [INFO] 期权链: 76 条 (moneyness 过滤后)
+23:07:37 [INFO] OI 快照写入 76 条 (2026-05-22)
+23:07:37 [INFO] OI 快照: 76 条
+23:07:37 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+23:07:37 [INFO] Databento NVDA trades ...
+23:07:38 [WARNING] Databento 失败: 422 data_end_after_available_end
+The dataset OPRA.PILLAR has data available up to '2026-05-22 22:30:00+00:00'. The `end` in the query ('2026-05-22 23:59:00+00:00') is after the available range. Try requesting with an earlier `end`.
 documentation: https://databento.com/docs/api-reference-historical/basics/datasets, 尝试长桥...
-23:08:03 [INFO] 长桥检查: SDK=OK, key=OK, secret=OK, token=OK
+23:07:38 [INFO] 长桥检查: SDK=OK, key=OK, secret=OK, token=OK
 +----------+------------------------------------+
-| CN       | ChinaConnect  LV1 Real-time Quotes |
-|----------+------------------------------------|
 | HK       | LV1 Real-time Quotes               |
 |----------+------------------------------------|
-| US       | Nasdaq Basic                       |
+| CN       | ChinaConnect  LV1 Real-time Quotes |
 |----------+------------------------------------|
 | USOption | LV1 Real-time Quotes               |
+|----------+------------------------------------|
+| US       | Nasdaq Basic                       |
 +----------+------------------------------------+
-23:08:11 [INFO] 长桥 NVDA.US: 54 条大单
-23:08:13 [INFO] 长桥 TSLA.US: 53 条大单
-23:08:13 [INFO] ✓ 数据源: 长桥 (107 条)
-23:08:13 [INFO] 大单: 107 笔
-23:08:14 [INFO] 宏观指标: VIX恐慌指数 16.8(-3.9%), 10Y美债利率 4.6(+0.3%), 原油 97.7(-0.5%), 黄金 4542.7(+0.3%), 美元指数 99.2(+0.1%)
-23:08:15 [INFO] NVDA 2026-06-19: 无有效合约
-23:08:15 [INFO] NVDA 2026-07-17 OTM过滤: Call≥230, Put≤209, 剩余8条
-23:08:15 [INFO] 报告: reports/daily/NVDA_2026-05-21.md
-23:08:15 [INFO] NVDA 2026-07-17: Call 69% | Call $65.5M / Put $29.1M | Top Call: 250C / Top Put: 205P
-23:08:15 [INFO] TSLA 2026-06-19: 无有效合约
-23:08:15 [INFO] TSLA 2026-07-17 OTM过滤: Call≥439, Put≤397, 剩余17条
-23:08:15 [INFO] 报告: reports/daily/TSLA_2026-05-21.md
-23:08:15 [INFO] TSLA 2026-07-17: Call 69% | Call $45.3M / Put $20.4M | Top Call: 475C / Top Put: 395P
-23:08:17 [INFO] Pipeline 完成 ✓
+23:07:44 [INFO] 长桥 NVDA.US: 52 条大单
+23:07:46 [INFO] 长桥 TSLA.US: 66 条大单
+23:07:46 [INFO] ✓ 数据源: 长桥 (118 条)
+23:07:46 [INFO] 大单: 118 笔
+23:07:47 [INFO] 宏观指标: VIX恐慌指数 16.7(-0.4%), 10Y美债利率 4.6(-0.6%), 原油 97.0(+0.7%), 黄金 4510.5(-0.6%), 美元指数 99.3(+0.1%)
+23:07:47 [INFO] NVDA 2026-06-19: 无有效合约
+23:07:47 [INFO] NVDA 2026-07-17 OTM过滤: Call≥226, Put≤205, 剩余8条
+23:07:47 [INFO] 报告: reports/daily/NVDA_2026-05-22.md
+23:07:47 [INFO] NVDA 2026-07-17: Call 68% | Call $40.1M / Put $18.9M | Top Call: 230C / Top Put: 200P
+23:07:47 [INFO] TSLA 2026-06-19: 无有效合约
+23:07:47 [INFO] TSLA 2026-07-17 OTM过滤: Call≥447, Put≤405, 剩余16条
+23:07:47 [INFO] 报告: reports/daily/TSLA_2026-05-22.md
+23:07:47 [INFO] TSLA 2026-07-17: Call 78% | Call $48.8M / Put $13.9M | Top Call: 475C / Top Put: 400P
+23:07:49 [INFO] Pipeline 完成 ✓
