@@ -1,26 +1,26 @@
-23:43:32 [INFO] 交易日: 2026-06-17
-23:43:32 [INFO] 月度到期日: ['2026-06-19', '2026-07-17']
-23:43:32 [INFO] NVDA $204.65 (-1.33%)
-23:43:32 [INFO] TSLA $396.38 (-2.05%)
-23:43:32 [INFO] 期权链: 74 条 (moneyness 过滤后)
-23:43:32 [INFO] OI 快照写入 74 条 (2026-06-17)
-23:43:32 [INFO] OI 快照: 74 条
-23:43:32 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-23:43:32 [INFO] Databento NVDA trades ...
-23:43:33 [WARNING] Databento 失败: 403 license_not_found_unauthorized
-A live data license is required to access OPRA.PILLAR data after 2026-06-17T13:30:00.000000000Z.
+23:49:21 [INFO] 交易日: 2026-06-18
+23:49:21 [INFO] 月度到期日: ['2026-06-19', '2026-07-17']
+23:49:21 [INFO] NVDA $210.69 (+2.95%)
+23:49:21 [INFO] TSLA $400.49 (+1.04%)
+23:49:22 [INFO] 期权链: 74 条 (moneyness 过滤后)
+23:49:22 [INFO] OI 快照写入 74 条 (2026-06-18)
+23:49:22 [INFO] OI 快照: 74 条
+23:49:22 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+23:49:22 [INFO] Databento NVDA trades ...
+23:49:22 [WARNING] Databento 失败: 403 license_not_found_unauthorized
+A live data license is required to access OPRA.PILLAR data after 2026-06-18T13:30:00.000000000Z.
 documentation: https://databento.com/docs, 尝试长桥...
-23:43:33 [INFO] 长桥检查: SDK=OK, key=OK, secret=OK, token=OK
-23:43:34 [WARNING] 长桥失败: OpenApiException: (kind=ErrorKind.OpenApi, code=401003, trace_id=72dbd678ca447efaeb500de10891f333) token expired, 降级到 yfinance...
-23:43:35 [INFO] ✓ 数据源: yfinance (151 条高成交量合约)
-23:43:35 [INFO] 大单: 151 笔
-23:43:35 [INFO] 宏观指标: VIX恐慌指数 18.4(+12.4%), 10Y美债利率 4.5(-0.5%), 原油 75.3(-1.0%), 黄金 4297.7(-0.8%), 美元指数 100.3(+0.8%)
-23:43:36 [INFO] NVDA 2026-06-19: 无有效合约
-23:43:36 [INFO] NVDA 2026-07-17 OTM过滤: Call≥215, Put≤194, 剩余9条
-23:43:36 [INFO] 报告: reports/daily/NVDA_2026-06-17.md
-23:43:36 [INFO] NVDA 2026-07-17: Call 57% | Call $24.4M / Put $18.7M | Top Call: 225C / Top Put: 180P
-23:43:36 [INFO] TSLA 2026-06-19: 无有效合约
-23:43:36 [INFO] TSLA 2026-07-17 OTM过滤: Call≥416, Put≤377, 剩余16条
-23:43:36 [INFO] 报告: reports/daily/TSLA_2026-06-17.md
-23:43:36 [INFO] TSLA 2026-07-17: Call 55% | Call $35.2M / Put $29.0M | Top Call: 420C / Top Put: 375P
-23:43:38 [INFO] Pipeline 完成 ✓
+23:49:22 [INFO] 长桥检查: SDK=OK, key=OK, secret=OK, token=OK
+23:49:23 [WARNING] 长桥失败: OpenApiException: (kind=ErrorKind.OpenApi, code=401003, trace_id=cc3171b7076adeb6bfa8e659c4a0b03a) token expired, 降级到 yfinance...
+23:49:24 [INFO] ✓ 数据源: yfinance (154 条高成交量合约)
+23:49:24 [INFO] 大单: 154 笔
+23:49:24 [INFO] 宏观指标: VIX恐慌指数 16.4(-11.1%), 10Y美债利率 4.5(-0.8%), 原油 75.3(-2.0%), 黄金 4217.1(-3.3%), 美元指数 100.8(+0.7%)
+23:49:24 [INFO] NVDA 2026-06-19: 无有效合约
+23:49:24 [INFO] NVDA 2026-07-17 OTM过滤: Call≥221, Put≤200, 剩余9条
+23:49:24 [INFO] 报告: reports/daily/NVDA_2026-06-18.md
+23:49:24 [INFO] NVDA 2026-07-17: Call 81% | Call $52.8M / Put $12.5M | Top Call: 225C / Top Put: 195P
+23:49:24 [INFO] TSLA 2026-06-19: 无有效合约
+23:49:24 [INFO] TSLA 2026-07-17 OTM过滤: Call≥421, Put≤380, 剩余16条
+23:49:25 [INFO] 报告: reports/daily/TSLA_2026-06-18.md
+23:49:25 [INFO] TSLA 2026-07-17: Call 70% | Call $66.3M / Put $29.0M | Top Call: 450C / Top Put: 380P
+23:49:26 [INFO] Pipeline 完成 ✓
