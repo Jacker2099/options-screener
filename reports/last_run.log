@@ -1,30 +1,30 @@
-23:03:21 [INFO] 交易日: 2026-06-29
-23:03:21 [INFO] 月度到期日: ['2026-07-17', '2026-08-21']
-23:03:21 [INFO] NVDA $194.97 (+1.27%)
-23:03:21 [INFO] TSLA $411.84 (+8.46%)
-23:03:22 [INFO] 期权链: 176 条 (moneyness 过滤后)
-23:03:22 [INFO] OI 快照写入 176 条 (2026-06-29)
-23:03:22 [INFO] OI 快照: 176 条
-23:03:22 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-23:03:22 [INFO] Databento NVDA trades ...
-23:03:22 [WARNING] Databento 失败: 422 data_end_after_available_end
-The dataset OPRA.PILLAR has data available up to '2026-06-29 22:30:00+00:00'. The `end` in the query ('2026-06-29 23:59:00+00:00') is after the available range. Try requesting with an earlier `end`.
+23:18:03 [INFO] 交易日: 2026-06-30
+23:18:03 [INFO] 月度到期日: ['2026-07-17', '2026-08-21']
+23:18:04 [INFO] NVDA $200.09 (+2.63%)
+23:18:04 [INFO] TSLA $420.60 (+2.13%)
+23:18:05 [INFO] 期权链: 186 条 (moneyness 过滤后)
+23:18:05 [INFO] OI 快照写入 186 条 (2026-06-30)
+23:18:05 [INFO] OI 快照: 186 条
+23:18:05 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+23:18:05 [INFO] Databento NVDA trades ...
+23:18:05 [WARNING] Databento 失败: 422 data_end_after_available_end
+The dataset OPRA.PILLAR has data available up to '2026-06-30 22:30:00+00:00'. The `end` in the query ('2026-06-30 23:59:00+00:00') is after the available range. Try requesting with an earlier `end`.
 documentation: https://databento.com/docs/api-reference-historical/basics/datasets, 尝试长桥...
-23:03:22 [INFO] 长桥检查: SDK=OK, key=OK, secret=OK, token=OK
-23:03:24 [WARNING] 长桥失败: OpenApiException: (kind=ErrorKind.OpenApi, code=401003, trace_id=9fcfdf33ca4a6305a807a6c53fbc99b4) token expired, 降级到 yfinance...
-23:03:24 [INFO] ✓ 数据源: yfinance (337 条高成交量合约)
-23:03:24 [INFO] 大单: 337 笔
-23:03:25 [INFO] 宏观指标: VIX恐慌指数 17.6(-4.1%), 10Y美债利率 4.4(+0.0%), 原油 70.3(+1.5%), 黄金 4028.5(-1.2%), 美元指数 101.1(-0.2%)
-23:03:25 [INFO] NVDA 2026-07-17 OTM过滤: Call≥205, Put≤185, 剩余12条
-23:03:25 [INFO] 报告: reports/daily/NVDA_2026-06-29.md
-23:03:25 [INFO] NVDA 2026-07-17: Call 76% | Call $44.7M / Put $14.3M | Top Call: 210C / Top Put: 170P
-23:03:25 [INFO] NVDA 2026-08-21 OTM过滤: Call≥205, Put≤185, 剩余8条
-23:03:25 [INFO] 报告: reports/daily/NVDA_2026-06-29.md
-23:03:25 [INFO] NVDA 2026-08-21: Call 70% | Call $26.0M / Put $11.0M | Top Call: 205C / Top Put: 180P
-23:03:25 [INFO] TSLA 2026-07-17 OTM过滤: Call≥432, Put≤391, 剩余22条
-23:03:25 [INFO] 报告: reports/daily/TSLA_2026-06-29.md
-23:03:25 [INFO] TSLA 2026-07-17: Call 81% | Call $95.3M / Put $22.5M | Top Call: 450C / Top Put: 355P
-23:03:25 [INFO] TSLA 2026-08-21 OTM过滤: Call≥432, Put≤391, 剩余16条
-23:03:25 [INFO] 报告: reports/daily/TSLA_2026-06-29.md
-23:03:25 [INFO] TSLA 2026-08-21: Call 79% | Call $47.8M / Put $13.0M | Top Call: 450C / Top Put: 385P
-23:03:29 [INFO] Pipeline 完成 ✓
+23:18:05 [INFO] 长桥检查: SDK=OK, key=OK, secret=OK, token=OK
+23:18:07 [WARNING] 长桥失败: OpenApiException: (kind=ErrorKind.OpenApi, code=401003, trace_id=4794b3256433eeb9848ec0b378afe4fa) token expired, 降级到 yfinance...
+23:18:07 [INFO] ✓ 数据源: yfinance (308 条高成交量合约)
+23:18:07 [INFO] 大单: 308 笔
+23:18:08 [INFO] 宏观指标: VIX恐慌指数 16.5(-6.8%), 10Y美债利率 4.4(+1.1%), 原油 70.0(-1.1%), 黄金 4031.5(+0.2%), 美元指数 101.1(-0.2%)
+23:18:09 [INFO] NVDA 2026-07-17 OTM过滤: Call≥210, Put≤190, 剩余13条
+23:18:09 [INFO] 报告: reports/daily/NVDA_2026-06-30.md
+23:18:09 [INFO] NVDA 2026-07-17: Call 77% | Call $55.1M / Put $16.0M | Top Call: 220C / Top Put: 187.5P
+23:18:09 [INFO] NVDA 2026-08-21 OTM过滤: Call≥210, Put≤190, 剩余8条
+23:18:09 [INFO] 报告: reports/daily/NVDA_2026-06-30.md
+23:18:09 [INFO] NVDA 2026-08-21: Call 77% | Call $33.6M / Put $10.3M | Top Call: 215C / Top Put: 175P
+23:18:09 [INFO] TSLA 2026-07-17 OTM过滤: Call≥442, Put≤400, 剩余24条
+23:18:09 [INFO] 报告: reports/daily/TSLA_2026-06-30.md
+23:18:09 [INFO] TSLA 2026-07-17: Call 79% | Call $79.8M / Put $21.7M | Top Call: 450C / Top Put: 365P
+23:18:09 [INFO] TSLA 2026-08-21 OTM过滤: Call≥442, Put≤400, 剩余16条
+23:18:09 [INFO] 报告: reports/daily/TSLA_2026-06-30.md
+23:18:09 [INFO] TSLA 2026-08-21: Call 71% | Call $34.8M / Put $14.2M | Top Call: 475C / Top Put: 395P
+23:18:13 [INFO] Pipeline 完成 ✓
