@@ -1,30 +1,30 @@
-03:01:31 [INFO] 交易日: 2026-08-26
-03:01:31 [INFO] 月度到期日: ['2026-09-18', '2026-10-16']
-03:01:31 [INFO] NVDA $209.66 (-1.59%)
-03:01:31 [INFO] TSLA $345.82 (-1.26%)
-03:01:32 [INFO] 期权链: 174 条 (moneyness 过滤后)
-03:01:32 [INFO] OI 快照写入 174 条 (2026-08-26)
-03:01:32 [INFO] OI 快照: 174 条
-03:01:32 [INFO] Initialized Historical(gateway=https://hist.databento.com)
-03:01:32 [INFO] Databento NVDA trades ...
-03:01:32 [WARNING] Databento 失败: 403 license_not_found_unauthorized
-A live data license is required to access OPRA.PILLAR data after 2026-08-26T13:30:00.000000000Z.
+06:02:10 [INFO] 交易日: 2026-08-27
+06:02:10 [INFO] 月度到期日: ['2026-09-18', '2026-10-16']
+06:02:11 [INFO] NVDA $227.98 (+8.74%)
+06:02:11 [INFO] TSLA $354.81 (+2.60%)
+06:02:11 [INFO] 期权链: 176 条 (moneyness 过滤后)
+06:02:11 [INFO] OI 快照写入 176 条 (2026-08-27)
+06:02:11 [INFO] OI 快照: 176 条
+06:02:11 [INFO] Initialized Historical(gateway=https://hist.databento.com)
+06:02:11 [INFO] Databento NVDA trades ...
+06:02:12 [WARNING] Databento 失败: 403 license_not_found_unauthorized
+A live data license is required to access OPRA.PILLAR data after 2026-08-27T13:30:00.000000000Z.
 documentation: https://databento.com/docs, 尝试长桥...
-03:01:32 [INFO] 长桥检查: SDK=OK, key=OK, secret=OK, token=OK
-03:01:32 [WARNING] 长桥失败: cannot create 'builtins.Config' instances, 降级到 yfinance...
-03:01:32 [INFO] ✓ 数据源: yfinance (289 条高成交量合约)
-03:01:32 [INFO] 大单: 289 笔
-03:01:33 [INFO] 宏观指标: VIX恐慌指数 15.2(-1.6%), 10Y美债利率 4.7(+0.5%), 原油 81.5(-1.0%), 黄金 4685.6(+1.0%), 美元指数 99.1(+0.2%)
-03:01:33 [INFO] NVDA 2026-09-18 OTM过滤: Call≥220, Put≤199, 剩余14条
-03:01:33 [INFO] 报告: reports/daily/NVDA_2026-08-26.md
-03:01:33 [INFO] NVDA 2026-09-18: Call 62% | Call $61.0M / Put $37.8M | Top Call: 230C / Top Put: 195P
-03:01:33 [INFO] NVDA 2026-10-16 OTM过滤: Call≥220, Put≤199, 剩余8条
-03:01:33 [INFO] 报告: reports/daily/NVDA_2026-08-26.md
-03:01:33 [INFO] NVDA 2026-10-16: Call 56% | Call $29.5M / Put $22.8M | Top Call: 240C / Top Put: 195P
-03:01:33 [INFO] TSLA 2026-09-18 OTM过滤: Call≥363, Put≤329, 剩余18条
-03:01:34 [INFO] 报告: reports/daily/TSLA_2026-08-26.md
-03:01:34 [INFO] TSLA 2026-09-18: Call 54% | Call $18.2M / Put $15.2M | Top Call: 382.5C / Top Put: 320P
-03:01:34 [INFO] TSLA 2026-10-16 OTM过滤: Call≥363, Put≤329, 剩余14条
-03:01:34 [INFO] 报告: reports/daily/TSLA_2026-08-26.md
-03:01:34 [INFO] TSLA 2026-10-16: Call 64% | Call $7.9M / Put $4.4M | Top Call: 375C / Top Put: 300P
-03:01:37 [INFO] Pipeline 完成 ✓
+06:02:12 [INFO] 长桥检查: SDK=OK, key=OK, secret=OK, token=OK
+06:02:12 [WARNING] 长桥失败: cannot create 'builtins.Config' instances, 降级到 yfinance...
+06:02:12 [INFO] ✓ 数据源: yfinance (303 条高成交量合约)
+06:02:12 [INFO] 大单: 303 笔
+06:02:13 [INFO] 宏观指标: VIX恐慌指数 14.5(-4.6%), 10Y美债利率 4.7(+0.2%), 原油 83.2(-0.4%), 黄金 4627.5(+0.4%), 美元指数 99.2(+0.0%)
+06:02:13 [INFO] NVDA 2026-09-18 OTM过滤: Call≥239, Put≤217, 剩余14条
+06:02:13 [INFO] 报告: reports/daily/NVDA_2026-08-27.md
+06:02:13 [INFO] NVDA 2026-09-18: Call 88% | Call $256.4M / Put $34.6M | Top Call: 250C / Top Put: 212.5P
+06:02:13 [INFO] NVDA 2026-10-16 OTM过滤: Call≥239, Put≤217, 剩余10条
+06:02:13 [INFO] 报告: reports/daily/NVDA_2026-08-27.md
+06:02:13 [INFO] NVDA 2026-10-16: Call 82% | Call $122.6M / Put $26.1M | Top Call: 250C / Top Put: 215P
+06:02:13 [INFO] TSLA 2026-09-18 OTM过滤: Call≥373, Put≤337, 剩余16条
+06:02:13 [INFO] 报告: reports/daily/TSLA_2026-08-27.md
+06:02:13 [INFO] TSLA 2026-09-18: Call 77% | Call $31.5M / Put $9.3M | Top Call: 400C / Top Put: 335P
+06:02:13 [INFO] TSLA 2026-10-16 OTM过滤: Call≥373, Put≤337, 剩余14条
+06:02:13 [INFO] 报告: reports/daily/TSLA_2026-08-27.md
+06:02:13 [INFO] TSLA 2026-10-16: Call 75% | Call $10.5M / Put $3.5M | Top Call: 400C / Top Put: 335P
+06:02:16 [INFO] Pipeline 完成 ✓
